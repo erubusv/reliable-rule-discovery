@@ -1,0 +1,48 @@
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+.venv/
+venv/
+
+# Python caches and build artifacts
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+build/
+dist/
+*.egg-info/
+*.so
+
+# Data, generated outputs, and experiment artifacts
+data/
+datasets/
+results/
+outputs/
+*.log
+*.checkpoint.*
+
+# Documentation and notebooks
+docs/
+documentation/
+notes/
+notebooks/
+*.md
+*.rst
+*.ipynb
+
+# Legacy and third-party source snapshots
+legacy/
+external/
+
+# Editor and OS files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+*~
+*.swp

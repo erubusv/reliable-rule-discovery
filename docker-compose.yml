@@ -1,0 +1,25 @@
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: rlrd:dev
+    container_name: ${CONTAINER_NAME:-RLRD}
+    working_dir: /workspace
+    volumes:
+      - ${WORKSPACE_DIR:-.}:/workspace
+    environment:
+      PYTHONPATH: /workspace
+      OMP_NUM_THREADS: ${OMP_NUM_THREADS:-12}
+      OPENBLAS_NUM_THREADS: ${OPENBLAS_NUM_THREADS:-12}
+      MKL_NUM_THREADS: ${MKL_NUM_THREADS:-12}
+      NUMEXPR_NUM_THREADS: ${NUMEXPR_NUM_THREADS:-12}
+      NVIDIA_VISIBLE_DEVICES: ${NVIDIA_VISIBLE_DEVICES:-all}
+      NVIDIA_DRIVER_CAPABILITIES: ${NVIDIA_DRIVER_CAPABILITIES:-compute,utility}
+    shm_size: "16gb"
+    ipc: host
+    runtime: nvidia
+    tty: true
+    stdin_open: true
+    gpus: all
+    command: bash
