@@ -12,7 +12,14 @@ from .likelihood import loss_rows
 from .native import moments
 from .objective import ObjectiveSpec, SupportRecord, support_score
 from .response import Context, ModelMatrix, ResponseEngine
-from .rules import EMPTY_SUPPORT, Antecedent, RuleIdentity, Support, skeletons
+from .rules import (
+    EMPTY_SUPPORT,
+    Antecedent,
+    RuleIdentity,
+    Support,
+    hierarchy_closure,
+    skeletons,
+)
 from .solver import fit_model_matrix
 
 
@@ -34,7 +41,7 @@ class SearchDiagnostics:
     pricing_passes: int = 0
     priced_blocks: int = 0
     bound_evaluations: int = 0
-    saturated_screens: int = 0
+    relaxation_screens: int = 0
     dual_screens: int = 0
     dual_fail_open: int = 0
     accepted_moves: int = 0
@@ -120,6 +127,8 @@ class SupportOptimizer:
         )
         self.records: dict[Support, SupportRecord] = {}
         self._addition_cache: dict[Support, SupportRecord | None] = {}
+        self._feature_rows_cache: dict[Support, np.ndarray] = {}
+        self._relaxed_upper_cache: dict[Support, float] = {}
         self._pricing_state: dict[
             Support, tuple[np.ndarray, np.ndarray, np.ndarray]
         ] = {}
@@ -269,6 +278,89 @@ class SupportOptimizer:
             penalty=self.objective.structural_penalty(support),
         )
 
+    def _feature_rows(self, support: Support) -> np.ndarray:
+        cached = self._feature_rows_cache.get(support)
+        if cached is not None:
+            return cached
+        parts = [
+            self.engine.block(self.context, term.antecedent, term.window).rows
+            for term in hierarchy_closure(support)
+        ]
+        parts.extend(
+            self.engine.block(self.context, rule.antecedent, rule.window).rows
+            for rule in support.rules
+        )
+        nonempty = [rows for rows in parts if len(rows)]
+        result = (
+            np.unique(np.concatenate(nonempty))
+            if nonempty
+            else np.zeros(0, dtype=np.int64)
+        )
+        self._feature_rows_cache[support] = result
+        return result
+
+    def localized_upper_score(self, support: Support) -> float:
+        """Safe score upper bound from a localized saturated relaxation.
+
+        Every row touched by any support or closure feature receives its own
+        unrestricted predictor; untouched rows retain one common intercept.
+        This relaxed model contains the exact support model, so its minimum
+        NLL is a rigorous lower bound on the exact minimum NLL.
+        """
+        cached = self._relaxed_upper_cache.get(support)
+        if cached is not None:
+            return cached
+        affected = self._feature_rows(support)
+        positions = np.searchsorted(self.context.target_rows, affected)
+        matched = positions < len(self.context.target_rows)
+        if len(self.context.target_rows):
+            safe = np.minimum(positions, len(self.context.target_rows) - 1)
+            matched &= self.context.target_rows[safe] == affected
+        affected_counts = (
+            self.context.target_counts[positions[matched]]
+            if np.any(matched)
+            else np.zeros(0, dtype=np.float64)
+        )
+        total_events = float(np.sum(self.context.target_counts))
+        affected_events = float(np.sum(affected_counts))
+        remaining_rows = int(self.context.n_grid - len(affected))
+        remaining_events = total_events - affected_events
+        if self.context.dataset.likelihood == "poisson":
+            exposure = self.engine.tick_exposure
+            positive = affected_counts > 0
+            affected_lower = float(
+                np.sum(
+                    affected_counts[positive]
+                    * (1.0 - np.log(affected_counts[positive] / exposure))
+                )
+            )
+            remaining_exposure = exposure * remaining_rows
+            if remaining_events > 0 and remaining_exposure > 0:
+                remaining_lower = remaining_events * (
+                    1.0 - math.log(remaining_events / remaining_exposure)
+                )
+            else:
+                remaining_lower = 0.0
+        else:
+            affected_lower = 0.0
+            remaining_noevents = remaining_rows - remaining_events
+            if remaining_events > 0 and remaining_noevents > 0:
+                total = remaining_events + remaining_noevents
+                probability = remaining_events / total
+                remaining_lower = -remaining_events * math.log(probability)
+                remaining_lower -= remaining_noevents * math.log1p(-probability)
+            else:
+                remaining_lower = 0.0
+        lower_nll = affected_lower + remaining_lower
+        score = support_score(
+            baseline_nll=self.baseline_nll,
+            fit_nll=lower_nll,
+            penalty=self.objective.structural_penalty(support),
+        )
+        score = min(score, self.saturated_upper_score(support))
+        self._relaxed_upper_cache[support] = score
+        return score
+
     def bounds(self, current: SupportRecord, trial: Support) -> ProposalBounds:
         """Return a feasible-primal lower score and verified-dual upper score."""
         self.diagnostics.bound_evaluations += 1
@@ -340,11 +432,11 @@ class SupportOptimizer:
             )
         else:
             self.diagnostics.dual_fail_open += 1
-            upper_score = self.saturated_upper_score(trial)
+            upper_score = self.localized_upper_score(trial)
             certificate = None
         # The analytic saturated likelihood bound is always valid and can
         # tighten a loose numerical Fenchel certificate.
-        upper_score = min(upper_score, self.saturated_upper_score(trial))
+        upper_score = min(upper_score, self.localized_upper_score(trial))
         if upper_score + 1.0e-7 * max(1.0, abs(upper_score)) < lower_score:
             raise AssertionError("proposal primal/dual sandwich is invalid")
         return ProposalBounds(
@@ -484,10 +576,10 @@ class SupportOptimizer:
         for price, rule in ranked:
             trial = current.support.add(rule)
             if (
-                self.saturated_upper_score(trial)
+                self.localized_upper_score(trial)
                 <= current.score + self.config.search_tolerance
             ):
-                self.diagnostics.saturated_screens += 1
+                self.diagnostics.relaxation_screens += 1
                 continue
             bounds.append((price, self.bounds(current, trial)))
         bounds.sort(
@@ -517,9 +609,9 @@ class SupportOptimizer:
         pending: list[tuple[float, ProposalBounds]] = []
         for price, rule in ranked:
             trial = Support.of((rule,))
-            saturated = self.saturated_upper_score(trial)
+            saturated = self.localized_upper_score(trial)
             if saturated <= self.config.search_tolerance:
-                self.diagnostics.saturated_screens += 1
+                self.diagnostics.relaxation_screens += 1
                 continue
             pending.append((price, self.bounds(empty, trial)))
         pending.sort(
@@ -544,10 +636,10 @@ class SupportOptimizer:
             if support == current.support:
                 continue
             if (
-                self.saturated_upper_score(support)
+                self.localized_upper_score(support)
                 <= current.score + self.config.search_tolerance
             ):
-                self.diagnostics.saturated_screens += 1
+                self.diagnostics.relaxation_screens += 1
                 continue
             bounded.append(self.bounds(current, support))
         bounded.sort(key=lambda item: (-item.upper_score, item.support.rules))
