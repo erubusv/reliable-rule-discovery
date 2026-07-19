@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import re
 import shutil
 from pathlib import Path
@@ -200,7 +201,11 @@ def preprocess_freddie(
         event_parts.append(events)
         target_parts.append(targets)
         entity_offset += len(entities)
-        source_digests[vintage] = str(path.stat().st_size)
+        digest = hashlib.sha256()
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        source_digests[vintage] = digest.hexdigest()
     entities = pd.concat(entity_parts, ignore_index=True)
     events = pd.concat(event_parts, ignore_index=True).sort_values(
         ["entity_code", "time", "predicate_code"], kind="stable"
@@ -227,7 +232,7 @@ def preprocess_freddie(
         provenance={
             "preprocessor": "crbstpp.preprocess.freddie.v1",
             "vintages": [name for name, _ in paths],
-            "source_sizes": source_digests,
+            "source_sha256": source_digests,
             "predicate_definition": "primitive ELTV-band and UPB-direction transition onsets",
         },
     )

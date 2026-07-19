@@ -29,6 +29,20 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _dataset_identity(manifest: dict[str, object]) -> dict[str, object]:
+    """Return exactly the provenance-bearing payload protected by the digest."""
+    names = (
+        "schema", "predicate_names", "likelihood", "time_unit",
+        "adverse_event_name", "f0_contract", "files", "provenance",
+    )
+    return {name: manifest[name] for name in names}
+
+
+def _identity_digest(identity: dict[str, object]) -> str:
+    blob = json.dumps(identity, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
 @dataclass(frozen=True)
 class Dataset:
     """Immutable sparse event-sequence dataset.
@@ -74,6 +88,12 @@ class Dataset:
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         if manifest.get("schema") != DATASET_SCHEMA:
             raise ValueError("legacy or unsupported dataset schema")
+        try:
+            expected_digest = _identity_digest(_dataset_identity(manifest))
+        except KeyError as error:
+            raise ValueError(f"incomplete dataset manifest: {error.args[0]}") from error
+        if manifest.get("dataset_digest") != expected_digest:
+            raise ValueError("dataset manifest or predicate provenance digest mismatch")
         likelihood = str(manifest.get("likelihood", ""))
         if likelihood not in SUPPORTED_LIKELIHOODS:
             raise ValueError(f"unsupported likelihood: {likelihood}")
@@ -250,7 +270,7 @@ def write_dataset(
     for name in ("entities", "events", "targets"):
         path = root / f"{name}.parquet"
         files[name] = {"path": path.name, "sha256": _sha256_file(path), "bytes": path.stat().st_size}
-    identity = {
+    identity: dict[str, object] = {
         "schema": DATASET_SCHEMA,
         "predicate_names": list(predicate_names),
         "likelihood": likelihood,
@@ -258,11 +278,10 @@ def write_dataset(
         "adverse_event_name": adverse_event_name,
         "f0_contract": f0_contract,
         "files": files,
+        "provenance": provenance,
     }
-    digest = hashlib.sha256(
-        json.dumps(identity, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    ).hexdigest()
-    manifest = {**identity, "dataset_digest": digest, "provenance": provenance}
+    digest = _identity_digest(identity)
+    manifest = {**identity, "dataset_digest": digest}
     (root / "manifest.json").write_text(
         json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8"
     )

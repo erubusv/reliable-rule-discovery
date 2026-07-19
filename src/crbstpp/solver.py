@@ -6,6 +6,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from .likelihood import loss_rows
+from .native import moments
 from .response import ModelMatrix
 
 
@@ -33,7 +34,9 @@ class FitResult:
         }
 
 
-def _objective(matrix: ModelMatrix, likelihood: str, beta: np.ndarray) -> tuple[float, np.ndarray, np.ndarray, np.ndarray]:
+def _objective(
+    matrix: ModelMatrix, likelihood: str, beta: np.ndarray
+) -> tuple[float, np.ndarray, np.ndarray, np.ndarray]:
     eta = matrix.x @ beta
     rows, first, second = loss_rows(
         eta,
@@ -42,7 +45,8 @@ def _objective(matrix: ModelMatrix, likelihood: str, beta: np.ndarray) -> tuple[
         noevent_weight=matrix.noevent_weight,
         event_weight=matrix.event_weight,
     )
-    return float(np.sum(rows)), matrix.x.T @ first, matrix.x.T @ (second[:, None] * matrix.x), eta
+    gradient, hessian = moments(matrix.x, first, second, device="cpu")
+    return float(np.sum(rows)), gradient, hessian, eta
 
 
 def projected_kkt(beta: np.ndarray, gradient: np.ndarray, free_dimension: int) -> float:
@@ -158,4 +162,3 @@ def fit_model_matrix(
         int(np.linalg.matrix_rank(hessian, tol=max(tolerance, 1.0e-12))), False,
         "maximum iterations reached",
     )
-

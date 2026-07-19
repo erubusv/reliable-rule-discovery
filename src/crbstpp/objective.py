@@ -4,7 +4,7 @@ import math
 from dataclasses import dataclass
 
 from .response import ModelMatrix
-from .rules import Support
+from .rules import Support, hierarchy_closure
 from .solver import FitResult
 
 
@@ -15,13 +15,12 @@ class ObjectiveSpec:
     knot_count: int
     window_count_by_order: tuple[int, int, int]
 
-    def penalty(self, support: Support, matrix: ModelMatrix, baseline_dimension: int) -> float:
+    def penalty_for_dimension(self, support: Support, parameter_dimension: int) -> float:
         size = len(support.rules)
         if size == 0:
             return 0.0
         if not 0 <= size <= self.skeleton_count:
             raise ValueError("support size exceeds skeleton dictionary")
-        parameter_dimension = matrix.dimension - int(baseline_dimension)
         parameter_code = parameter_dimension * math.log(max(2, int(self.n_entities)))
         support_code = 2.0 * (
             math.lgamma(self.skeleton_count + 1)
@@ -33,6 +32,20 @@ class ObjectiveSpec:
             count = self.window_count_by_order[rule.order - 1]
             identity_code += 2.0 * math.log(2 * count)
         return float(parameter_code + support_code + identity_code)
+
+    def structural_penalty(self, support: Support) -> float:
+        parameter_dimension = self.knot_count * (
+            len(support.rules) + len(hierarchy_closure(support))
+        )
+        return self.penalty_for_dimension(support, parameter_dimension)
+
+    def penalty(self, support: Support, matrix: ModelMatrix, baseline_dimension: int) -> float:
+        parameter_dimension = matrix.dimension - int(baseline_dimension)
+        penalty = self.penalty_for_dimension(support, parameter_dimension)
+        expected = self.structural_penalty(support)
+        if not math.isclose(penalty, expected, rel_tol=0.0, abs_tol=1.0e-12):
+            raise AssertionError("closure complexity is not counted exactly once")
+        return penalty
 
 
 @dataclass(frozen=True)
@@ -50,4 +63,3 @@ def support_score(
     if not math.isfinite(fit_nll):
         return -math.inf
     return float(2.0 * (baseline_nll - fit_nll) - penalty)
-

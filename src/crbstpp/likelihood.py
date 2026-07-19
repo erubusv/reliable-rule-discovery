@@ -90,12 +90,58 @@ def cloglog_conjugate(
     noevent_weight: np.ndarray,
     event_weight: np.ndarray,
 ) -> np.ndarray:
-    """Numerical conjugate of aggregated Bernoulli-cloglog row losses."""
+    """Conjugate of aggregated Bernoulli-cloglog row losses.
+
+    CRBS matrices contain event-only active rows and aggregated no-event rows.
+    Those cases are handled vectorially; the general mixed-row fallback is
+    retained as a checked reference path.
+    """
     dual = np.asarray(dual, dtype=np.float64)
-    output = np.empty_like(dual)
-    for index, (u, noevent, event) in enumerate(
-        zip(dual.tolist(), noevent_weight.tolist(), event_weight.tolist(), strict=True)
-    ):
+    noevent_weight = np.asarray(noevent_weight, dtype=np.float64)
+    event_weight = np.asarray(event_weight, dtype=np.float64)
+    output = np.full_like(dual, np.inf)
+    noevent_only = (noevent_weight > 0) & (event_weight == 0)
+    if np.any(noevent_only):
+        u = dual[noevent_only]
+        exposure = noevent_weight[noevent_only]
+        valid = u >= 0
+        values = np.full_like(u, np.inf)
+        positive = valid & (u > 0)
+        values[valid & ~positive] = 0.0
+        values[positive] = u[positive] * (
+            np.log(u[positive] / exposure[positive]) - 1.0
+        )
+        output[noevent_only] = values
+    event_only = (event_weight > 0) & (noevent_weight == 0)
+    if np.any(event_only):
+        u = dual[event_only]
+        event = event_weight[event_only]
+        valid = (u >= -event) & (u <= 0)
+        values = np.full_like(u, np.inf)
+        boundary = valid & ((np.abs(u + event) <= 1.0e-14) | (np.abs(u) <= 1.0e-14))
+        values[boundary] = 0.0
+        interior = valid & ~boundary
+        if np.any(interior):
+            target = u[interior] / event[interior]
+            low = np.full_like(target, -745.0)
+            high = np.full_like(target, math.log(700.0))
+            for _ in range(64):
+                middle = 0.5 * (low + high)
+                _, derivative, _ = cloglog_event_terms(middle)
+                move_low = derivative < target
+                low = np.where(move_low, middle, low)
+                high = np.where(move_low, high, middle)
+            eta = 0.5 * (low + high)
+            event_value, _, _ = cloglog_event_terms(eta)
+            values[interior] = u[interior] * eta - event[interior] * event_value
+        output[event_only] = values
+    empty = (noevent_weight == 0) & (event_weight == 0)
+    output[empty & (dual == 0)] = 0.0
+    mixed = (noevent_weight > 0) & (event_weight > 0)
+    for index in np.flatnonzero(mixed):
+        u = float(dual[index])
+        noevent = float(noevent_weight[index])
+        event = float(event_weight[index])
         lower_domain = -event
         upper_domain = math.inf if noevent > 0 else 0.0
         if u < lower_domain or u > upper_domain:
