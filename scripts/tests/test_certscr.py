@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import json
+import os
 import tempfile
 import types
 import unittest
@@ -10,6 +11,12 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import certscr.pipeline as pipeline_module
+
+try:
+    import torch
+except ImportError:  # pragma: no cover
+    torch = None
 
 from certscr.data import (
     EventData,
@@ -32,21 +39,45 @@ from certscr.marked import (
 )
 from certscr.model import (
     FitResult,
+    IncrementalSupportPartition,
     PreparedFixedSupportDesign,
     aggregate_duplicate_design_rows,
+    append_rules_to_incremental_partition,
     assemble_compressed_design,
     assemble_design,
     canonical_nll,
     cluster_nll,
+    cloglog_event_terms,
     compress_zero_grid_rows,
     fixed_support_projected_kkt,
     fit_fixed_support,
+    fit_delta_factorized_support,
+    fit_sparse_delta_support,
+    fit_sparse_delta_closure,
+    factorized_rule_recession_columns,
+    fit_constrained_prepared_batch,
+    fit_unconstrained_prepared_batch,
     _fit_fixed_support_native64,
     _fit_fixed_support_numpy64,
     group_saturated_poisson_lower_bound,
     prepare_fixed_support_design,
+    prepare_delta_factorized_support_design,
+    prepare_sparse_delta_support_design,
+    prepare_sparse_nuisance_partition,
+    sparse_delta_rule_recession_columns,
     project_prepared_support_design,
+    refine_sparse_nuisance_partition,
+    update_incremental_support_partition,
+    _factorized_objective_grad_hessian_numpy,
+    _factorized_objective_numpy,
+    _prepared_objective_grad_hessian_numpy,
+    _prepared_objective_numpy,
     predict_eta,
+)
+from certscr.native import (
+    batched_sparse_rule_moments,
+    sorted_unique_int64_union,
+    update_sparse_design_partitioned,
 )
 from certscr.occurrence import (
     RuleIdentity,
@@ -68,6 +99,7 @@ from certscr.statistics import (
 from certscr_tpp import synthetic_data
 from certscr.predicate_policy import (
     FREDDIE_PRIMITIVE_DYNAMIC_V3,
+    FREDDIE_PRIMITIVE_DYNAMIC_V4,
     FREDDIE_STRUCTURAL_DYNAMIC_V2,
     HOME_CREDIT_BEHAVIORAL_NONPROXY,
     HOME_CREDIT_BEHAVIORAL_NONPROXY_EXPANDED,
@@ -93,6 +125,71 @@ from preprocess_freddiemac_dynamic_events import (
 
 
 class StatisticsTests(unittest.TestCase):
+    def test_native_wide_sorted_union_matches_numpy(self) -> None:
+        rng = np.random.default_rng(29)
+        arrays = [
+            np.unique(rng.integers(0, 20000, size=700, dtype=np.int64))
+            for _ in range(100)
+        ]
+        union = sorted_unique_int64_union(arrays, allow_wide=True)
+        if union is None:
+            self.skipTest("native compiler is unavailable")
+        np.testing.assert_array_equal(
+            union, np.unique(np.concatenate(arrays))
+        )
+
+    def test_native_batched_rule_moments_match_numpy(self) -> None:
+        rng = np.random.default_rng(17)
+        grid = rng.random((257, 4), dtype=np.float32)
+        grid_weights = rng.random((257, 5))
+        events = rng.random((31, 4), dtype=np.float32)
+        event_first = rng.normal(size=(31, 5))
+        event_second = np.abs(rng.normal(size=(31, 5)))
+        native = batched_sparse_rule_moments(
+            grid,
+            grid_weights.T,
+            events,
+            event_first.T,
+            event_second.T,
+            include_event_second=True,
+            worker_count=4,
+        )
+        if native is None:
+            self.skipTest("native compiler is unavailable")
+        gradient, information = native
+        grid64 = grid.astype(np.float64)
+        events64 = events.astype(np.float64)
+        expected_gradient = (
+            grid64.T @ grid_weights + events64.T @ event_first
+        )
+        expected_information = np.zeros((5, 4, 4), dtype=np.float64)
+        for left in range(4):
+            for right in range(left + 1):
+                values = (
+                    (grid64[:, left] * grid64[:, right]) @ grid_weights
+                    + (events64[:, left] * events64[:, right])
+                    @ event_second
+                )
+                expected_information[:, left, right] = values
+                expected_information[:, right, left] = values
+        np.testing.assert_allclose(
+            gradient, expected_gradient, rtol=2e-13, atol=2e-11
+        )
+        np.testing.assert_allclose(
+            information,
+            expected_information,
+            rtol=2e-13,
+            atol=2e-11,
+        )
+
+    def test_cloglog_event_terms_remain_finite_below_exp_underflow(self) -> None:
+        loss, gradient, hessian = cloglog_event_terms(
+            np.asarray([-1000.0], dtype=np.float64)
+        )
+        self.assertEqual(float(loss[0]), 1000.0)
+        self.assertEqual(float(gradient[0]), -1.0)
+        self.assertEqual(float(hessian[0]), 0.0)
+
     def test_native_cone_solver_matches_portable_cloglog_optimum(self) -> None:
         rows = []
         bounds = []
@@ -342,12 +439,355 @@ class StatisticsTests(unittest.TestCase):
         self.assertAlmostEqual(direct, float(np.sum(clustered)), places=12)
         self.assertAlmostEqual(direct, fit.nll, places=12)
 
+    def test_batched_first_event_cloglog_nulls_match_scalar_fits(self) -> None:
+        data = EventData.from_frame(
+            pd.DataFrame(
+                [
+                    {
+                        "sequence_id": "batch-0",
+                        "position": 0,
+                        "month_index": 1,
+                        "target_token": 1,
+                        "a": 0,
+                    },
+                    {
+                        "sequence_id": "batch-1",
+                        "position": 0,
+                        "month_index": 2,
+                        "target_token": 1,
+                        "a": 0,
+                    },
+                ]
+            ),
+            predicate_names=("a",),
+            bounds=pd.DataFrame(
+                [
+                    {"sequence_id": "batch-0", "start_month": 0, "end_month": 1},
+                    {"sequence_id": "batch-1", "start_month": 0, "end_month": 2},
+                ]
+            ),
+        )
+        ctx = make_context(data, "batched-cloglog", np.arange(data.n_sequences))
+        closure_terms = [(((0,), 0),), (((0,), 2),)]
+        controls = [
+            (np.zeros((ctx.n_queries, 1), dtype=np.float64),),
+            (np.zeros((ctx.n_queries, 1), dtype=np.float64),),
+        ]
+        prepared = [
+            PreparedFixedSupportDesign(
+                design=np.asarray(design, dtype=np.float64),
+                n_events=3,
+                event_weights=np.asarray(event_weights, dtype=np.float64),
+                grid_weights=np.asarray(grid_weights, dtype=np.float64),
+                constrained_start=2,
+                control_width=1,
+                knot_count=0,
+                active_grid_rows=len(grid_weights),
+                rules=(),
+                occurrence_likelihood="first_event_cloglog",
+            )
+            for design, event_weights, grid_weights in (
+                (
+                    [
+                        [1.0, -0.8],
+                        [1.0, 0.1],
+                        [1.0, 0.9],
+                        [1.0, -1.0],
+                        [1.0, -0.2],
+                        [1.0, 0.7],
+                        [1.0, 1.2],
+                    ],
+                    [4.0, 6.0, 5.0],
+                    [18.0, 22.0, 17.0, 11.0],
+                ),
+                (
+                    [
+                        [1.0, -0.5],
+                        [1.0, 0.3],
+                        [1.0, 1.1],
+                        [1.0, -1.2],
+                        [1.0, 0.0],
+                        [1.0, 0.6],
+                    ],
+                    [3.0, 7.0, 4.0],
+                    [21.0, 19.0, 16.0],
+                ),
+            )
+        ]
+        batched = fit_unconstrained_prepared_batch(
+            ctx,
+            controls,
+            prepared,
+            closure_terms,
+            device="cpu",
+            dtype="float64",
+            max_iter=120,
+            tolerance=1.0e-9,
+        )
+        scalar = [
+            fit_fixed_support(
+                ctx,
+                control,
+                (),
+                (),
+                device="cpu",
+                dtype="float64",
+                max_iter=120,
+                tolerance=1.0e-9,
+                closure_terms=terms,
+                prepared_design=item,
+                occurrence_likelihood="first_event_cloglog",
+            )
+            for control, terms, item in zip(
+                controls, closure_terms, prepared, strict=True
+            )
+        ]
+        for item, batch_fit, scalar_fit in zip(
+            prepared, batched, scalar, strict=True
+        ):
+            self.assertTrue(batch_fit.converged)
+            self.assertTrue(scalar_fit.converged)
+            self.assertAlmostEqual(batch_fit.nll, scalar_fit.nll, places=9)
+            self.assertAlmostEqual(batch_fit.alpha, scalar_fit.alpha, places=8)
+            batch_eta = item.design.astype(np.float64) @ np.concatenate(
+                ([batch_fit.alpha], batch_fit.gamma)
+            )
+            scalar_eta = item.design.astype(np.float64) @ np.concatenate(
+                ([scalar_fit.alpha], scalar_fit.gamma)
+            )
+            self.assertTrue(
+                np.allclose(batch_eta, scalar_eta, rtol=0.0, atol=1.0e-8),
+                msg=str(float(np.max(np.abs(batch_eta - scalar_eta)))),
+            )
+
+    def test_batched_constrained_supports_match_scalar_cone_fits(self) -> None:
+        data = EventData.from_frame(
+            pd.DataFrame(
+                [
+                    {
+                        "sequence_id": "cone-0",
+                        "position": 0,
+                        "month_index": 1,
+                        "target_token": 1,
+                        "a": 0,
+                    },
+                    {
+                        "sequence_id": "cone-1",
+                        "position": 0,
+                        "month_index": 2,
+                        "target_token": 1,
+                        "a": 0,
+                    },
+                ]
+            ),
+            predicate_names=("a",),
+            bounds=pd.DataFrame(
+                [
+                    {"sequence_id": "cone-0", "start_month": 0, "end_month": 1},
+                    {"sequence_id": "cone-1", "start_month": 0, "end_month": 2},
+                ]
+            ),
+        )
+        ctx = make_context(data, "batched-cone", np.arange(data.n_sequences))
+        rule = RuleIdentity((0,), 0, 1)
+        terms = [(((0,), 0),), (((0,), 1),)]
+        controls = [(), ()]
+        prepared = [
+            PreparedFixedSupportDesign(
+                design=np.asarray(design, dtype=np.float64),
+                n_events=2,
+                event_weights=np.asarray([4.0, 5.0], dtype=np.float64),
+                grid_weights=np.asarray([18.0, 20.0, 16.0], dtype=np.float64),
+                constrained_start=2,
+                control_width=1,
+                knot_count=1,
+                active_grid_rows=3,
+                rules=(rule,),
+                occurrence_likelihood="first_event_cloglog",
+            )
+            for design in (
+                [
+                    [1.0, -0.4, 1.0],
+                    [1.0, 0.6, 0.9],
+                    [1.0, -1.0, 0.1],
+                    [1.0, 0.0, 0.2],
+                    [1.0, 1.0, 0.1],
+                ],
+                [
+                    [1.0, -0.4, 0.0],
+                    [1.0, 0.6, 0.1],
+                    [1.0, -1.0, 1.0],
+                    [1.0, 0.0, 0.9],
+                    [1.0, 1.0, 1.0],
+                ],
+            )
+        ]
+        batched = fit_constrained_prepared_batch(
+            ctx,
+            controls,
+            prepared,
+            terms,
+            device="cpu",
+            dtype="float64",
+            max_iter=120,
+            tolerance=1.0e-9,
+        )
+        scalar = [
+            fit_fixed_support(
+                ctx,
+                control,
+                (),
+                (rule,),
+                device="cpu",
+                dtype="float64",
+                max_iter=120,
+                tolerance=1.0e-9,
+                closure_terms=item_terms,
+                prepared_design=item,
+                occurrence_likelihood="first_event_cloglog",
+            )
+            for control, item_terms, item in zip(
+                controls, terms, prepared, strict=True
+            )
+        ]
+        for batch_fit, scalar_fit in zip(batched, scalar, strict=True):
+            self.assertTrue(batch_fit.converged)
+            self.assertTrue(scalar_fit.converged)
+            self.assertLessEqual(batch_fit.kkt_residual, 1.0e-9)
+            np.testing.assert_allclose(
+                batch_fit.gamma, scalar_fit.gamma, rtol=1.0e-7, atol=1.0e-8
+            )
+            np.testing.assert_allclose(
+                batch_fit.theta, scalar_fit.theta, rtol=1.0e-7, atol=1.0e-8
+            )
+            self.assertAlmostEqual(batch_fit.nll, scalar_fit.nll, places=8)
+        if torch is not None and torch.cuda.is_available():
+            gpu_batched = fit_constrained_prepared_batch(
+                ctx,
+                controls,
+                prepared,
+                terms,
+                device="cuda:0",
+                dtype="float32",
+                max_iter=120,
+                tolerance=1.0e-9,
+            )
+            for gpu_fit, scalar_fit in zip(gpu_batched, scalar, strict=True):
+                self.assertTrue(gpu_fit.converged)
+                self.assertLessEqual(gpu_fit.kkt_residual, 1.0e-9)
+                self.assertAlmostEqual(gpu_fit.nll, scalar_fit.nll, places=8)
+
     def test_freddie_primitive_dictionary_has_thirteen_unique_atoms(self) -> None:
         self.assertEqual(len(FREDDIE_PRIMITIVE_DYNAMIC_V3), 13)
         self.assertEqual(len(set(FREDDIE_PRIMITIVE_DYNAMIC_V3)), 13)
         contract = resolve_predicate_policy_contract("freddie_primitive_dynamic_v3")
         self.assertTrue(contract.atomic_events)
         self.assertTrue(contract.f0_eligible)
+
+    def test_freddie_financial_primitive_v4_has_twelve_unique_atoms(self) -> None:
+        self.assertEqual(len(FREDDIE_PRIMITIVE_DYNAMIC_V4), 12)
+        self.assertEqual(len(set(FREDDIE_PRIMITIVE_DYNAMIC_V4)), 12)
+        contract = resolve_predicate_policy_contract(
+            "freddie_primitive_dynamic_v4"
+        )
+        self.assertEqual(contract.predicates, FREDDIE_PRIMITIVE_DYNAMIC_V4)
+        self.assertTrue(contract.atomic_events)
+        self.assertTrue(contract.f0_eligible)
+
+    def test_ordered_group_split_keeps_cohorts_disjoint_and_ordered(self) -> None:
+        rows = []
+        bounds = []
+        for sequence in range(6):
+            group = 1 + sequence // 2
+            rows.append(
+                {
+                    "sequence_id": f"g{sequence}",
+                    "position": 0,
+                    "month_index": 0,
+                    "target_token": int(sequence % 2 == 0),
+                    "a": 0,
+                }
+            )
+            bounds.append(
+                {
+                    "sequence_id": f"g{sequence}",
+                    "start_month": 0,
+                    "end_month": 1,
+                    "vintage": group,
+                }
+            )
+        data = EventData.from_frame(
+            pd.DataFrame(rows),
+            predicate_names=("a",),
+            bounds=pd.DataFrame(bounds),
+            split_group_col="vintage",
+        )
+        splits = split_contexts(
+            data,
+            fractions=(1 / 3, 1 / 3, 1 / 3),
+            strategy="ordered_group",
+        )
+        self.assertEqual(splits.split_strategy, "ordered_group")
+        self.assertEqual(splits.split_groups, ((1,), (2,), (3,)))
+        observed = [
+            set(data.sequence_split_groups[ctx.global_sequence_ids].tolist())
+            for ctx in (splits.fit, splits.cert, splits.test)
+        ]
+        self.assertEqual(observed, [{1}, {2}, {3}])
+
+    def test_first_event_loan_age_baseline_is_registered_nuisance(self) -> None:
+        rows = []
+        bounds = []
+        for sequence in range(12):
+            target_time = 5 if sequence % 3 == 0 else None
+            end = target_time if target_time is not None else 8
+            rows.append(
+                {
+                    "sequence_id": f"a{sequence}",
+                    "position": 0,
+                    "month_index": target_time if target_time is not None else 1,
+                    "target_token": int(target_time is not None),
+                    "a": 0,
+                }
+            )
+            bounds.append(
+                {
+                    "sequence_id": f"a{sequence}",
+                    "start_month": 0,
+                    "end_month": end,
+                    "start_loan_age": 0,
+                }
+            )
+        data = EventData.from_frame(
+            pd.DataFrame(rows),
+            predicate_names=("a",),
+            bounds=pd.DataFrame(bounds),
+            start_age_col="start_loan_age",
+            preprocessing_provenance={"target_process": "first_event"},
+        )
+        pipeline = CertSCRPipeline(
+            data,
+            rule_predicates=("a",),
+            config=CertSCRConfig(
+                q_max=1,
+                impact_lag=4,
+                knot_count=2,
+                max_formation_window=2,
+                target_history_control=False,
+                loan_age_baseline=True,
+                occurrence_likelihood="first_event_cloglog",
+            ),
+        )
+        self.assertEqual(pipeline.loan_age_baseline_milestones, (0, 4))
+        self.assertEqual(len(pipeline.loan_age_baseline_source_ids), 2)
+        self.assertTrue(
+            set(pipeline.loan_age_baseline_source_ids).isdisjoint(
+                pipeline.rule_source_ids
+            )
+        )
+        fit = pipeline.fit_baseline()
+        self.assertTrue(fit.converged)
+        self.assertEqual(len(fit.gamma), 4)
 
     def test_zero_padded_mean_test_matches_explicit_dense_test(self) -> None:
         rng = np.random.default_rng(20260715)
@@ -507,6 +947,855 @@ class StatisticsTests(unittest.TestCase):
         self.assertTrue(certified)
         self.assertLessEqual(residual, 1.0e-7)
         self.assertAlmostEqual(objective, reused.nll, places=10)
+
+    def test_fitted_null_hessian_reuse_preserves_child_optimum(self) -> None:
+        data = synthetic_data(seed=1607, n_sequences=115)
+        ctx = make_context(data, "null-hessian-reuse", np.arange(data.n_sequences))
+        engine = RuleOccurrenceEngine(data, lag=5, knot_count=2)
+        controls = (
+            engine.sparse_response(ctx, (1,), 0),
+            engine.sparse_response(ctx, (0,), 1),
+        )
+        rule = RuleIdentity((0, 1), 2, -1)
+        feature = engine.sparse_response(ctx, rule.antecedent, rule.window).projected(
+            np.asarray([0.35, 0.65], dtype=np.float64)
+        )
+        null_prepared = prepare_fixed_support_design(ctx, controls, (), ())
+        child_prepared = prepare_fixed_support_design(
+            ctx, controls, (feature,), (rule,)
+        )
+        null = _fit_fixed_support_numpy64(
+            null_prepared,
+            (),
+            (),
+            max_iter=120,
+            tolerance=1.0e-8,
+            initial=None,
+        )
+        self.assertTrue(null.converged)
+        self.assertIsNotNone(null.solver_hessian)
+        reused = _fit_fixed_support_numpy64(
+            child_prepared,
+            (rule,),
+            (),
+            max_iter=120,
+            tolerance=1.0e-8,
+            initial=null,
+        )
+        cold_state = replace(null, solver_hessian=None)
+        ordinary = _fit_fixed_support_numpy64(
+            child_prepared,
+            (rule,),
+            (),
+            max_iter=120,
+            tolerance=1.0e-8,
+            initial=cold_state,
+        )
+        self.assertTrue(reused.converged)
+        self.assertTrue(ordinary.converged)
+        self.assertAlmostEqual(reused.nll, ordinary.nll, places=10)
+        self.assertTrue(
+            np.allclose(reused.gamma, ordinary.gamma, rtol=0.0, atol=2.0e-8)
+        )
+        self.assertTrue(
+            np.allclose(reused.theta, ordinary.theta, rtol=0.0, atol=2.0e-8)
+        )
+        self.assertLessEqual(reused.kkt_residual, 1.0e-8)
+
+    @unittest.skipUnless(
+        torch is not None and torch.cuda.is_available(),
+        "CUDA is unavailable",
+    )
+    def test_cuda_first_event_cloglog_matches_host_certificate(self) -> None:
+        rule = RuleIdentity((0,), 0, 1)
+        prepared = PreparedFixedSupportDesign(
+            design=np.asarray(
+                [
+                    [1.0, 0.2],
+                    [1.0, 1.0],
+                    [1.0, 1.5],
+                    [1.0, 0.0],
+                    [1.0, 0.5],
+                    [1.0, 1.0],
+                    [1.0, 2.0],
+                ],
+                dtype=np.float32,
+            ),
+            n_events=3,
+            event_weights=np.ones(3, dtype=np.float64),
+            grid_weights=np.full(4, 5.0, dtype=np.float64),
+            constrained_start=1,
+            control_width=0,
+            knot_count=1,
+            active_grid_rows=4,
+            rules=(rule,),
+            occurrence_likelihood="first_event_cloglog",
+        )
+        host = fit_fixed_support(
+            None,
+            (),
+            (),
+            (rule,),
+            device="cpu",
+            dtype="float64",
+            max_iter=120,
+            tolerance=1.0e-8,
+            prepared_design=prepared,
+            occurrence_likelihood="first_event_cloglog",
+        )
+        device = fit_fixed_support(
+            None,
+            (),
+            (),
+            (rule,),
+            device="cuda:0",
+            dtype="float64",
+            max_iter=120,
+            tolerance=1.0e-8,
+            prepared_design=prepared,
+            occurrence_likelihood="first_event_cloglog",
+        )
+        self.assertTrue(host.converged)
+        self.assertTrue(device.converged)
+        self.assertAlmostEqual(device.nll, host.nll, places=11)
+        self.assertTrue(
+            np.allclose(device.theta, host.theta, rtol=0.0, atol=1.0e-10)
+        )
+
+    def test_sparse_nuisance_partition_refinement_preserves_exact_fit(self) -> None:
+        data = synthetic_data(seed=817, n_sequences=110)
+        ctx = make_context(data, "partition-refinement", np.arange(data.n_sequences))
+        engine = RuleOccurrenceEngine(data, lag=4, knot_count=2)
+        weights = 0.75 + (np.arange(ctx.n_sequences, dtype=np.float64) % 5) / 8.0
+        fixed = (engine.sparse_response(ctx, (1,), 0),)
+        dynamic = (engine.sparse_response(ctx, (0,), 1),)
+        rule = RuleIdentity((0, 1), 2, -1)
+        feature = engine.sparse_response(ctx, rule.antecedent, rule.window)
+        direct = prepare_fixed_support_design(
+            ctx,
+            (*fixed, *dynamic),
+            (feature,),
+            (rule,),
+            cluster_weights=weights,
+        )
+        base = prepare_sparse_nuisance_partition(
+            ctx,
+            fixed,
+            cluster_weights=weights,
+        )
+        refined = refine_sparse_nuisance_partition(
+            ctx,
+            base,
+            dynamic,
+            (feature,),
+            (rule,),
+            cluster_weights=weights,
+        )
+        direct_fit = fit_fixed_support(
+            ctx,
+            (),
+            (),
+            (rule,),
+            device="cpu",
+            dtype="float64",
+            max_iter=120,
+            tolerance=1.0e-7,
+            prepared_design=direct,
+        )
+        refined_fit = fit_fixed_support(
+            ctx,
+            (),
+            (),
+            (rule,),
+            device="cpu",
+            dtype="float64",
+            max_iter=120,
+            tolerance=1.0e-7,
+            prepared_design=refined,
+        )
+        self.assertTrue(direct_fit.converged)
+        self.assertTrue(refined_fit.converged)
+        self.assertAlmostEqual(direct_fit.nll, refined_fit.nll, places=10)
+        self.assertTrue(
+            np.allclose(direct_fit.gamma, refined_fit.gamma, rtol=0.0, atol=1e-9)
+        )
+        self.assertTrue(
+            np.allclose(direct_fit.theta, refined_fit.theta, rtol=0.0, atol=1e-9)
+        )
+
+    def test_sparse_delta_native_fit_matches_materialized_poisson(self) -> None:
+        data = synthetic_data(seed=881, n_sequences=180)
+        ctx = make_context(data, "sparse-delta-poisson", np.arange(data.n_sequences))
+        engine = RuleOccurrenceEngine(data, lag=4, knot_count=2)
+        weights = 0.7 + (np.arange(ctx.n_sequences) % 4) * 0.15
+        fixed = (engine.sparse_response(ctx, (1,), 0),)
+        closure = (engine.sparse_response(ctx, (0,), 1),)
+        closure_terms = (((0,), 1),)
+        rule = RuleIdentity((0, 1), 2, 1)
+        feature = engine.sparse_response(ctx, rule.antecedent, rule.window)
+        direct = prepare_fixed_support_design(
+            ctx,
+            (*fixed, *closure),
+            (feature,),
+            (rule,),
+            cluster_weights=weights,
+        )
+        base = prepare_sparse_nuisance_partition(
+            ctx, fixed, cluster_weights=weights
+        )
+        sparse = prepare_sparse_delta_support_design(
+            ctx,
+            base,
+            closure,
+            closure_terms,
+            (feature,),
+            (rule,),
+            cluster_weights=weights,
+        )
+        direct_fit = fit_fixed_support(
+            ctx,
+            (),
+            (),
+            (rule,),
+            device="cpu",
+            dtype="float64",
+            max_iter=160,
+            tolerance=1.0e-7,
+            prepared_design=direct,
+            closure_terms=closure_terms,
+        )
+        sparse_fit = fit_sparse_delta_support(
+            sparse, max_iter=160, tolerance=1.0e-7
+        )
+        direct_closure = prepare_fixed_support_design(
+            ctx,
+            (*fixed, *closure),
+            (),
+            (),
+            cluster_weights=weights,
+        )
+        direct_closure_fit = fit_fixed_support(
+            ctx,
+            (),
+            (),
+            (),
+            device="cpu",
+            dtype="float64",
+            max_iter=160,
+            tolerance=1.0e-7,
+            prepared_design=direct_closure,
+            closure_terms=closure_terms,
+        )
+        sparse_closure_fit = fit_sparse_delta_closure(
+            sparse, max_iter=160, tolerance=1.0e-7
+        )
+        self.assertIsNotNone(sparse_fit)
+        assert sparse_fit is not None
+        self.assertTrue(direct_fit.converged)
+        self.assertTrue(sparse_fit.converged)
+        self.assertIsNotNone(sparse_closure_fit)
+        assert sparse_closure_fit is not None
+        self.assertTrue(sparse_closure_fit.converged)
+        self.assertAlmostEqual(
+            direct_closure_fit.nll, sparse_closure_fit.nll, places=9
+        )
+        self.assertAlmostEqual(direct_fit.nll, sparse_fit.nll, places=9)
+        self.assertTrue(
+            np.allclose(direct_fit.gamma, sparse_fit.gamma, rtol=0.0, atol=1e-8)
+        )
+        self.assertTrue(
+            np.allclose(direct_fit.theta, sparse_fit.theta, rtol=0.0, atol=1e-8)
+        )
+        self.assertEqual(
+            sparse_delta_rule_recession_columns(sparse),
+            CertSCRPipeline._nonattained_rule_recession_columns(direct),
+        )
+
+    def test_incremental_window_partition_equals_fresh_cumulative_design(self) -> None:
+        data = synthetic_data(seed=819, n_sequences=125)
+        ctx = make_context(data, "incremental-window", np.arange(data.n_sequences))
+        engine = RuleOccurrenceEngine(data, lag=5, knot_count=3)
+        weights = 0.9 + (np.arange(ctx.n_sequences) % 4) * 0.15
+        fixed: tuple[SparseKernelResponse, ...] = ()
+        base = prepare_sparse_nuisance_partition(
+            ctx, fixed, cluster_weights=weights
+        )
+        rule_one = RuleIdentity((0, 1), 1, 1)
+        dynamic_one = (
+            engine.sparse_response(ctx, (0,), 1),
+            engine.sparse_response(ctx, (1,), 1),
+        )
+        initial = refine_sparse_nuisance_partition(
+            ctx,
+            base,
+            dynamic_one,
+            (engine.sparse_response(ctx, rule_one.antecedent, 1),),
+            (rule_one,),
+            cluster_weights=weights,
+            return_partition=True,
+        )
+        self.assertIsInstance(initial, IncrementalSupportPartition)
+        assert isinstance(initial, IncrementalSupportPartition)
+        rule_three = RuleIdentity((0, 1), 3, 1)
+        updated = update_incremental_support_partition(
+            ctx,
+            initial,
+            (
+                engine.sparse_window_delta_response(ctx, (0,), 1, 3),
+                engine.sparse_window_delta_response(ctx, (1,), 1, 3),
+            ),
+            (
+                engine.sparse_window_delta_response(
+                    ctx, rule_three.antecedent, 1, 3
+                ),
+            ),
+            (rule_three,),
+            cluster_weights=weights,
+        )
+        direct = prepare_fixed_support_design(
+            ctx,
+            (
+                *fixed,
+                engine.sparse_response(ctx, (0,), 3),
+                engine.sparse_response(ctx, (1,), 3),
+            ),
+            (engine.sparse_response(ctx, rule_three.antecedent, 3),),
+            (rule_three,),
+            cluster_weights=weights,
+        )
+        probe = FitResult(
+            rules=(rule_three,),
+            closure_terms=(),
+            alpha=-2.4,
+            gamma=np.linspace(-0.12, 0.14, direct.control_width),
+            theta=np.asarray([[0.08, 0.03, 0.11]]),
+            nll=math.inf,
+            kkt_residual=math.inf,
+            converged=False,
+            iterations=0,
+            device="test",
+        )
+        _, direct_probe_kkt, direct_probe_nll = fixed_support_projected_kkt(
+            direct, probe, tolerance=1.0e-9
+        )
+        _, updated_probe_kkt, updated_probe_nll = fixed_support_projected_kkt(
+            updated.prepared, probe, tolerance=1.0e-9
+        )
+        self.assertAlmostEqual(direct_probe_nll, updated_probe_nll, places=12)
+        self.assertAlmostEqual(direct_probe_kkt, updated_probe_kkt, places=11)
+        direct_fit = fit_fixed_support(
+            ctx,
+            (),
+            (),
+            (rule_three,),
+            device="cpu",
+            dtype="float64",
+            max_iter=120,
+            tolerance=1.0e-7,
+            prepared_design=direct,
+        )
+        updated_fit = fit_fixed_support(
+            ctx,
+            (),
+            (),
+            (rule_three,),
+            device="cpu",
+            dtype="float64",
+            max_iter=120,
+            tolerance=1.0e-7,
+            prepared_design=updated.prepared,
+        )
+        self.assertTrue(direct_fit.converged)
+        self.assertTrue(updated_fit.converged)
+        self.assertAlmostEqual(direct_fit.nll, updated_fit.nll, places=10)
+        self.assertTrue(
+            np.allclose(direct_fit.gamma, updated_fit.gamma, rtol=0.0, atol=1e-7)
+        )
+        self.assertTrue(
+            np.allclose(direct_fit.theta, updated_fit.theta, rtol=0.0, atol=1e-7)
+        )
+
+    def test_incremental_native_update_clamps_only_accumulation_roundoff(self) -> None:
+        # IPW groups can contain thousands of equal positive masses.  The old
+        # group sum and the later row-wise subtraction are legal but different
+        # floating-point summation orders.  Simulate the Freddie deficit:
+        # larger than 128 eps, yet inside the standard gamma_k error bound.
+        row_count = 4096
+        active_rows = np.arange(row_count, dtype=np.int64)
+        active_weights = np.full(row_count, 50.0 / row_count, dtype=np.float64)
+        exact_active_mass = float(np.sum(active_weights, dtype=np.float64))
+        rounded_old_mass = exact_active_mass - 2.0e-11
+        grouped = update_sparse_design_partitioned(
+            active_rows,
+            active_weights,
+            np.zeros(row_count, dtype=np.int32),
+            np.asarray([[1.0, 0.0]], dtype=np.float32),
+            np.asarray([rounded_old_mass], dtype=np.float64),
+            np.empty(0, dtype=np.int32),
+            np.empty((0, 2), dtype=np.float32),
+            np.empty(0, dtype=np.float64),
+            (active_rows,),
+            (np.ones((row_count, 1), dtype=np.float32),),
+            (np.empty((0, 1), dtype=np.float32),),
+            (1,),
+            (1.0,),
+        )
+        self.assertIsNotNone(grouped)
+        assert grouped is not None
+        _design, event_rows, mass, _representatives = grouped[:4]
+        self.assertEqual(event_rows, 0)
+        self.assertAlmostEqual(float(np.sum(mass)), exact_active_mass, places=10)
+
+        with self.assertRaisesRegex(RuntimeError, "status -64"):
+            update_sparse_design_partitioned(
+                active_rows,
+                active_weights,
+                np.zeros(row_count, dtype=np.int32),
+                np.asarray([[1.0, 0.0]], dtype=np.float32),
+                np.asarray([exact_active_mass - 1.0e-6], dtype=np.float64),
+                np.empty(0, dtype=np.int32),
+                np.empty((0, 2), dtype=np.float32),
+                np.empty(0, dtype=np.float64),
+                (active_rows,),
+                (np.ones((row_count, 1), dtype=np.float32),),
+                (np.empty((0, 1), dtype=np.float32),),
+                (1,),
+                (1.0,),
+            )
+
+    def test_appended_rule_partition_matches_cold_hierarchy_support_fit(self) -> None:
+        data = synthetic_data(seed=1441, n_sequences=140)
+        pipeline = CertSCRPipeline(
+            data,
+            rule_predicates=("pred_a", "pred_b"),
+            config=CertSCRConfig(
+                q_max=2,
+                impact_lag=3,
+                knot_count=2,
+                max_formation_window=2,
+                solver_device="cpu",
+                solver_dtype="float64",
+                solver_max_iter=120,
+                solver_tolerance=1.0e-7,
+            ),
+        )
+        rule = RuleIdentity((0, 1), 2, -1)
+        closure = pipeline.hierarchy_closure((rule,))
+        features = pipeline.sparse_features(pipeline.splits.fit, (rule,))
+        weights = np.ones(pipeline.splits.fit.n_sequences, dtype=np.float64)
+        weights[::11] = 0.0
+        pipeline.fit_cluster_weights = weights
+        base = pipeline.prepare_partitioned_support_design(
+            pipeline.splits.fit,
+            closure,
+            [],
+            [],
+            cluster_weights=weights,
+            return_partition=True,
+        )
+        self.assertIsInstance(base, IncrementalSupportPartition)
+        assert isinstance(base, IncrementalSupportPartition)
+        appended = append_rules_to_incremental_partition(
+            pipeline.splits.fit,
+            base,
+            features,
+            (rule,),
+            cluster_weights=weights,
+            occurrence_likelihood=pipeline.occurrence_likelihood,
+        )
+        self.assertIsNotNone(appended)
+        assert appended is not None
+        factorized = prepare_delta_factorized_support_design(
+            pipeline.splits.fit,
+            base,
+            features,
+            (rule,),
+            cluster_weights=weights,
+            occurrence_likelihood=pipeline.occurrence_likelihood,
+        )
+        probe = np.linspace(
+            -0.25,
+            0.35,
+            appended.prepared.design.shape[1],
+            dtype=np.float64,
+        )
+        probe[appended.prepared.constrained_start :] = np.abs(
+            probe[appended.prepared.constrained_start :]
+        )
+        dense_objective, dense_gradient, dense_hessian = (
+            _prepared_objective_grad_hessian_numpy(
+                appended.prepared, probe
+            )
+        )
+        delta_objective, delta_gradient, delta_hessian = (
+            _factorized_objective_grad_hessian_numpy(factorized, probe)
+        )
+        self.assertAlmostEqual(
+            _prepared_objective_numpy(appended.prepared, probe),
+            _factorized_objective_numpy(factorized, probe),
+            places=10,
+        )
+        self.assertAlmostEqual(dense_objective, delta_objective, places=10)
+        self.assertTrue(
+            np.allclose(dense_gradient, delta_gradient, rtol=1e-11, atol=1e-10)
+        )
+        assert dense_hessian is not None
+        self.assertTrue(
+            np.allclose(dense_hessian, delta_hessian, rtol=1e-10, atol=1e-10)
+        )
+        _, _, base_hessian = _prepared_objective_grad_hessian_numpy(
+            factorized.base,
+            probe[: factorized.constrained_start],
+        )
+        assert base_hessian is not None
+        cached_objective, cached_gradient, cached_hessian = (
+            _factorized_objective_grad_hessian_numpy(
+                factorized,
+                probe,
+                closure_hessian=base_hessian,
+            )
+        )
+        self.assertAlmostEqual(delta_objective, cached_objective, places=12)
+        self.assertTrue(np.array_equal(delta_gradient, cached_gradient))
+        self.assertTrue(
+            np.allclose(delta_hessian, cached_hessian, rtol=0.0, atol=1e-12)
+        )
+        self.assertEqual(
+            factorized_rule_recession_columns(factorized),
+            CertSCRPipeline._nonattained_rule_recession_columns(
+                appended.prepared
+            ),
+        )
+        # Strong inhibition must be evaluated as residual-base plus the
+        # active likelihood, not by subtracting two nearly equal large base
+        # terms.  The compact path remains identical to the materialized child
+        # even when exp(delta) is close to machine zero.
+        extreme = probe.copy()
+        extreme[factorized.constrained_start :] = 80.0
+        dense_extreme = _prepared_objective_grad_hessian_numpy(
+            appended.prepared, extreme
+        )
+        factorized_extreme = _factorized_objective_grad_hessian_numpy(
+            factorized, extreme
+        )
+        self.assertTrue(np.isfinite(factorized_extreme[0]))
+        self.assertAlmostEqual(
+            dense_extreme[0], factorized_extreme[0], places=9
+        )
+        self.assertTrue(
+            np.allclose(
+                dense_extreme[1],
+                factorized_extreme[1],
+                rtol=1e-11,
+                atol=1e-9,
+            )
+        )
+        assert dense_extreme[2] is not None
+        self.assertTrue(
+            np.allclose(
+                dense_extreme[2],
+                factorized_extreme[2],
+                rtol=1e-10,
+                atol=1e-9,
+            )
+        )
+        cold = pipeline.prepare_partitioned_support_design(
+            pipeline.splits.fit,
+            closure,
+            features,
+            (rule,),
+            cluster_weights=weights,
+        )
+        direct_fit = fit_fixed_support(
+            pipeline.splits.fit,
+            (),
+            (),
+            (rule,),
+            device="cpu",
+            dtype="float64",
+            max_iter=120,
+            tolerance=1.0e-7,
+            prepared_design=cold,
+        )
+        appended_fit = fit_fixed_support(
+            pipeline.splits.fit,
+            (),
+            (),
+            (rule,),
+            device="cpu",
+            dtype="float64",
+            max_iter=120,
+            tolerance=1.0e-7,
+            prepared_design=appended.prepared,
+        )
+        factorized_fit = fit_delta_factorized_support(
+            factorized,
+            closure,
+            max_iter=120,
+            tolerance=1.0e-7,
+        )
+        self.assertTrue(direct_fit.converged)
+        self.assertTrue(appended_fit.converged)
+        self.assertTrue(factorized_fit.converged)
+        self.assertAlmostEqual(direct_fit.nll, appended_fit.nll, places=10)
+        self.assertAlmostEqual(
+            direct_fit.nll, factorized_fit.nll, places=9
+        )
+        self.assertTrue(
+            np.allclose(direct_fit.gamma, appended_fit.gamma, rtol=0.0, atol=1e-8)
+        )
+        self.assertTrue(
+            np.allclose(direct_fit.theta, appended_fit.theta, rtol=0.0, atol=1e-8)
+        )
+        self.assertTrue(
+            np.allclose(
+                direct_fit.theta,
+                factorized_fit.theta,
+                rtol=0.0,
+                atol=1e-7,
+            )
+        )
+
+    def test_sparse_partition_refinement_preserves_first_event_cloglog(self) -> None:
+        rows: list[dict] = []
+        bounds: list[dict] = []
+        for sequence in range(72):
+            target_time = 6 if sequence % 4 == 0 else None
+            end_time = target_time if target_time is not None else 9
+            serialized: list[dict] = []
+            b_time = 2 + sequence % 3
+            for month in range(end_time + 1):
+                a = int(month == 1 and sequence % 3 != 0)
+                b = int(month == b_time and sequence % 5 != 0)
+                target = int(target_time is not None and month == target_time)
+                if a or b or target:
+                    serialized.append(
+                        {
+                            "sequence_id": f"c{sequence}",
+                            "position": len(serialized),
+                            "month_index": month,
+                            "target_token": target,
+                            "a": a,
+                            "b": b,
+                        }
+                    )
+            rows.extend(serialized)
+            bounds.append(
+                {
+                    "sequence_id": f"c{sequence}",
+                    "start_month": 0,
+                    "end_month": end_time,
+                }
+            )
+        data = EventData.from_frame(
+            pd.DataFrame(rows),
+            predicate_names=("a", "b"),
+            bounds=pd.DataFrame(bounds),
+        )
+        ctx = make_context(data, "partition-cloglog", np.arange(data.n_sequences))
+        engine = RuleOccurrenceEngine(data, lag=4, knot_count=2)
+        fixed = (engine.sparse_response(ctx, (0,), 0),)
+        dynamic = (engine.sparse_response(ctx, (1,), 0),)
+        rule = RuleIdentity((0, 1), 1, 1)
+        feature = engine.sparse_response(ctx, rule.antecedent, rule.window)
+        weights = 0.8 + (np.arange(ctx.n_sequences) % 3) * 0.2
+        direct = prepare_fixed_support_design(
+            ctx,
+            (*fixed, *dynamic),
+            (feature,),
+            (rule,),
+            cluster_weights=weights,
+            occurrence_likelihood="first_event_cloglog",
+        )
+        base = prepare_sparse_nuisance_partition(
+            ctx,
+            fixed,
+            cluster_weights=weights,
+            occurrence_likelihood="first_event_cloglog",
+        )
+        sparse_delta = prepare_sparse_delta_support_design(
+            ctx,
+            base,
+            dynamic,
+            (((1,), 0),),
+            (feature,),
+            (rule,),
+            cluster_weights=weights,
+            occurrence_likelihood="first_event_cloglog",
+        )
+        partitioned = refine_sparse_nuisance_partition(
+            ctx,
+            base,
+            dynamic,
+            (feature,),
+            (rule,),
+            cluster_weights=weights,
+            occurrence_likelihood="first_event_cloglog",
+            return_partition=True,
+        )
+        self.assertIsInstance(partitioned, IncrementalSupportPartition)
+        assert isinstance(partitioned, IncrementalSupportPartition)
+        refined = partitioned.prepared
+        closure_partition = refine_sparse_nuisance_partition(
+            ctx,
+            base,
+            dynamic,
+            (),
+            (),
+            cluster_weights=weights,
+            occurrence_likelihood="first_event_cloglog",
+            return_partition=True,
+        )
+        self.assertIsInstance(closure_partition, IncrementalSupportPartition)
+        assert isinstance(closure_partition, IncrementalSupportPartition)
+        factorized = prepare_delta_factorized_support_design(
+            ctx,
+            closure_partition,
+            (feature,),
+            (rule,),
+            cluster_weights=weights,
+            occurrence_likelihood="first_event_cloglog",
+        )
+        probe = np.linspace(
+            -0.35,
+            0.3,
+            direct.design.shape[1],
+            dtype=np.float64,
+        )
+        probe[direct.constrained_start :] = np.abs(
+            probe[direct.constrained_start :]
+        )
+        dense_objective, dense_gradient, dense_hessian = (
+            _prepared_objective_grad_hessian_numpy(direct, probe)
+        )
+        delta_objective, delta_gradient, delta_hessian = (
+            _factorized_objective_grad_hessian_numpy(factorized, probe)
+        )
+        self.assertAlmostEqual(dense_objective, delta_objective, places=9)
+        self.assertTrue(
+            np.allclose(dense_gradient, delta_gradient, rtol=1e-10, atol=1e-9)
+        )
+        assert dense_hessian is not None
+        self.assertTrue(
+            np.allclose(dense_hessian, delta_hessian, rtol=1e-9, atol=1e-9)
+        )
+        dense_fit = fit_fixed_support(
+            ctx,
+            (),
+            (),
+            (rule,),
+            device="cpu",
+            dtype="float64",
+            max_iter=120,
+            tolerance=1.0e-7,
+            prepared_design=direct,
+            occurrence_likelihood="first_event_cloglog",
+        )
+        factorized_fit = fit_delta_factorized_support(
+            factorized,
+            (),
+            max_iter=120,
+            tolerance=1.0e-7,
+        )
+        sparse_delta_fit = fit_sparse_delta_support(
+            sparse_delta,
+            max_iter=120,
+            tolerance=1.0e-7,
+        )
+        self.assertTrue(dense_fit.converged)
+        self.assertTrue(factorized_fit.converged)
+        self.assertIsNotNone(sparse_delta_fit)
+        assert sparse_delta_fit is not None
+        self.assertTrue(sparse_delta_fit.converged)
+        self.assertAlmostEqual(dense_fit.nll, factorized_fit.nll, places=8)
+        self.assertAlmostEqual(dense_fit.nll, sparse_delta_fit.nll, places=8)
+        self.assertTrue(
+            np.allclose(
+                dense_fit.theta,
+                factorized_fit.theta,
+                rtol=0.0,
+                atol=1e-7,
+            )
+        )
+        self.assertTrue(
+            np.allclose(
+                dense_fit.theta,
+                sparse_delta_fit.theta,
+                rtol=0.0,
+                atol=1e-7,
+            )
+        )
+        initial = FitResult(
+            rules=(rule,),
+            closure_terms=(),
+            alpha=-2.0,
+            gamma=np.asarray([0.1, -0.2, 0.05, -0.1]),
+            theta=np.asarray([[0.15, 0.05]]),
+            nll=math.inf,
+            kkt_residual=math.inf,
+            converged=False,
+            iterations=0,
+            device="test",
+        )
+        direct_ok, direct_kkt, direct_objective = fixed_support_projected_kkt(
+            direct, initial, tolerance=1.0e-7
+        )
+        refined_ok, refined_kkt, refined_objective = fixed_support_projected_kkt(
+            refined, initial, tolerance=1.0e-7
+        )
+        self.assertEqual(direct_ok, refined_ok)
+        self.assertAlmostEqual(direct_objective, refined_objective, places=11)
+        self.assertAlmostEqual(direct_kkt, refined_kkt, places=10)
+        rule_three = RuleIdentity((0, 1), 3, 1)
+        updated = update_incremental_support_partition(
+            ctx,
+            partitioned,
+            (),
+            (
+                engine.sparse_window_delta_response(
+                    ctx, rule_three.antecedent, 1, 3
+                ),
+            ),
+            (rule_three,),
+            cluster_weights=weights,
+            occurrence_likelihood="first_event_cloglog",
+        )
+        direct_three = prepare_fixed_support_design(
+            ctx,
+            (*fixed, *dynamic),
+            (engine.sparse_response(ctx, rule_three.antecedent, 3),),
+            (rule_three,),
+            cluster_weights=weights,
+            occurrence_likelihood="first_event_cloglog",
+        )
+        probe_three = replace(initial, rules=(rule_three,))
+        _, updated_kkt, updated_objective = fixed_support_projected_kkt(
+            updated.prepared, probe_three, tolerance=1.0e-7
+        )
+        _, direct_three_kkt, direct_three_objective = fixed_support_projected_kkt(
+            direct_three, probe_three, tolerance=1.0e-7
+        )
+        self.assertAlmostEqual(updated_objective, direct_three_objective, places=11)
+        self.assertAlmostEqual(updated_kkt, direct_three_kkt, places=10)
+
+    def test_minimum_event_activating_span_matches_full_sparse_responses(self) -> None:
+        data = synthetic_data(seed=821, n_sequences=95)
+        ctx = make_context(data, "event-activation-span", np.arange(data.n_sequences))
+        engine = RuleOccurrenceEngine(data, lag=5, knot_count=3)
+        windows = [0, 1, 2, 3, 4]
+        for antecedent in ((0,), (1,), (0, 1)):
+            exact = [
+                window
+                for window, response in engine.iter_window_sparse_responses(
+                    ctx, antecedent, windows
+                )
+                if np.any(response.event_values != 0.0)
+            ]
+            expected = min(exact) if exact else None
+            observed = engine.minimum_event_activating_span(
+                ctx, antecedent, max_window=max(windows)
+            )
+            self.assertEqual(observed, expected)
 
     def test_group_saturated_bound_is_below_exact_signed_kernel_optimum(self) -> None:
         frame = pd.DataFrame(
@@ -853,6 +2142,10 @@ class StatisticsTests(unittest.TestCase):
         self.assertIsNone(config.max_gradient_triplets)
         self.assertIsNone(config.support_pool_size)
         self.assertEqual(config.active_start_policy, "all_atoms")
+        self.assertEqual(
+            config.active_neighbor_strategy,
+            "exact_one_exchange",
+        )
         self.assertEqual(config.support_family, "terminal_atoms")
         self.assertEqual(config.certification_mode, "auto")
         self.assertEqual(config.solver_device, "cpu")
@@ -899,6 +2192,7 @@ class StatisticsTests(unittest.TestCase):
             {"target_history_control": 1},
             {"active_restarts": 0},
             {"active_start_policy": "random_top_k"},
+            {"active_neighbor_strategy": "beam"},
             {"support_family": "all_visited_unconditionally"},
             {"support_pool_size": 0},
             {"search_improvement_tolerance": -1.0},
@@ -1379,6 +2673,134 @@ class OccurrenceTests(unittest.TestCase):
         rebuilt = engine.sparse_response(ctx, (1,), 0)
         self.assertIsNot(rebuilt, first)
 
+    def test_persistent_sparse_response_store_is_exact_and_cross_run_mmap(self) -> None:
+        data = self.data()
+        ctx = make_context(data, "persistent-response", np.asarray([0, 1]))
+        with tempfile.TemporaryDirectory() as directory:
+            writer = RuleOccurrenceEngine(
+                data,
+                lag=3,
+                knot_count=2,
+                feature_cache_bytes=1,
+                persistent_response_dir=directory,
+                persistent_response_bytes=1024**2,
+            )
+            expected = writer.persist_sparse_response(ctx, (0,), 0)
+            shape = np.asarray([0.25, 0.75], dtype=np.float64)
+            expected_projected = writer.persist_sparse_response(
+                ctx, (0,), 0, shape=shape
+            )
+            self.assertEqual(writer.persistent_response_writes, 2)
+
+            reader = RuleOccurrenceEngine(
+                data,
+                lag=3,
+                knot_count=2,
+                feature_cache_bytes=0,
+                persistent_response_dir=directory,
+                persistent_response_bytes=1024**2,
+            )
+            reader._build_sparse_response = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                AssertionError("persistent response was rebuilt")
+            )
+            observed = reader.sparse_response(ctx, (0,), 0)
+            observed_projected = reader.sparse_projected_response(
+                ctx, (0,), 0, shape
+            )
+            np.testing.assert_array_equal(
+                observed.grid_indices, expected.grid_indices
+            )
+            np.testing.assert_array_equal(
+                observed.grid_values, expected.grid_values
+            )
+            np.testing.assert_array_equal(
+                observed.event_values, expected.event_values
+            )
+            np.testing.assert_array_equal(
+                observed_projected.grid_values,
+                expected_projected.grid_values,
+            )
+            self.assertIsInstance(observed.grid_values, np.memmap)
+            self.assertGreaterEqual(reader.persistent_response_hits, 2)
+
+    def test_persistent_mmaps_share_the_resident_feature_cache_budget(self) -> None:
+        data = self.data()
+        ctx = make_context(data, "persistent-resident-budget", np.asarray([0, 1]))
+        with tempfile.TemporaryDirectory() as directory:
+            writer = RuleOccurrenceEngine(
+                data,
+                lag=3,
+                knot_count=2,
+                feature_cache_bytes=1,
+                persistent_response_dir=directory,
+                persistent_response_bytes=1024**2,
+            )
+            raw = writer.persist_sparse_response(ctx, (0,), 0)
+            shape = np.asarray([0.25, 0.75], dtype=np.float64)
+            projected = writer.persist_sparse_response(
+                ctx, (0,), 0, shape=shape
+            )
+            resident_limit = max(int(raw.nbytes), int(projected.nbytes))
+            reader = RuleOccurrenceEngine(
+                data,
+                lag=3,
+                knot_count=2,
+                feature_cache_bytes=resident_limit,
+                persistent_response_dir=directory,
+                persistent_response_bytes=1024**2,
+            )
+            observed_raw = reader.sparse_response(ctx, (0,), 0)
+            observed_projected = reader.sparse_projected_response(
+                ctx, (0,), 0, shape
+            )
+            np.testing.assert_array_equal(
+                observed_raw.grid_values, raw.grid_values
+            )
+            np.testing.assert_array_equal(
+                observed_projected.grid_values, projected.grid_values
+            )
+            self.assertLessEqual(
+                reader._feature_cache_bytes
+                + reader._persistent_sparse_cache_bytes,
+                resident_limit,
+            )
+            self.assertGreaterEqual(reader.persistent_response_evictions, 1)
+
+    def test_persistent_response_digest_rejects_changed_event_data(self) -> None:
+        data = self.data()
+        with tempfile.TemporaryDirectory() as directory:
+            original_ctx = make_context(
+                data, "persistent-invalidation", np.asarray([0, 1])
+            )
+            writer = RuleOccurrenceEngine(
+                data,
+                lag=3,
+                knot_count=2,
+                persistent_response_dir=directory,
+                persistent_response_bytes=1024**2,
+            )
+            original = writer.persist_sparse_response(
+                original_ctx, (0,), 0
+            )
+            self.assertGreater(len(original.grid_indices), 0)
+            changed_predicates = data.predicates.copy()
+            changed_predicates[:, 0] = 0
+            changed = replace(data, predicates=changed_predicates)
+            changed_ctx = make_context(
+                changed, "persistent-invalidation", np.asarray([0, 1])
+            )
+            reader = RuleOccurrenceEngine(
+                changed,
+                lag=3,
+                knot_count=2,
+                feature_cache_bytes=0,
+                persistent_response_dir=directory,
+                persistent_response_bytes=1024**2,
+            )
+            observed = reader.sparse_response(changed_ctx, (0,), 0)
+            self.assertEqual(reader.persistent_response_hits, 0)
+            self.assertEqual(len(observed.grid_indices), 0)
+
     def test_sparse_native_support_fit_equals_dense_support_fit(self) -> None:
         data = synthetic_data(seed=733, n_sequences=120)
         ctx = make_context(data, "sparse-fit", np.arange(data.n_sequences))
@@ -1412,6 +2834,72 @@ class OccurrenceTests(unittest.TestCase):
         self.assertAlmostEqual(dense_fit.nll, sparse_fit.nll, places=9)
         self.assertTrue(np.allclose(dense_fit.gamma, sparse_fit.gamma, atol=1.0e-9))
         self.assertTrue(np.allclose(dense_fit.theta, sparse_fit.theta, atol=1.0e-9))
+
+    def test_sparse_native_first_event_fit_equals_dense_fit(self) -> None:
+        rows = []
+        bounds = []
+        for sequence in range(40):
+            target_time = 5 if sequence % 4 == 0 else None
+            end_time = target_time if target_time is not None else 8
+            serialized = []
+            for time in range(end_time + 1):
+                source = int(time in {1, 3} and sequence % 3 != 0)
+                target = int(target_time is not None and time == target_time)
+                if source or target:
+                    serialized.append(
+                        {
+                            "sequence_id": f"f{sequence}",
+                            "position": len(serialized),
+                            "month_index": time,
+                            "target_token": target,
+                            "a": source,
+                        }
+                    )
+            rows.extend(serialized)
+            bounds.append(
+                {
+                    "sequence_id": f"f{sequence}",
+                    "start_month": 0,
+                    "end_month": end_time,
+                }
+            )
+        data = EventData.from_frame(
+            pd.DataFrame(rows),
+            predicate_names=("a",),
+            bounds=pd.DataFrame(bounds),
+        )
+        ctx = make_context(data, "sparse-first-event", np.arange(data.n_sequences))
+        engine = RuleOccurrenceEngine(data, lag=4, knot_count=2)
+        rule = RuleIdentity((0,), 0, 1)
+        sparse = engine.sparse_response(ctx, (0,), 0)
+        dense = sparse.dense()
+        dense_fit = fit_fixed_support(
+            ctx,
+            (),
+            [dense],
+            [rule],
+            device="cpu",
+            dtype="float64",
+            max_iter=120,
+            tolerance=1.0e-8,
+            occurrence_likelihood="first_event_cloglog",
+        )
+        sparse_fit = fit_fixed_support(
+            ctx,
+            (),
+            [sparse],
+            [rule],
+            device="cpu",
+            dtype="float64",
+            max_iter=120,
+            tolerance=1.0e-8,
+            occurrence_likelihood="first_event_cloglog",
+        )
+        self.assertTrue(dense_fit.converged and sparse_fit.converged)
+        self.assertAlmostEqual(dense_fit.nll, sparse_fit.nll, places=10)
+        self.assertTrue(
+            np.allclose(dense_fit.theta, sparse_fit.theta, rtol=0.0, atol=1.0e-10)
+        )
 
     def test_cumulative_window_responses_equal_independent_responses(self) -> None:
         data = synthetic_data(seed=79, n_sequences=90)
@@ -1972,6 +3460,22 @@ class OccurrenceTests(unittest.TestCase):
 
 
 class HierarchyClosureTests(unittest.TestCase):
+    def test_exact_fit_worker_limit_changes_scheduling_only(self) -> None:
+        name = "CERTSCR_MAX_CONCURRENT_EXACT_FITS"
+        previous = os.environ.get(name)
+        try:
+            os.environ[name] = "3"
+            self.assertEqual(CertSCRPipeline._exact_fit_worker_limit(12), 3)
+            self.assertEqual(CertSCRPipeline._exact_fit_worker_limit(2), 2)
+            os.environ[name] = "0"
+            with self.assertRaises(ValueError):
+                CertSCRPipeline._exact_fit_worker_limit(12)
+        finally:
+            if previous is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = previous
+
     def test_first_event_support_calibration_is_not_mislabeled_hazard_error(self) -> None:
         rows: list[dict] = []
         bounds: list[dict] = []
@@ -2038,6 +3542,14 @@ class HierarchyClosureTests(unittest.TestCase):
                 "estimate": None,
                 "note": "probability calibration requires per-cell survival probabilities",
             },
+        )
+        profile_closures = ((((0,), 0),), (((0,), 1),))
+        pipeline._prefit_profile_nulls(profile_closures)
+        self.assertEqual(
+            pipeline._safe_screen_stats["profile_null_models_batched"], 2
+        )
+        self.assertTrue(
+            all(((), terms) in pipeline._fit_cache for terms in profile_closures)
         )
 
     def test_full_m_mdl_keeps_w_sign_code_but_drops_dictionary_shape_code(self) -> None:
@@ -2116,6 +3628,155 @@ class HierarchyClosureTests(unittest.TestCase):
                 for item in log["candidates"]
             ),
             len(identities),
+        )
+
+    def test_fused_profile_reuses_live_window_response_for_exact_fit(self) -> None:
+        data = synthetic_data(seed=2207, n_sequences=100)
+        pipeline = CertSCRPipeline(
+            data,
+            rule_predicates=("pred_a",),
+            config=CertSCRConfig(
+                q_max=1,
+                impact_lag=3,
+                knot_count=2,
+                max_formation_window=2,
+                solver_device="cpu",
+                solver_dtype="float64",
+                solver_tolerance=1.0e-7,
+                identity_profile="dictionary_mdl",
+                safe_mdl_screen=False,
+            ),
+        )
+        ordinary = pipeline.engine.sparse_response
+        candidate_rebuilds: list[tuple[tuple[int, ...], int]] = []
+
+        def counted(ctx, antecedent, window):
+            if tuple(antecedent) == (0,):
+                candidate_rebuilds.append((tuple(antecedent), int(window)))
+            return ordinary(ctx, antecedent, window)
+
+        pipeline.engine.sparse_response = counted
+        pipeline.profile_rule_identities()
+        self.assertEqual(candidate_rebuilds, [])
+        log = next(
+            item for item in pipeline.profile_logs if item["antecedent"] == [0]
+        )
+        self.assertEqual(
+            pipeline._safe_screen_stats["identity_fused_profile_exact_fits"],
+            int(log["exact_fit_count"]),
+        )
+
+    def test_profile_parent_representatives_preserve_canonical_atom_design(self) -> None:
+        data = synthetic_data(seed=2208, n_sequences=120)
+        pipeline = CertSCRPipeline(
+            data,
+            rule_predicates=("pred_a", "pred_b"),
+            config=CertSCRConfig(
+                q_max=2,
+                impact_lag=4,
+                knot_count=2,
+                max_formation_window=3,
+                solver_device="cpu",
+                solver_dtype="float64",
+                identity_profile="dictionary_mdl",
+                safe_mdl_screen=False,
+            ),
+        )
+        rule = RuleIdentity((0, 1), 2, 1)
+        closure = pipeline.hierarchy_closure((rule,))
+        response = pipeline.engine.sparse_response(
+            pipeline.splits.fit, rule.antecedent, rule.window
+        )
+        nuisance = pipeline.sparse_nuisance_blocks(
+            pipeline.splits.fit, closure
+        )
+        parent = prepare_fixed_support_design(
+            pipeline.splits.fit,
+            nuisance,
+            [response],
+            [rule],
+            cluster_weights=pipeline.fit_cluster_weights,
+            sequence_exposures=pipeline.sequence_exposures(
+                pipeline.splits.fit
+            ),
+            occurrence_likelihood=pipeline.occurrence_likelihood,
+        )
+        self.assertIsNotNone(parent.representative_rows)
+        shape = pipeline.kernel_dictionary[-1]
+        candidates = (
+            RuleIdentity(rule.antecedent, rule.window, -1),
+            rule,
+        )
+        for candidate in candidates:
+            pipeline.rule_dictionary_shapes[candidate] = shape.copy()
+        pipeline._stage_profile_window_designs(
+            candidates,
+            response,
+            full_m_parent=parent,
+        )
+        for candidate in candidates:
+            staged = pipeline._prepared_design_cache.pop(
+                ((candidate,), closure)
+            )
+            direct = prepare_fixed_support_design(
+                pipeline.splits.fit,
+                nuisance,
+                [response.projected(shape)],
+                [candidate],
+                cluster_weights=pipeline.fit_cluster_weights,
+                sequence_exposures=pipeline.sequence_exposures(
+                    pipeline.splits.fit
+                ),
+                occurrence_likelihood=pipeline.occurrence_likelihood,
+            )
+            self.assertTrue(np.array_equal(staged.design, direct.design))
+            self.assertTrue(
+                np.array_equal(staged.event_weights, direct.event_weights)
+            )
+            self.assertTrue(
+                np.array_equal(staged.grid_weights, direct.grid_weights)
+            )
+
+    def test_grouped_parent_identity_moments_equal_sparse_moments(self) -> None:
+        data = synthetic_data(seed=2211, n_sequences=130)
+        pipeline = CertSCRPipeline(
+            data,
+            rule_predicates=("pred_a", "pred_b"),
+            config=CertSCRConfig(
+                q_max=2,
+                impact_lag=4,
+                knot_count=2,
+                max_formation_window=3,
+                solver_device="cpu",
+                solver_dtype="float64",
+                identity_profile="dictionary_mdl",
+                safe_mdl_screen=False,
+            ),
+        )
+        rule = RuleIdentity((0, 1), 2, 1)
+        closure = pipeline.hierarchy_closure((rule,))
+        null = pipeline.fit_model((), closure)
+        response = pipeline.engine.sparse_response(
+            pipeline.splits.fit, rule.antecedent, rule.window
+        )
+        parent = pipeline.prepare_partitioned_support_design(
+            pipeline.splits.fit,
+            closure,
+            (response,),
+            (rule,),
+            cluster_weights=pipeline.fit_cluster_weights,
+        )
+        sparse_gradient, sparse_information = pipeline._identity_moments_at_null(
+            null, response
+        )
+        grouped_gradient, grouped_information = (
+            pipeline._identity_moments_from_grouped_parent(null, parent)
+        )
+        self.assertTrue(
+            np.allclose(sparse_gradient, grouped_gradient, rtol=1e-12, atol=1e-12)
+        )
+        self.assertTrue(
+            np.allclose(sparse_information, grouped_information, rtol=1e-12, atol=1e-12)
         )
 
     def test_rule_irreducibility_uses_global_and_horizon_iut(self) -> None:
@@ -2244,7 +3905,7 @@ class HierarchyClosureTests(unittest.TestCase):
         )
         self.assertEqual(
             pipeline.search_diagnostics["returned_family_definition"],
-            "all_positive_standalone_atoms_hierarchy_links_and_unique_atom_start_local_terminals",
+            "all_positive_standalone_atoms_and_unique_atom_start_local_terminals",
         )
 
     def test_fit_summary_reuse_metadata_can_be_replanned_and_cleared(self) -> None:
@@ -3073,6 +4734,72 @@ class HierarchyClosureTests(unittest.TestCase):
             json.dumps(parallel, sort_keys=True, allow_nan=True),
         )
 
+    def test_closure_group_reuse_matches_cold_support_fits(self) -> None:
+        data = synthetic_data(seed=1931, n_sequences=180)
+        config = CertSCRConfig(
+            q_max=2,
+            impact_lag=4,
+            knot_count=3,
+            max_formation_window=2,
+            solver_workers=1,
+            solver_device="cpu",
+            solver_dtype="float64",
+            solver_max_iter=120,
+            solver_tolerance=1.0e-7,
+            target_history_control=False,
+            safe_mdl_screen=False,
+        )
+        optimized = CertSCRPipeline(
+            data,
+            rule_predicates=("pred_a", "pred_b"),
+            config=config,
+        )
+        cold = CertSCRPipeline(
+            data,
+            rule_predicates=("pred_a", "pred_b"),
+            config=config,
+        )
+        a_rule = RuleIdentity((0,), 0, 1)
+        b_rule = RuleIdentity((1,), 0, -1)
+        supports = ((a_rule,), (b_rule,), (a_rule, b_rule))
+        observed = optimized._fit_one_closure_group(
+            supports, profile="closure-reuse-regression"
+        )
+        expected = [
+            cold._support_record(rules, profile="cold-regression")
+            for rules in supports
+        ]
+        self.assertEqual(
+            [record.rules for record in observed],
+            [record.rules for record in expected],
+        )
+        self.assertTrue(
+            np.allclose(
+                [record.fit.nll for record in observed],
+                [record.fit.nll for record in expected],
+                rtol=0.0,
+                atol=1.0e-8,
+            )
+        )
+        self.assertTrue(
+            np.allclose(
+                [record.search_nll_improvement for record in observed],
+                [record.search_nll_improvement for record in expected],
+                rtol=0.0,
+                atol=1.0e-8,
+            )
+        )
+        self.assertEqual(
+            optimized._safe_screen_stats[
+                "support_sparse_delta_closure_groups"
+            ],
+            1,
+        )
+        self.assertGreater(
+            optimized._safe_screen_stats["support_sparse_delta_fits"],
+            0,
+        )
+
     def test_safe_mdl_screen_rejects_a_provably_zero_response_without_fitting(self) -> None:
         rows = []
         bounds = []
@@ -3425,6 +5152,152 @@ class HierarchyClosureTests(unittest.TestCase):
                     right["selected_block_mdl"],
                     places=7,
                 )
+        for key in (
+            "identity_zero_boundary_kkt_screens",
+            "identity_sign_pair_parent_designs",
+            "identity_sign_pair_child_reuses",
+            "identity_fused_profile_exact_fits",
+            "identity_incremental_partition_rebuilds",
+        ):
+            self.assertEqual(
+                sequential._safe_screen_stats[key],
+                forked._safe_screen_stats[key],
+            )
+
+    def test_skeleton_subset_reprofiles_all_identities_like_complete_family(self) -> None:
+        data = synthetic_data(seed=1517, n_sequences=140)
+        config = CertSCRConfig(
+            q_max=2,
+            impact_lag=3,
+            knot_count=2,
+            max_formation_window=2,
+            solver_device="cpu",
+            solver_dtype="float64",
+            solver_workers=1,
+            solver_max_iter=120,
+            solver_tolerance=1.0e-7,
+            identity_profile="dictionary_mdl",
+            safe_mdl_screen=False,
+        )
+        complete = CertSCRPipeline(
+            data,
+            rule_predicates=("pred_a", "pred_b"),
+            config=config,
+        )
+        restricted = CertSCRPipeline(
+            data,
+            rule_predicates=("pred_a", "pred_b"),
+            config=config,
+        )
+        complete_rules = complete.profile_rule_identities()
+        requested = ((0,), (0, 1))
+        restricted_rules = restricted.profile_rule_identities(
+            antecedent_subset=requested
+        )
+        self.assertEqual(
+            restricted_rules,
+            [rule for rule in complete_rules if rule.antecedent in requested],
+        )
+        complete_logs = {
+            tuple(row["antecedent"]): row for row in complete.profile_logs
+        }
+        restricted_logs = {
+            tuple(row["antecedent"]): row for row in restricted.profile_logs
+        }
+        self.assertEqual(set(restricted_logs), set(requested))
+        for antecedent, right in restricted_logs.items():
+            left = complete_logs[antecedent]
+            self.assertEqual(left["status"], right["status"])
+            self.assertEqual(
+                [(item["window"], item["sign"]) for item in left["candidates"]],
+                [(item["window"], item["sign"]) for item in right["candidates"]],
+            )
+            if left["status"].startswith("profiled"):
+                self.assertEqual(left["selected_window"], right["selected_window"])
+                self.assertEqual(left["selected_sign"], right["selected_sign"])
+                self.assertAlmostEqual(
+                    left["selected_block_mdl"],
+                    right["selected_block_mdl"],
+                    places=8,
+                )
+        with self.assertRaisesRegex(ValueError, "outside the finite family"):
+            CertSCRPipeline(
+                data,
+                rule_predicates=("pred_a", "pred_b"),
+                config=config,
+            ).profile_rule_identities(antecedent_subset=((0, 1, 2),))
+
+    def test_incremental_profile_failure_rebuilds_the_same_exact_identity(self) -> None:
+        base = synthetic_data(seed=1611, n_sequences=180)
+        data = replace(
+            base,
+            predicates=np.column_stack(
+                (
+                    base.predicates,
+                    np.logical_or(
+                        base.predicates[:, 0], base.predicates[:, 1]
+                    ).astype(np.int8),
+                )
+            ),
+            predicate_names=("pred_a", "pred_b", "pred_c"),
+        )
+        common = dict(
+            q_max=3,
+            impact_lag=4,
+            knot_count=2,
+            max_formation_window=3,
+            solver_device="cpu",
+            solver_dtype="float64",
+            solver_workers=1,
+            solver_max_iter=120,
+            solver_tolerance=1.0e-7,
+            identity_profile="dictionary_mdl",
+            safe_mdl_screen=False,
+        )
+        ordinary = CertSCRPipeline(
+            data,
+            rule_predicates=data.predicate_names,
+            config=CertSCRConfig(**common),
+        )
+        rebuilt = CertSCRPipeline(
+            data,
+            rule_predicates=data.predicate_names,
+            config=CertSCRConfig(**common),
+        )
+        expected = ordinary.profile_rule_identities()
+        original_update = pipeline_module.update_incremental_support_partition
+
+        def fail_incremental(*args: object, **kwargs: object) -> object:
+            del args, kwargs
+            raise RuntimeError("forced native incremental failure")
+
+        pipeline_module.update_incremental_support_partition = fail_incremental  # type: ignore[assignment]
+        try:
+            observed = rebuilt.profile_rule_identities()
+        finally:
+            pipeline_module.update_incremental_support_partition = original_update
+        self.assertEqual(observed, expected)
+        self.assertGreater(
+            rebuilt._safe_screen_stats["identity_incremental_partition_rebuilds"],
+            0,
+        )
+        expected_logs = {
+            tuple(row["antecedent"]): row for row in ordinary.profile_logs
+        }
+        observed_logs = {
+            tuple(row["antecedent"]): row for row in rebuilt.profile_logs
+        }
+        for antecedent, left in expected_logs.items():
+            right = observed_logs[antecedent]
+            self.assertEqual(left["status"], right["status"])
+            if left["status"].startswith("profiled"):
+                self.assertEqual(left["selected_window"], right["selected_window"])
+                self.assertEqual(left["selected_sign"], right["selected_sign"])
+                self.assertAlmostEqual(
+                    left["selected_block_mdl"],
+                    right["selected_block_mdl"],
+                    places=8,
+                )
 
     def test_active_set_returns_exact_one_exchange_stationarity_certificate(self) -> None:
         data = synthetic_data(n_sequences=160)
@@ -3442,6 +5315,7 @@ class HierarchyClosureTests(unittest.TestCase):
                 solver_max_iter=120,
                 solver_tolerance=1.0e-7,
                 support_search="active_set",
+                active_neighbor_strategy="exact_one_exchange",
                 active_restarts=4,
                 support_pool_size=8,
             ),
@@ -3468,6 +5342,313 @@ class HierarchyClosureTests(unittest.TestCase):
         for record in records:
             for rule in record.rules:
                 self.assertIn(rule, pipeline.identity_candidates[rule.antecedent])
+
+    def test_gradient_multistart_returns_exact_one_exchange_stationarity(self) -> None:
+        data = synthetic_data(n_sequences=180)
+        pipeline = CertSCRPipeline(
+            data,
+            rule_predicates=("pred_a", "pred_b"),
+            config=CertSCRConfig(
+                q_max=2,
+                impact_lag=3,
+                knot_count=2,
+                max_formation_window=2,
+                max_support_size=2,
+                solver_device="cpu",
+                solver_dtype="float64",
+                solver_max_iter=120,
+                solver_tolerance=1.0e-7,
+                support_search="active_set",
+                active_neighbor_strategy="gradient_first_exact_audit",
+                active_start_policy="all_atoms",
+            ),
+        )
+        records = pipeline.search_supports()
+        self.assertTrue(records)
+        diagnostics = pipeline.search_diagnostics
+        self.assertEqual(
+            diagnostics["method"],
+            "multi-start-gradient-first-exact-one-exchange-column-generation",
+        )
+        self.assertEqual(
+            diagnostics["gradient_pricing"]["role"],
+            "deterministic_ordering_only_no_candidate_removal",
+        )
+        self.assertTrue(diagnostics["runs"])
+        self.assertTrue(
+            all(run["stationary_within_tolerance"] for run in diagnostics["runs"])
+        )
+        self.assertTrue(
+            all(
+                float(run["one_exchange_stationarity_gap"])
+                <= pipeline.config.search_improvement_tolerance
+                for run in diagnostics["runs"]
+            )
+        )
+        self.assertGreaterEqual(
+            diagnostics["gradient_pricing"]["complete_terminal_audits"],
+            diagnostics["terminal_support_count"],
+        )
+        self.assertEqual(
+            diagnostics["atom_anchor_support_count"],
+            diagnostics["start_atom_count"],
+        )
+
+    def test_mdl_score_working_set_has_no_candidate_budget(self) -> None:
+        data = synthetic_data(n_sequences=180)
+        pipeline = CertSCRPipeline(
+            data,
+            rule_predicates=("pred_a", "pred_b"),
+            config=CertSCRConfig(
+                q_max=2,
+                impact_lag=3,
+                knot_count=2,
+                max_formation_window=2,
+                max_support_size=2,
+                solver_device="cpu",
+                solver_dtype="float64",
+                solver_max_iter=120,
+                solver_tolerance=1.0e-7,
+                support_search="active_set",
+                active_neighbor_strategy="mdl_score_working_set",
+                active_start_policy="all_atoms",
+            ),
+        )
+        records = pipeline.search_supports()
+        self.assertTrue(records)
+        diagnostics = pipeline.search_diagnostics
+        self.assertEqual(
+            diagnostics["method"],
+            "multi-start-mdl-block-score-working-set",
+        )
+        self.assertEqual(
+            diagnostics["stationarity_claim"],
+            "block_score_stationary_not_exact_one_exchange_stationary",
+        )
+        pricing = diagnostics["gradient_pricing"]
+        self.assertEqual(
+            pricing["role"],
+            "MDL_calibrated_full_dictionary_working_set_no_top_k_or_budget",
+        )
+        self.assertEqual(pricing["complete_terminal_audits"], 0)
+        self.assertGreater(pricing["block_score_terminal_certificates"], 0)
+        self.assertTrue(diagnostics["runs"])
+        self.assertTrue(
+            all(run["stationary_within_tolerance"] for run in diagnostics["runs"])
+        )
+        self.assertTrue(
+            all("block_score_stationarity_gap" in run for run in diagnostics["runs"])
+        )
+        scheduled = pricing["ordered_work_conserving_exact_refits"]
+        self.assertTrue(scheduled["enabled"])
+        self.assertIn("next_contiguous_prefix", scheduled["dispatch"])
+        self.assertTrue(scheduled["preserves_candidate_order"])
+        self.assertTrue(scheduled["preserves_accepted_moves_and_terminal"])
+        self.assertFalse(scheduled["changes_objective_or_candidate_family"])
+
+    def test_ordered_lazy_refits_preserve_mdl_working_set_across_worker_widths(self) -> None:
+        data = synthetic_data(seed=1979, n_sequences=150)
+        common = dict(
+            q_max=2,
+            impact_lag=3,
+            knot_count=2,
+            max_formation_window=2,
+            max_support_size=2,
+            solver_device="cpu",
+            solver_dtype="float64",
+            solver_max_iter=120,
+            solver_tolerance=1.0e-7,
+            support_search="active_set",
+            active_neighbor_strategy="mdl_score_working_set",
+            active_start_policy="all_atoms",
+            support_conditioned_refinement=False,
+        )
+        serial = CertSCRPipeline(
+            data,
+            rule_predicates=("pred_a", "pred_b"),
+            config=CertSCRConfig(**common, solver_workers=1),
+        )
+        parallel = CertSCRPipeline(
+            data,
+            rule_predicates=("pred_a", "pred_b"),
+            config=CertSCRConfig(**common, solver_workers=4),
+        )
+        serial_records = serial.search_supports()
+        parallel_records = parallel.search_supports()
+        self.assertEqual(
+            [record.rules for record in serial_records],
+            [record.rules for record in parallel_records],
+        )
+        np.testing.assert_allclose(
+            [serial._support_search_score(record) for record in serial_records],
+            [parallel._support_search_score(record) for record in parallel_records],
+            rtol=0.0,
+            atol=1.0e-8,
+        )
+        serial_runs = {
+            tuple(
+                (
+                    tuple(rule["antecedent_ids"]),
+                    rule["window"],
+                    rule["sign"],
+                )
+                for rule in run["start"]
+            ): run
+            for run in serial.search_diagnostics["runs"]
+        }
+        parallel_runs = {
+            tuple(
+                (
+                    tuple(rule["antecedent_ids"]),
+                    rule["window"],
+                    rule["sign"],
+                )
+                for rule in run["start"]
+            ): run
+            for run in parallel.search_diagnostics["runs"]
+        }
+        self.assertEqual(serial_runs.keys(), parallel_runs.keys())
+        for start in serial_runs:
+            self.assertEqual(
+                serial_runs[start]["terminal"], parallel_runs[start]["terminal"]
+            )
+            self.assertAlmostEqual(
+                float(serial_runs[start]["terminal_score"]),
+                float(parallel_runs[start]["terminal_score"]),
+                places=8,
+            )
+
+    def test_conditional_safe_bound_preserves_working_set_output(self) -> None:
+        data = synthetic_data(seed=1967, n_sequences=140)
+        common = dict(
+            q_max=2,
+            impact_lag=3,
+            knot_count=2,
+            max_formation_window=2,
+            solver_device="cpu",
+            solver_dtype="float64",
+            solver_max_iter=120,
+            solver_tolerance=1.0e-7,
+            solver_workers=2,
+            target_history_control=False,
+            safe_mdl_screen=False,
+            support_search="active_set",
+            active_start_policy="all_atoms",
+            active_neighbor_strategy="mdl_score_working_set",
+            support_conditioned_refinement=False,
+        )
+        ordinary = CertSCRPipeline(
+            data,
+            rule_predicates=("pred_a", "pred_b"),
+            config=CertSCRConfig(
+                **common, conditional_safe_mdl_screen=False
+            ),
+        )
+        bounded = CertSCRPipeline(
+            data,
+            rule_predicates=("pred_a", "pred_b"),
+            config=CertSCRConfig(
+                **common, conditional_safe_mdl_screen=True
+            ),
+        )
+        ordinary_records = ordinary.search_supports()
+        bounded_records = bounded.search_supports()
+        self.assertEqual(
+            [record.rules for record in ordinary_records],
+            [record.rules for record in bounded_records],
+        )
+        np.testing.assert_allclose(
+            [ordinary._support_search_score(record) for record in ordinary_records],
+            [bounded._support_search_score(record) for record in bounded_records],
+            rtol=0.0,
+            atol=1.0e-8,
+        )
+
+    def test_batched_multistate_rule_prices_match_scalar_prices(self) -> None:
+        data = synthetic_data(n_sequences=240)
+        pipeline = CertSCRPipeline(
+            data,
+            rule_predicates=("pred_a", "pred_b"),
+            config=CertSCRConfig(
+                q_max=2,
+                impact_lag=3,
+                knot_count=2,
+                max_formation_window=2,
+                solver_device="cpu",
+                solver_dtype="float64",
+                solver_max_iter=120,
+                solver_tolerance=1.0e-7,
+                support_search="active_set",
+            ),
+        )
+        rules = [
+            RuleIdentity((0,), 1, 1),
+            RuleIdentity((1,), 1, -1),
+            RuleIdentity((0, 1), 2, -1),
+        ]
+        fits = [pipeline.fit_baseline(), pipeline.fit_support((rules[0],))]
+        candidate_sets = [tuple(rules), tuple(rules[1:])]
+        scalar = [
+            pipeline._support_rule_gradient_prices(fit, candidates)
+            for fit, candidates in zip(fits, candidate_sets, strict=True)
+        ]
+        batched = pipeline._support_rule_gradient_prices_batch(
+            list(zip(fits, candidate_sets, strict=True))
+        )
+        self.assertEqual(
+            [set(item) for item in batched],
+            [set(item) for item in scalar],
+        )
+        for expected, observed in zip(scalar, batched, strict=True):
+            for rule in expected:
+                np.testing.assert_allclose(
+                    observed[rule], expected[rule], rtol=1.0e-10, atol=1.0e-10
+                )
+    def test_fused_support_gradient_prices_equal_direct_moments(self) -> None:
+        data = synthetic_data(seed=1602, n_sequences=220)
+        pipeline = CertSCRPipeline(
+            data,
+            rule_predicates=("pred_a", "pred_b"),
+            config=CertSCRConfig(
+                q_max=2,
+                impact_lag=4,
+                knot_count=3,
+                max_formation_window=3,
+                solver_device="cpu",
+                solver_dtype="float64",
+                solver_tolerance=1.0e-7,
+                identity_profile="dictionary_mdl",
+                safe_mdl_screen=False,
+            ),
+        )
+        candidates = pipeline.profile_rule_identities()
+        self.assertTrue(candidates)
+        fit = pipeline.fit_baseline()
+        fused = pipeline._support_rule_gradient_prices(fit, candidates)
+        for rule in candidates:
+            response = pipeline.sparse_features(pipeline.splits.fit, (rule,))[0]
+            gradient, information = pipeline._identity_moments_at_null(
+                fit,
+                response,
+            )
+            signed = float(rule.sign) * gradient
+            expected_gain = pipeline._cone_quadratic_gain(
+                signed, information
+            )
+            expected_kkt = float(
+                np.max(
+                    np.maximum(-signed, 0.0)
+                    / np.sqrt(
+                        np.maximum(
+                            np.diag(information),
+                            np.finfo(np.float64).tiny,
+                        )
+                    ),
+                    initial=0.0,
+                )
+            )
+            self.assertAlmostEqual(fused[rule][0], expected_gain, places=12)
+            self.assertAlmostEqual(fused[rule][1], expected_kkt, places=12)
 
     def test_parallel_active_set_preserves_refined_supports_and_objectives(self) -> None:
         data = synthetic_data(n_sequences=180)
@@ -3558,6 +5739,208 @@ class HierarchyClosureTests(unittest.TestCase):
             parallel.search_diagnostics.get("memoized_neighborhood_hits", 0),
             0,
         )
+
+    def test_shared_thread_support_scheduler_preserves_input_order(self) -> None:
+        data = synthetic_data(seed=1973, n_sequences=60)
+        pipeline = CertSCRPipeline(
+            data,
+            rule_predicates=("pred_a", "pred_b"),
+            config=CertSCRConfig(
+                q_max=1,
+                impact_lag=3,
+                knot_count=2,
+                max_formation_window=7,
+                solver_workers=2,
+                solver_device="cpu",
+                solver_dtype="float64",
+                solver_max_iter=80,
+                solver_tolerance=1.0e-7,
+                target_history_control=False,
+                safe_mdl_screen=False,
+            ),
+        )
+        supports = tuple(
+            (RuleIdentity((source,), window, sign),)
+            for source in (0, 1)
+            for window in range(8)
+            for sign in (-1, 1)
+        )
+        self.assertEqual(len(supports), 32)
+        pipeline._start_active_support_workers()
+        records = pipeline._fit_support_records_batch(
+            supports, profile="rolling-fork-regression"
+        )
+        self.assertEqual(
+            [record.rules for record in records],
+            [tuple(sorted(rules)) for rules in supports],
+        )
+        self.assertEqual(
+            pipeline._safe_screen_stats["active_fit_thread_batches"], 1
+        )
+        self.assertEqual(
+            pipeline._safe_screen_stats["active_fit_process_batches"], 0
+        )
+        self.assertEqual(
+            pipeline._safe_screen_stats["active_fit_dynamic_worker_launches"],
+            0,
+        )
+
+    def test_shared_closure_children_are_sharded_without_changing_exact_fits(self) -> None:
+        data = synthetic_data(seed=1981, n_sequences=180)
+        common = dict(
+            q_max=2,
+            impact_lag=3,
+            knot_count=2,
+            max_formation_window=2,
+            solver_device="cpu",
+            solver_dtype="float64",
+            solver_max_iter=120,
+            solver_tolerance=1.0e-7,
+            support_search="active_set",
+            support_conditioned_refinement=False,
+        )
+        serial = CertSCRPipeline(
+            data,
+            rule_predicates=("pred_a", "pred_b"),
+            config=CertSCRConfig(**common, solver_workers=1),
+        )
+        parallel = CertSCRPipeline(
+            data,
+            rule_predicates=("pred_a", "pred_b"),
+            config=CertSCRConfig(**common, solver_workers=4),
+        )
+        rules = (
+            RuleIdentity((0,), 1, -1),
+            RuleIdentity((0,), 1, 1),
+            RuleIdentity((1,), 1, -1),
+            RuleIdentity((1,), 1, 1),
+        )
+        keys = [
+            tuple(sorted((left, right)))
+            for left in rules[:2]
+            for right in rules[2:]
+        ]
+        self.assertEqual(
+            len({serial.hierarchy_closure(key) for key in keys}), 1
+        )
+        serial_records = serial._fit_support_records_batch(
+            keys, profile="shared-closure-shard-regression"
+        )
+        parallel._start_active_support_workers()
+        parallel_records = parallel._fit_support_records_batch(
+            keys, profile="shared-closure-shard-regression"
+        )
+        self.assertEqual(
+            [record.rules for record in serial_records],
+            [record.rules for record in parallel_records],
+        )
+        np.testing.assert_allclose(
+            [record.fit.nll for record in serial_records],
+            [record.fit.nll for record in parallel_records],
+            rtol=0.0,
+            atol=1.0e-8,
+        )
+        self.assertGreater(
+            parallel._safe_screen_stats["active_fit_closure_shards"], 0
+        )
+
+    def test_profile_and_fit_checkpoint_round_trip_is_exact(self) -> None:
+        data = synthetic_data(seed=2027, n_sequences=80)
+        config = CertSCRConfig(
+            q_max=1,
+            impact_lag=3,
+            knot_count=2,
+            max_formation_window=2,
+            solver_workers=1,
+            solver_device="cpu",
+            solver_dtype="float64",
+            solver_max_iter=120,
+            solver_tolerance=1.0e-7,
+            target_history_control=False,
+            safe_mdl_screen=False,
+            identity_profile="dictionary_mdl",
+        )
+        source = CertSCRPipeline(
+            data,
+            rule_predicates=("pred_a", "pred_b"),
+            config=config,
+        )
+        rule = RuleIdentity((0,), 1, 1)
+        alternative = RuleIdentity((0,), 2, -1)
+        source.seed_profiled_library(
+            (rule,),
+            identity_candidates={(0,): (rule, alternative)},
+            dictionary_shapes={
+                rule: np.asarray([0.25, 0.75]),
+                alternative: np.asarray([0.75, 0.25]),
+            },
+        )
+        source_fit = source.fit_model((rule,), source.hierarchy_closure((rule,)))
+        self.assertTrue(source_fit.converged)
+        profile_state = source.export_profile_state()
+        fit_state = source.export_fit_cache_state()
+        # Execution-only parallelism and cache sizes may change across a
+        # resumed run; the statistical model and data may not.
+        resumed = CertSCRPipeline(
+            data,
+            rule_predicates=("pred_a", "pred_b"),
+            config=replace(
+                config,
+                solver_workers=2,
+                feature_cache_bytes=1024,
+                loss_summary_cache_bytes=0,
+                fit_summary_cache_bytes=0,
+            ),
+        )
+        resumed.restore_profile_state(profile_state)
+        restored_count = resumed.restore_fit_cache_state(fit_state)
+        self.assertGreaterEqual(restored_count, 1)
+        self.assertEqual(resumed.profiled_rules, [rule])
+        np.testing.assert_array_equal(
+            resumed.rule_dictionary_shapes[rule],
+            np.asarray([0.25, 0.75]),
+        )
+        np.testing.assert_array_equal(
+            resumed.rule_dictionary_shapes[alternative],
+            np.asarray([0.75, 0.25]),
+        )
+        restored = resumed.fit_model((rule,), resumed.hierarchy_closure((rule,)))
+        self.assertEqual(restored.nll, source_fit.nll)
+        self.assertEqual(restored.alpha, source_fit.alpha)
+        np.testing.assert_array_equal(restored.gamma, source_fit.gamma)
+        np.testing.assert_array_equal(restored.theta, source_fit.theta)
+        self.assertTrue(restored.device.startswith("resume:"))
+
+    def test_checkpoint_signature_rejects_changed_statistical_inputs(self) -> None:
+        data = synthetic_data(seed=2028, n_sequences=50)
+        config = CertSCRConfig(
+            q_max=1,
+            impact_lag=3,
+            knot_count=2,
+            solver_device="cpu",
+            solver_dtype="float64",
+            target_history_control=False,
+        )
+        source = CertSCRPipeline(
+            data,
+            rule_predicates=("pred_a",),
+            control_predicates=("pred_b",),
+            config=config,
+        )
+        rule = RuleIdentity((0,), 0, 1)
+        source.seed_profiled_library(
+            (rule,),
+            identity_candidates={(0,): (rule,)},
+            dictionary_shapes={rule: np.asarray([1.0, 0.0])},
+        )
+        state = source.export_profile_state()
+        changed = CertSCRPipeline(
+            data,
+            rule_predicates=("pred_a", "pred_b"),
+            config=config,
+        )
+        with self.assertRaisesRegex(ValueError, "signature differs"):
+            changed.restore_profile_state(state)
 
 
 @unittest.skipUnless(__import__("torch").cuda.is_available(), "CUDA is unavailable")

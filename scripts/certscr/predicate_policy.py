@@ -78,6 +78,27 @@ FREDDIE_PRIMITIVE_DYNAMIC_V3: tuple[str, ...] = (
     "pred_upb_paydown_steady",
 )
 
+# Financially interpretable, target-blind transition onsets for the primary
+# Freddie experiment. Within each ELTV and UPB family the events
+# are mutually exclusive in a reporting month. Dense persistent directions
+# and the nearly empty "UPB increase continues" atom from v3 are replaced by
+# onsets, so pair/triplet rules describe combinations of distinct changes
+# rather than repeated encodings of one persistent state.
+FREDDIE_PRIMITIVE_DYNAMIC_V4: tuple[str, ...] = (
+    "pred_eltv_enters_high_ltv",
+    "pred_eltv_exits_high_ltv",
+    "pred_eltv_enters_negative_equity",
+    "pred_eltv_exits_negative_equity",
+    "pred_eltv_deterioration_starts_within_band",
+    "pred_eltv_improvement_starts_within_band",
+    "pred_upb_increase_starts",
+    "pred_upb_flat_starts",
+    "pred_upb_paydown_resumes",
+    "pred_upb_paydown_acceleration_starts",
+    "pred_upb_paydown_deceleration_starts",
+    "pred_upb_paydown_steady_starts",
+)
+
 # IBM AMLworld account-history transitions selected without consulting the AML
 # outcome.  On the complete HI-Small stream these seven columns have maximum
 # pairwise event-row Jaccard 0.156 after calibration-tail refinement; all but
@@ -137,6 +158,7 @@ PREDICATE_POLICIES: dict[str, tuple[str, ...]] = {
     "home_credit_behavioral_nonproxy_expanded": HOME_CREDIT_BEHAVIORAL_NONPROXY_EXPANDED,
     "freddie_structural_dynamic_v2": FREDDIE_STRUCTURAL_DYNAMIC_V2,
     "freddie_primitive_dynamic_v3": FREDDIE_PRIMITIVE_DYNAMIC_V3,
+    "freddie_primitive_dynamic_v4": FREDDIE_PRIMITIVE_DYNAMIC_V4,
     "ibm_aml_dynamic_nonproxy_v2": IBM_AML_DYNAMIC_NONPROXY_V2,
     "ibm_aml_dynamic_nonproxy_v3": IBM_AML_DYNAMIC_NONPROXY_V3,
     "ibm_aml_primitive_dynamic_v1": IBM_AML_PRIMITIVE_DYNAMIC_V1,
@@ -186,6 +208,7 @@ PREDICATE_POLICY_CONTRACTS: dict[str, PredicatePolicyContract] = {
             in {
                 "ibm_aml_primitive_dynamic_v1",
                 "freddie_primitive_dynamic_v3",
+                "freddie_primitive_dynamic_v4",
             }
         ),
     )

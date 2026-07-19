@@ -16,7 +16,7 @@ Sequence rule:
 
 Feature time rule:
     Predicate columns use only month t and, for transition onsets, consecutive
-    months t-1 and t-2. They never use t+1 or later information.
+    months t-1 through t-3. They never use t+1 or later information.
 """
 
 from __future__ import annotations
@@ -92,19 +92,18 @@ PREDICATE_COLUMNS = [
     "pred_eltv_exits_high_ltv",
     "pred_eltv_enters_negative_equity",
     "pred_eltv_exits_negative_equity",
-    "pred_eltv_rises_within_band",
-    "pred_eltv_falls_within_band",
+    "pred_eltv_deterioration_starts_within_band",
+    "pred_eltv_improvement_starts_within_band",
     "pred_upb_increase_starts",
-    "pred_upb_increase_continues",
     "pred_upb_flat_starts",
     "pred_upb_paydown_resumes",
-    "pred_upb_paydown_accelerates",
-    "pred_upb_paydown_decelerates",
-    "pred_upb_paydown_steady",
+    "pred_upb_paydown_acceleration_starts",
+    "pred_upb_paydown_deceleration_starts",
+    "pred_upb_paydown_steady_starts",
 ]
 
 TARGET_TOKEN = "T_SDQ3"
-PREPROCESSING_SCHEMA_VERSION = 5
+PREPROCESSING_SCHEMA_VERSION = 7
 
 
 @dataclass(frozen=True)
@@ -126,7 +125,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output-root",
         type=Path,
-        default=Path("data/freddiemac/processed/sdq3_primitive_v5_sparse"),
+        default=Path("data/freddiemac/processed/sdq3_primitive_v7_financial"),
     )
     parser.add_argument(
         "--vintage",
@@ -610,25 +609,36 @@ def add_legacy_dynamic_predicates(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def add_dynamic_predicates(df: pd.DataFrame) -> pd.DataFrame:
-    """Create the frozen primitive-v3 outcome-blind transition dictionary.
+    """Create the frozen primitive-v4 outcome-blind transition dictionary.
 
-    Every token is a one-step state transition or change-direction onset. No
+    Every token is a mutually exclusive within-family state transition or
+    change-direction onset. No
     entry contains delinquency, modification, forbearance, termination, a
-    rolling motif, or a future value. The six ELTV transitions partition the
-    same-band and boundary-crossing cases; the UPB onsets partition distinct
-    local payment-direction changes. This prevents a "primitive" from already
-    encoding the pair/triplet interaction the rule grammar is meant to find.
+    rolling motif, or a future value. ELTV distinguishes economically standard
+    80%/100% equity-band crossings from within-band deterioration/improvement
+    onsets. UPB distinguishes balance growth, stalled amortization, resumed
+    payment and changes in paydown momentum. Coupon changes are deliberately
+    excluded: in the audited stream they are near-empty servicing/modification
+    sentinels rather than a general borrower-state process. This prevents a
+    primitive from already encoding the pair/triplet interaction the rule
+    grammar must find.
     """
     has_prev = consecutive_previous(df)
     prev2_contiguous = (
         df["loan_id"].eq(df["loan_id"].shift(2))
         & df["month_index"].eq(df["month_index"].shift(2) + 2)
     ).fillna(False)
+    prev3_contiguous = (
+        df["loan_id"].eq(df["loan_id"].shift(3))
+        & df["month_index"].eq(df["month_index"].shift(3) + 3)
+    ).fillna(False)
 
     eltv = df["eltv"]
     prev_eltv = previous(eltv, has_prev)
     valid_eltv = eltv.notna() & eltv.ne(999)
     valid_prev_eltv = prev_eltv.notna() & prev_eltv.ne(999)
+    prev2_eltv = eltv.shift(2).where(prev2_contiguous)
+    valid_prev2_eltv = prev2_eltv.notna() & prev2_eltv.ne(999)
     eltv_pair = has_prev & valid_eltv & valid_prev_eltv
     current_band = pd.Series(
         np.select(
@@ -656,6 +666,7 @@ def add_dynamic_predicates(df: pd.DataFrame) -> pd.DataFrame:
     upb = df["current_actual_upb"]
     prev_upb = previous(upb, has_prev)
     prev2_upb = upb.shift(2).where(prev2_contiguous)
+    prev3_upb = upb.shift(3).where(prev3_contiguous)
     valid_upb_pair = has_prev & upb.notna() & prev_upb.notna() & upb.gt(0) & prev_upb.gt(0)
     valid_upb_triple = (
         valid_upb_pair
@@ -663,8 +674,15 @@ def add_dynamic_predicates(df: pd.DataFrame) -> pd.DataFrame:
         & prev2_upb.notna()
         & prev2_upb.gt(0)
     )
+    valid_upb_quad = (
+        valid_upb_triple
+        & prev3_contiguous
+        & prev3_upb.notna()
+        & prev3_upb.gt(0)
+    )
     current_paydown = prev_upb - upb
     previous_paydown = prev2_upb - prev_upb
+    prior_paydown = prev3_upb - prev2_upb
 
     predicates = pd.DataFrame(index=df.index)
     predicates["pred_eltv_enters_high_ltv"] = as_i8(
@@ -679,17 +697,58 @@ def add_dynamic_predicates(df: pd.DataFrame) -> pd.DataFrame:
     predicates["pred_eltv_exits_negative_equity"] = as_i8(
         eltv_pair & previous_band.eq(2) & current_band.lt(2)
     )
-    predicates["pred_eltv_rises_within_band"] = as_i8(
-        eltv_pair & current_band.eq(previous_band) & eltv.gt(prev_eltv)
+    previous_eltv_rise_same_band = (
+        prev2_contiguous
+        & valid_prev2_eltv
+        & valid_prev_eltv
+        & previous_band.eq(
+            pd.Series(
+                np.select(
+                    [
+                        prev2_eltv.lt(80).fillna(False).to_numpy(dtype=bool),
+                        prev2_eltv.lt(100).fillna(False).to_numpy(dtype=bool),
+                    ],
+                    [0, 1],
+                    default=2,
+                ),
+                index=df.index,
+            )
+        )
+        & prev_eltv.gt(prev2_eltv)
     )
-    predicates["pred_eltv_falls_within_band"] = as_i8(
-        eltv_pair & current_band.eq(previous_band) & eltv.lt(prev_eltv)
+    previous_eltv_fall_same_band = (
+        prev2_contiguous
+        & valid_prev2_eltv
+        & valid_prev_eltv
+        & previous_band.eq(
+            pd.Series(
+                np.select(
+                    [
+                        prev2_eltv.lt(80).fillna(False).to_numpy(dtype=bool),
+                        prev2_eltv.lt(100).fillna(False).to_numpy(dtype=bool),
+                    ],
+                    [0, 1],
+                    default=2,
+                ),
+                index=df.index,
+            )
+        )
+        & prev_eltv.lt(prev2_eltv)
+    )
+    predicates["pred_eltv_deterioration_starts_within_band"] = as_i8(
+        eltv_pair
+        & current_band.eq(previous_band)
+        & eltv.gt(prev_eltv)
+        & ~previous_eltv_rise_same_band
+    )
+    predicates["pred_eltv_improvement_starts_within_band"] = as_i8(
+        eltv_pair
+        & current_band.eq(previous_band)
+        & eltv.lt(prev_eltv)
+        & ~previous_eltv_fall_same_band
     )
     predicates["pred_upb_increase_starts"] = as_i8(
         valid_upb_triple & upb.gt(prev_upb) & prev_upb.le(prev2_upb)
-    )
-    predicates["pred_upb_increase_continues"] = as_i8(
-        valid_upb_triple & upb.gt(prev_upb) & prev_upb.gt(prev2_upb)
     )
     predicates["pred_upb_flat_starts"] = as_i8(
         valid_upb_triple & upb.eq(prev_upb) & prev_upb.ne(prev2_upb)
@@ -697,23 +756,50 @@ def add_dynamic_predicates(df: pd.DataFrame) -> pd.DataFrame:
     predicates["pred_upb_paydown_resumes"] = as_i8(
         valid_upb_triple & upb.lt(prev_upb) & prev_upb.ge(prev2_upb)
     )
-    predicates["pred_upb_paydown_accelerates"] = as_i8(
-        valid_upb_triple
+    accelerating = (
+        valid_upb_quad
         & current_paydown.gt(0)
         & previous_paydown.gt(0)
         & current_paydown.gt(previous_paydown)
     )
-    predicates["pred_upb_paydown_decelerates"] = as_i8(
-        valid_upb_triple
+    previously_accelerating = (
+        valid_upb_quad
+        & previous_paydown.gt(0)
+        & prior_paydown.gt(0)
+        & previous_paydown.gt(prior_paydown)
+    )
+    decelerating = (
+        valid_upb_quad
         & current_paydown.gt(0)
         & previous_paydown.gt(0)
         & current_paydown.lt(previous_paydown)
     )
-    predicates["pred_upb_paydown_steady"] = as_i8(
-        valid_upb_triple
+    previously_decelerating = (
+        valid_upb_quad
+        & previous_paydown.gt(0)
+        & prior_paydown.gt(0)
+        & previous_paydown.lt(prior_paydown)
+    )
+    steady = (
+        valid_upb_quad
         & current_paydown.gt(0)
         & previous_paydown.gt(0)
         & current_paydown.eq(previous_paydown)
+    )
+    previously_steady = (
+        valid_upb_quad
+        & previous_paydown.gt(0)
+        & prior_paydown.gt(0)
+        & previous_paydown.eq(prior_paydown)
+    )
+    predicates["pred_upb_paydown_acceleration_starts"] = as_i8(
+        accelerating & ~previously_accelerating
+    )
+    predicates["pred_upb_paydown_deceleration_starts"] = as_i8(
+        decelerating & ~previously_decelerating
+    )
+    predicates["pred_upb_paydown_steady_starts"] = as_i8(
+        steady & ~previously_steady
     )
     return predicates[PREDICATE_COLUMNS]
 
@@ -799,9 +885,36 @@ def build_sequence_outputs(
         sequence_length_months=("month_index", "size"),
         has_target=("target_token", "max"),
         target_token_count=("target_token", "sum"),
+        start_loan_age=("loan_age", "first"),
+        end_loan_age_raw=("loan_age", "last"),
     ).reset_index()
     sequences["vintage_year"] = np.int16(q.year)
     sequences["vintage_quarter"] = np.int8(q.quarter)
+    sequences["vintage_index"] = np.int32(q.year * 4 + q.quarter - 1)
+    sequences["vintage"] = q.label
+    invalid_start_age = (
+        sequences["start_loan_age"].isna()
+        | sequences["start_loan_age"].lt(0)
+        | sequences["start_loan_age"].ne(
+            np.floor(sequences["start_loan_age"])
+        )
+    )
+    if bool(invalid_start_age.any()):
+        raise ValueError("Freddie sequence has a missing, negative, or nonintegral start loan age")
+    sequences["start_loan_age"] = sequences["start_loan_age"].astype("int16")
+    # Freddie loan age counts scheduled payment months.  Backing it out from
+    # the first observed reporting month gives a target-blind monthly cohort
+    # key.  It is finer than the source-file quarter and therefore supports a
+    # chronological 3-way split without breaking one cohort across splits.
+    sequences["first_payment_month_index"] = (
+        sequences["start_month_index"].astype("int32")
+        - sequences["start_loan_age"].astype("int32")
+    ).astype("int32")
+    sequences["reconstructed_end_loan_age"] = (
+        sequences["start_loan_age"].astype("int32")
+        + sequences["end_month_index"].astype("int32")
+        - sequences["start_month_index"].astype("int32")
+    ).astype("int16")
 
     target_meta = months.loc[months["target_token"].eq(1), ["sequence_id", "position", "monthly_reporting_period", "month_index"]]
     target_meta = target_meta.rename(
@@ -1018,8 +1131,13 @@ def build_sequence_outputs(
             col: CURRENT_PREDICATE_GROUPS[col] for col in PREDICATE_COLUMNS
         },
         "predicate_policy": predicate_policy_metadata(),
-        "predicate_dictionary": "freddie_primitive_dynamic_v3",
+        "predicate_dictionary": "freddie_primitive_dynamic_v4",
         "atomic_predicates": True,
+        "ordered_split_group": {
+            "column": "first_payment_month_index",
+            "definition": "start_month_index - start_loan_age",
+            "outcome_blind": True,
+        },
         "occurrence_likelihood": "first_event_cloglog",
         "target_token": TARGET_TOKEN,
         "preprocessing_schema_version": PREPROCESSING_SCHEMA_VERSION,
@@ -1095,7 +1213,7 @@ def build_summary(output_root: Path, vintages: list[dict]) -> dict:
         "target_definition": "T_SDQ3 is the first month whose delinquency status is 3+ or RA.",
         "target_process": "first_event",
         "forward_bias_rule": (
-            "Predicate tokens use only t and consecutive t-1/t-2. First T is applied before "
+            "Predicate tokens use only t and consecutive t-1 through t-3. First T is applied before "
             "continuity; a pre-T observation gap censors at its preceding month and post-T rows "
             "cannot affect admission. Predicate columns on T are 0 so T is consequent-only."
         ),
@@ -1114,7 +1232,12 @@ def build_summary(output_root: Path, vintages: list[dict]) -> dict:
             col: CURRENT_PREDICATE_GROUPS[col] for col in PREDICATE_COLUMNS
         },
         "predicate_policy": predicate_policy_metadata(),
-        "predicate_dictionary": "freddie_primitive_dynamic_v3",
+        "predicate_dictionary": "freddie_primitive_dynamic_v4",
+        "ordered_split_group": {
+            "column": "first_payment_month_index",
+            "definition": "start_month_index - start_loan_age",
+            "outcome_blind": True,
+        },
         "occurrence_likelihood": "first_event_cloglog",
         "target_token": TARGET_TOKEN,
         "target_mark": vintages[0].get("target_mark") if vintages else None,

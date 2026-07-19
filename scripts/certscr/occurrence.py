@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import hashlib
 import itertools
+import json
+import os
 import threading
 from collections import OrderedDict
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Sequence
 
 import numpy as np
@@ -266,6 +269,8 @@ class RuleOccurrenceEngine:
         lag: int,
         knot_count: int,
         feature_cache_bytes: int = 4 * 1024**3,
+        persistent_response_dir: str | Path | None = None,
+        persistent_response_bytes: int = 0,
         max_completion_span: int | None = None,
         extra_source_events: dict[int, SourceEvents] | None = None,
     ):
@@ -291,6 +296,47 @@ class RuleOccurrenceEngine:
         ] = OrderedDict()
         self._feature_cache_bytes = 0
         self._feature_cache_limit = max(0, int(feature_cache_bytes))
+        self._persistent_response_dir = (
+            Path(persistent_response_dir)
+            if persistent_response_dir is not None
+            and int(persistent_response_bytes) > 0
+            else None
+        )
+        self._persistent_response_limit = max(
+            0, int(persistent_response_bytes)
+        )
+        self._persistent_response_bytes = 0
+        # Disk capacity and resident-memory capacity are different contracts.
+        # The former implementation retained a strong reference to every mmap
+        # ever opened, so a 32 GiB on-disk store silently bypassed the 8 GiB
+        # feature-cache limit and eventually made all touched pages resident.
+        # Persistent responses now participate in the same byte budget as
+        # computed features; eviction closes only our strong reference and the
+        # exact .npy artifact remains available for a later mmap reload.
+        self._persistent_sparse_cache: OrderedDict[
+            tuple, SparseKernelResponse
+        ] = OrderedDict()
+        self._persistent_sparse_cache_bytes = 0
+        self.persistent_response_evictions = 0
+        self._persistent_context_digests: dict[str, str] = {}
+        self._persistent_dataset_digest_cache: bytes | None = None
+        self.persistent_response_hits = 0
+        self.persistent_response_writes = 0
+        self.persistent_response_skipped_bytes = 0
+        if self._persistent_response_dir is not None:
+            self._persistent_response_dir.mkdir(parents=True, exist_ok=True)
+            for metadata_path in self._persistent_response_dir.glob(
+                "*/complete.json"
+            ):
+                try:
+                    metadata = json.loads(
+                        metadata_path.read_text(encoding="utf-8")
+                    )
+                    self._persistent_response_bytes += max(
+                        0, int(metadata.get("nbytes", 0))
+                    )
+                except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                    continue
         self._cache_guard = threading.RLock()
         self._response_locks: dict[tuple, threading.Lock] = {}
         self._source_event_cache: dict[int, SourceEvents] = {}
@@ -365,6 +411,322 @@ class RuleOccurrenceEngine:
         self._time_stride = int(
             max(np.max(self.data.end_times), np.max(self.data.times))
         ) - self._time_origin + 2
+
+    @staticmethod
+    def _persistent_key_payload(key: tuple) -> list[object]:
+        """Convert a sparse-response key to stable JSON without pickle."""
+        output: list[object] = []
+        for item in key:
+            if isinstance(item, bytes):
+                output.append({"bytes_hex": item.hex()})
+            elif isinstance(item, tuple):
+                output.append([int(value) for value in item])
+            elif isinstance(item, (np.integer, int)):
+                output.append(int(item))
+            else:
+                output.append(str(item))
+        return output
+
+    def _persistent_dataset_digest(self) -> bytes:
+        """Hash every immutable input that can change a rule response."""
+        cached = self._persistent_dataset_digest_cache
+        if cached is not None:
+            return cached
+        digest = hashlib.blake2b(digest_size=24)
+
+        def update(array: np.ndarray) -> None:
+            value = np.ascontiguousarray(array)
+            digest.update(np.asarray(value.shape, dtype=np.int64).tobytes())
+            digest.update(str(value.dtype).encode("ascii"))
+            view = memoryview(value).cast("B")
+            chunk = 8 * 1024**2
+            for left in range(0, len(view), chunk):
+                digest.update(view[left : left + chunk])
+
+        for array in (
+            self.data.sequence_codes,
+            self.data.times,
+            self.data.predicates,
+            self.data.start_times,
+            self.data.end_times,
+            self.basis,
+        ):
+            update(array)
+        digest.update(
+            np.asarray(
+                [
+                    -1
+                    if self.max_completion_span is None
+                    else self.max_completion_span,
+                    self.lag,
+                    self.knot_count,
+                ],
+                dtype=np.int64,
+            ).tobytes()
+        )
+        for source_id, source in sorted(self._source_event_cache.items()):
+            digest.update(np.asarray([source_id], dtype=np.int64).tobytes())
+            update(source.sequence_codes)
+            update(source.times)
+            update(source.offsets)
+        cached = digest.digest()
+        self._persistent_dataset_digest_cache = cached
+        return cached
+
+    def _persistent_context_digest(self, ctx: QueryContext) -> str:
+        cached = self._persistent_context_digests.get(ctx.name)
+        if cached is not None:
+            return cached
+        digest = hashlib.blake2b(digest_size=16)
+        digest.update(self._persistent_dataset_digest())
+        digest.update(np.ascontiguousarray(ctx.global_sequence_ids).view(np.uint8))
+        digest.update(np.ascontiguousarray(ctx.start_times).view(np.uint8))
+        digest.update(np.ascontiguousarray(ctx.end_times).view(np.uint8))
+        digest.update(np.ascontiguousarray(ctx.event_sequence_local).view(np.uint8))
+        digest.update(np.ascontiguousarray(ctx.event_times).view(np.uint8))
+        digest.update(np.ascontiguousarray(ctx.event_grid_rows).view(np.uint8))
+        digest.update(np.ascontiguousarray(ctx.grid_offsets).view(np.uint8))
+        digest.update(
+            np.asarray(
+                [ctx.n_events, ctx.n_grid, self.lag, self.knot_count],
+                dtype=np.int64,
+            ).view(np.uint8)
+        )
+        value = digest.hexdigest()
+        self._persistent_context_digests[ctx.name] = value
+        return value
+
+    def _persistent_sparse_path(
+        self,
+        ctx: QueryContext,
+        key: tuple,
+    ) -> Path | None:
+        root = self._persistent_response_dir
+        if root is None:
+            return None
+        payload = {
+            "schema": 1,
+            "context_digest": self._persistent_context_digest(ctx),
+            "key": self._persistent_key_payload(key),
+        }
+        encoded = json.dumps(
+            payload, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+        name = hashlib.blake2b(encoded, digest_size=20).hexdigest()
+        return root / name
+
+    def _load_persistent_sparse(
+        self,
+        ctx: QueryContext,
+        key: tuple,
+    ) -> SparseKernelResponse | None:
+        with self._cache_guard:
+            cached = self._persistent_sparse_cache.get(key)
+            if cached is not None:
+                self._persistent_sparse_cache.move_to_end(key)
+                self.persistent_response_hits += 1
+                return cached
+        path = self._persistent_sparse_path(ctx, key)
+        if path is None or not (path / "complete.json").is_file():
+            return None
+        try:
+            metadata = json.loads(
+                (path / "complete.json").read_text(encoding="utf-8")
+            )
+            if (
+                int(metadata.get("schema", -1)) != 1
+                or metadata.get("context_digest")
+                != self._persistent_context_digest(ctx)
+            ):
+                return None
+            response = SparseKernelResponse(
+                n_events=int(metadata["n_events"]),
+                n_grid=int(metadata["n_grid"]),
+                grid_indices=np.load(
+                    path / "grid_indices.npy", mmap_mode="r"
+                ),
+                grid_values=np.load(
+                    path / "grid_values.npy", mmap_mode="r"
+                ),
+                event_values=np.load(
+                    path / "event_values.npy", mmap_mode="r"
+                ),
+            )
+        except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
+            return None
+        with self._cache_guard:
+            # Another worker may have mapped the same immutable response while
+            # this thread was reading metadata. Reuse its object if so.
+            cached = self._persistent_sparse_cache.get(key)
+            if cached is not None:
+                self._persistent_sparse_cache.move_to_end(key)
+                self.persistent_response_hits += 1
+                return cached
+            size = int(response.nbytes)
+            if self._make_combined_cache_room(size):
+                self._persistent_sparse_cache[key] = response
+                self._persistent_sparse_cache.move_to_end(key)
+                self._persistent_sparse_cache_bytes += size
+            self.persistent_response_hits += 1
+        return response
+
+    def _evict_oldest_persistent(self) -> bool:
+        """Drop one mmap owner while keeping the exact disk artifact intact."""
+        if not self._persistent_sparse_cache:
+            return False
+        _key, value = self._persistent_sparse_cache.popitem(last=False)
+        self._persistent_sparse_cache_bytes -= int(value.nbytes)
+        self.persistent_response_evictions += 1
+        return True
+
+    def _make_combined_cache_room(self, incoming_bytes: int) -> bool:
+        """Enforce one resident byte cap across heap and persistent objects.
+
+        Called with ``_cache_guard`` held. Cache eviction changes recomputation
+        only; callers retain their local object and all stored arrays are exact.
+        """
+        incoming = max(0, int(incoming_bytes))
+        limit = int(self._feature_cache_limit)
+        if limit <= 0 or incoming > limit:
+            return False
+        while (
+            self._persistent_sparse_cache
+            and self._feature_cache_bytes
+            + self._persistent_sparse_cache_bytes
+            + incoming
+            > limit
+        ):
+            self._evict_oldest_persistent()
+        while (
+            self._feature_cache
+            and self._feature_cache_bytes
+            + self._persistent_sparse_cache_bytes
+            + incoming
+            > limit
+        ):
+            old_key, old_value = self._feature_cache.popitem(last=False)
+            self._feature_cache_bytes -= int(old_value.nbytes)
+            self._response_locks.pop(old_key, None)
+            self._remove_sparse_metadata(old_key)
+        return bool(
+            self._feature_cache_bytes
+            + self._persistent_sparse_cache_bytes
+            + incoming
+            <= limit
+        )
+
+    def _write_persistent_sparse(
+        self,
+        ctx: QueryContext,
+        key: tuple,
+        response: SparseKernelResponse,
+    ) -> bool:
+        path = self._persistent_sparse_path(ctx, key)
+        if path is None:
+            return False
+        size = int(response.nbytes)
+        if (
+            size > self._persistent_response_limit
+            or self._persistent_response_bytes + size
+            > self._persistent_response_limit
+        ):
+            self.persistent_response_skipped_bytes += size
+            return False
+        complete = path / "complete.json"
+        if complete.is_file():
+            loaded = self._load_persistent_sparse(ctx, key)
+            return loaded is not None
+        temporary = path.with_name(
+            f"{path.name}.tmp-{os.getpid()}-{threading.get_ident()}"
+        )
+        try:
+            temporary.mkdir(parents=True, exist_ok=False)
+            np.save(
+                temporary / "grid_indices.npy",
+                np.ascontiguousarray(response.grid_indices),
+                allow_pickle=False,
+            )
+            np.save(
+                temporary / "grid_values.npy",
+                np.ascontiguousarray(response.grid_values),
+                allow_pickle=False,
+            )
+            np.save(
+                temporary / "event_values.npy",
+                np.ascontiguousarray(response.event_values),
+                allow_pickle=False,
+            )
+            metadata = {
+                "schema": 1,
+                "context_digest": self._persistent_context_digest(ctx),
+                "n_events": int(response.n_events),
+                "n_grid": int(response.n_grid),
+                "nbytes": size,
+            }
+            (temporary / "complete.json").write_text(
+                json.dumps(metadata, sort_keys=True), encoding="utf-8"
+            )
+            try:
+                temporary.rename(path)
+            except FileExistsError:
+                for child in temporary.iterdir():
+                    child.unlink(missing_ok=True)
+                temporary.rmdir()
+        except (FileExistsError, OSError):
+            if temporary.exists():
+                for child in temporary.iterdir():
+                    child.unlink(missing_ok=True)
+                temporary.rmdir()
+            return complete.is_file()
+        self._persistent_response_bytes += size
+        self.persistent_response_writes += 1
+        loaded = self._load_persistent_sparse(ctx, key)
+        return loaded is not None
+
+    def persist_sparse_response(
+        self,
+        ctx: QueryContext,
+        antecedent: Antecedent,
+        window: int,
+        *,
+        shape: np.ndarray | None = None,
+    ) -> SparseKernelResponse:
+        """Materialize one exact response as read-only mmap-backed arrays."""
+        if shape is None:
+            key = (
+                ctx.name,
+                tuple(antecedent),
+                int(window),
+                "__sparse_raw__",
+            )
+            response = self.sparse_response(ctx, antecedent, window)
+        else:
+            shape32 = np.asarray(shape, dtype=np.float32).reshape(-1)
+            key = (
+                ctx.name,
+                tuple(antecedent),
+                int(window),
+                "__sparse_projected__",
+                shape32.tobytes(),
+            )
+            response = self.sparse_projected_response(
+                ctx, antecedent, window, shape32
+            )
+        self._write_persistent_sparse(ctx, key, response)
+        mapped = self._persistent_sparse_cache.get(key)
+        if mapped is None:
+            return response
+        # Replace, rather than duplicate, an existing heap-backed LRU entry.
+        # Both objects contain the same exact float32/int64 arrays; subsequent
+        # support fits now fault pages from the bounded mmap store and the
+        # original NumPy allocation can be released immediately.
+        with self._cache_guard:
+            cached = self._feature_cache.get(key)
+            if isinstance(cached, SparseKernelResponse):
+                self._feature_cache_bytes += int(mapped.nbytes - cached.nbytes)
+                self._feature_cache[key] = mapped
+                self._feature_cache.move_to_end(key)
+        return mapped
 
     def _validate_context_identity(self, ctx: QueryContext) -> None:
         """Prevent a name-keyed cache from serving a different cohort."""
@@ -454,6 +816,13 @@ class RuleOccurrenceEngine:
                 self._feature_cache_bytes -= int(old_value.nbytes)
                 self._response_locks.pop(old_key, None)
                 self._remove_sparse_metadata(old_key)
+            while (
+                self._persistent_sparse_cache
+                and self._feature_cache_bytes
+                + self._persistent_sparse_cache_bytes
+                > self._feature_cache_limit
+            ):
+                self._evict_oldest_persistent()
             self._response_locks.pop(key, None)
 
     def _remove_sparse_metadata(self, key: tuple) -> None:
@@ -807,6 +1176,9 @@ class RuleOccurrenceEngine:
         """Build a response without allocating an ``n_grid × M`` zero matrix."""
         self._validate_context_identity(ctx)
         key = (ctx.name, tuple(antecedent), int(window), "__sparse_raw__")
+        persistent = self._load_persistent_sparse(ctx, key)
+        if persistent is not None:
+            return persistent
         with self._cache_guard:
             cached = self._cached_sparse(key)
             if cached is not None:
@@ -873,6 +1245,7 @@ class RuleOccurrenceEngine:
         window: int,
         shape: np.ndarray,
     ) -> SparseKernelResponse:
+        self._validate_context_identity(ctx)
         shape32 = np.asarray(shape, dtype=np.float32).reshape(-1)
         if shape32.shape != (self.knot_count,) or np.any(~np.isfinite(shape32)):
             raise ValueError("projected response shape must be a finite M-vector")
@@ -883,6 +1256,9 @@ class RuleOccurrenceEngine:
             "__sparse_projected__",
             shape32.tobytes(),
         )
+        persistent = self._load_persistent_sparse(ctx, key)
+        if persistent is not None:
+            return persistent
         with self._cache_guard:
             cached = self._cached_sparse(key)
             if cached is not None:
@@ -900,6 +1276,44 @@ class RuleOccurrenceEngine:
             ).projected(shape32)
             return self._intern_sparse(key, result)
 
+    def sparse_window_delta_response(
+        self,
+        ctx: QueryContext,
+        antecedent: Antecedent,
+        lower_window: int,
+        upper_window: int,
+    ) -> SparseKernelResponse:
+        """Response contributed only by completions newly admitted at W."""
+        lower = int(lower_window)
+        upper = int(upper_window)
+        if upper <= lower:
+            raise ValueError("delta response requires an increasing window")
+        self._validate_context_identity(ctx)
+        key = (
+            ctx.name,
+            tuple(antecedent),
+            lower,
+            upper,
+            "__sparse_window_delta__",
+        )
+        with self._cache_guard:
+            cached = self._cached_sparse(key)
+            if cached is not None:
+                return cached
+            key_lock = self._response_locks.setdefault(key, threading.Lock())
+        with key_lock:
+            with self._cache_guard:
+                cached = self._cached_sparse(key)
+                if cached is not None:
+                    return cached
+            result = self._build_sparse_response(
+                ctx,
+                tuple(antecedent),
+                upper,
+                lower_window=lower,
+            )
+            return self._intern_sparse(key, result)
+
     def _build_sparse_response(
         self,
         ctx: QueryContext,
@@ -907,10 +1321,13 @@ class RuleOccurrenceEngine:
         window: int,
         *,
         lag_limit: int | None = None,
+        lower_window: int | None = None,
     ) -> SparseKernelResponse:
         events = self.completions_for_context(ctx, antecedent)
         local_seq = ctx.sequence_lookup[events.sequence_codes]
         keep = (local_seq >= 0) & (events.spans <= int(window))
+        if lower_window is not None:
+            keep &= events.spans > int(lower_window)
         local_seq = local_seq[keep].astype(np.int32, copy=False)
         occurrence_times = events.times[keep].astype(np.int64, copy=False)
         grid_indices = np.zeros(0, dtype=np.int64)
@@ -1142,6 +1559,61 @@ class RuleOccurrenceEngine:
                 event_values=event_values,
             )
 
+    def minimum_event_activating_span(
+        self,
+        ctx: QueryContext,
+        antecedent: Antecedent,
+        *,
+        max_window: int,
+    ) -> int | None:
+        """Return the first W whose nonnegative response reaches a target event.
+
+        Completion effects occupy the strictly future grid interval
+        ``[completion + 1, completion + impact_lag]``.  Testing interval
+        intersection against the sorted event-grid rows is equivalent to
+        constructing every kernel column because the triangular basis has
+        positive total mass at every represented lag.  This outcome-aware
+        check is an exact structural likelihood certificate, not a ranking
+        score or a candidate budget.
+        """
+        events = self.completions_for_context(ctx, tuple(antecedent))
+        if not len(events.times) or not ctx.n_events:
+            return None
+        local_seq = ctx.sequence_lookup[events.sequence_codes]
+        keep = (local_seq >= 0) & (events.spans <= int(max_window))
+        if not np.any(keep):
+            return None
+        local_seq = local_seq[keep].astype(np.int32, copy=False)
+        occurrence_times = events.times[keep].astype(np.int64, copy=False)
+        spans = events.spans[keep].astype(np.int32, copy=False)
+        starts = ctx.start_times[local_seq].astype(np.int64, copy=False)
+        ends = ctx.end_times[local_seq].astype(np.int64, copy=False)
+        valid = (occurrence_times >= starts) & (occurrence_times <= ends)
+        if not np.any(valid):
+            return None
+        local_seq = local_seq[valid]
+        occurrence_times = occurrence_times[valid]
+        spans = spans[valid]
+        starts = starts[valid]
+        ends = ends[valid]
+        base_rows = (
+            ctx.grid_offsets[local_seq]
+            + occurrence_times
+            - starts
+        )
+        last_rows = base_rows + np.minimum(
+            int(self.lag), ends - occurrence_times
+        )
+        first_rows = base_rows + 1
+        positions = np.searchsorted(ctx.event_grid_rows, first_rows)
+        safe = np.minimum(positions, ctx.n_events - 1)
+        hit = (positions < ctx.n_events) & (
+            ctx.event_grid_rows[safe] <= last_rows
+        )
+        if not np.any(hit):
+            return None
+        return int(np.min(spans[hit]))
+
     def _build_response(
         self,
         ctx: QueryContext,
@@ -1297,6 +1769,9 @@ class RuleOccurrenceEngine:
                 self._sparse_aliases.clear()
                 self._sparse_key_fingerprints.clear()
                 self._sparse_canonical_aliases.clear()
+                self._persistent_sparse_cache.clear()
+                self._persistent_sparse_cache_bytes = 0
+                self._persistent_context_digests.clear()
                 return
             self._remove_feature_keys([key for key in self._feature_cache if key[0] == context_name])
             self._remove_feature_keys([
@@ -1310,6 +1785,16 @@ class RuleOccurrenceEngine:
                 if key and key[0] == context_name:
                     self._remove_sparse_metadata(key)
             self._context_sequences.pop(context_name, None)
+            self._persistent_sparse_cache = OrderedDict(
+                (key, value)
+                for key, value in self._persistent_sparse_cache.items()
+                if not key or key[0] != context_name
+            )
+            self._persistent_sparse_cache_bytes = sum(
+                int(value.nbytes)
+                for value in self._persistent_sparse_cache.values()
+            )
+            self._persistent_context_digests.pop(context_name, None)
 
     def evict_context_completion(
         self,

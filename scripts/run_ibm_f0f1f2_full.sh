@@ -6,17 +6,19 @@ cd /workspace
 export PYTHONPATH=scripts
 export PYTHONHASHSEED=0
 export PYTHONUNBUFFERED=1
-# Twelve independent exact-fit workers occupy the physical cores.  Keeping
-# each BLAS call single-threaded prevents nested oversubscription; this changes
-# scheduling only, never the model, dictionary, or acceptance rule.
+# Twenty-four independent exact-fit workers use both logical threads on this
+# 12-core host. Keeping each BLAS call single-threaded prevents nested
+# oversubscription; this changes scheduling only, never the model, dictionary,
+# optimizer, or acceptance rule. A controlled 50k run was 14.4% faster than
+# 12 workers with identical discovery/refinement output.
 export OMP_NUM_THREADS=1
 export MKL_NUM_THREADS=1
 export OPENBLAS_NUM_THREADS=1
 
 RAW_ZIP="data/ibm_aml/raw/HI-Small_Trans.csv.zip"
 export DATA_ROOT="data/ibm_aml/processed/hi_small_tpp_dynamic_nonproxy_v4_f0_clean"
-OUTPUT="results/certscr_ibm_dynamic_nonproxy_v4_f0_clean_full_schema11.json"
-LOG="results/certscr_ibm_dynamic_nonproxy_v4_f0_clean_full_schema11.log"
+OUTPUT="results/certscr_ibm_dynamic_nonproxy_v4_f0_clean_full_schema14.json"
+LOG="results/certscr_ibm_dynamic_nonproxy_v4_f0_clean_full_schema14.log"
 
 mkdir -p results
 exec > >(tee "${LOG}") 2>&1
@@ -87,6 +89,7 @@ python scripts/certscr_tpp.py \
   --triplet-generation all \
   --support-search active_set \
   --active-start-policy all_atoms \
+  --active-neighbor-strategy exact_one_exchange \
   --support-family terminal_atoms \
   --no-safe-mdl-screen \
   --target-history-control \
@@ -94,8 +97,8 @@ python scripts/certscr_tpp.py \
   --adverse-event-name "outgoing money-laundering transaction" \
   --early-warning-horizon 12 \
   --early-warning-threshold 0 \
-  --solver-workers 12 \
-  --response-workers 8 \
+  --solver-workers 24 \
+  --response-workers 16 \
   --device cpu \
   --solver-dtype float64 \
   --feature-cache-gb 32 \

@@ -46,6 +46,8 @@ class EventData:
     sequence_slices: tuple[tuple[int, int], ...]
     start_times: np.ndarray
     end_times: np.ndarray
+    sequence_split_groups: np.ndarray | None = None
+    sequence_start_ages: np.ndarray | None = None
     target_marks: TargetMarkCSR | None = None
     mark_name: str | None = None
     sequence_financial_weights: np.ndarray | None = None
@@ -75,6 +77,8 @@ class EventData:
         end_col: str = "end_month",
         mark_col: str | None = None,
         financial_weight_col: str | None = None,
+        split_group_col: str | None = None,
+        start_age_col: str | None = None,
         preprocessing_provenance: dict[str, object] | None = None,
     ) -> "EventData":
         predicate_names = tuple(str(v) for v in predicate_names)
@@ -99,14 +103,23 @@ class EventData:
             raise ValueError(f"missing event columns: {missing}")
         bounds_map: dict[str, tuple[int, int]] = {}
         financial_weight_map: dict[str, float] = {}
+        split_group_map: dict[str, object] = {}
+        start_age_map: dict[str, int] = {}
         if bounds is not None:
             bound_columns = (sequence_col, start_col, end_col)
-            for name in (*bound_columns, *((financial_weight_col,) if financial_weight_col else ())):
+            for name in (
+                *bound_columns,
+                *((financial_weight_col,) if financial_weight_col else ()),
+                *((split_group_col,) if split_group_col else ()),
+                *((start_age_col,) if start_age_col else ()),
+            ):
                 if name not in bounds.columns:
                     raise ValueError(f"sequence bounds missing {name}")
             selected_bound_columns = [
                 *bound_columns,
                 *((financial_weight_col,) if financial_weight_col else ()),
+                *((split_group_col,) if split_group_col else ()),
+                *((start_age_col,) if start_age_col else ()),
             ]
             bound_frame = bounds.loc[:, selected_bound_columns]
             bound_ids = bound_frame[sequence_col].astype("string").astype(str).to_numpy(
@@ -165,6 +178,35 @@ class EventData:
                     )
                 financial_weight_map = dict(
                     zip(bound_ids.tolist(), weight_values.tolist(), strict=True)
+                )
+            if split_group_col is not None:
+                group_values = bound_frame[split_group_col]
+                if bool(group_values.isna().any()):
+                    raise ValueError("sequence split groups must be nonmissing")
+                split_group_map = dict(
+                    zip(bound_ids.tolist(), group_values.tolist(), strict=True)
+                )
+            if start_age_col is not None:
+                age_values = pd.to_numeric(
+                    bound_frame[start_age_col], errors="coerce"
+                ).to_numpy(dtype=np.float64)
+                invalid_age = (
+                    ~np.isfinite(age_values)
+                    | (age_values < 0.0)
+                    | (age_values != np.floor(age_values))
+                    | (age_values > np.iinfo(np.int16).max)
+                )
+                if np.any(invalid_age):
+                    index = int(np.flatnonzero(invalid_age)[0])
+                    raise ValueError(
+                        f"invalid sequence start age for {bound_ids[index]}: {age_values[index]}"
+                    )
+                start_age_map = dict(
+                    zip(
+                        bound_ids.tolist(),
+                        age_values.astype(np.int16).tolist(),
+                        strict=True,
+                    )
                 )
         elif financial_weight_col is not None:
             raise ValueError("financial weights require a sequence bounds table")
@@ -327,6 +369,19 @@ class EventData:
             sequence_slices=tuple(slices),
             start_times=np.asarray(starts_array, dtype=np.int32),
             end_times=np.asarray(ends_array, dtype=np.int32),
+            sequence_split_groups=(
+                np.asarray([split_group_map[seq_id] for seq_id in ids])
+                if split_group_col is not None
+                else None
+            ),
+            sequence_start_ages=(
+                np.asarray(
+                    [start_age_map[seq_id] for seq_id in ids],
+                    dtype=np.int16,
+                )
+                if start_age_col is not None
+                else None
+            ),
             target_marks=target_marks,
             mark_name=mark_col,
             sequence_financial_weights=(
@@ -541,6 +596,8 @@ class ThreeWayContexts:
     fit_population_sequence_count: int
     fit_population_negative_count: int
     fit_sampled_negative_count: int
+    split_strategy: str = "random_sequence"
+    split_groups: tuple[tuple[object, ...], tuple[object, ...], tuple[object, ...]] | None = None
 
 
 def _parquet_schema_names(path: Path) -> tuple[str, ...]:
@@ -586,6 +643,8 @@ def load_event_data(
     financial_weight_col: str | None = None,
     start_col: str | None = None,
     end_col: str | None = None,
+    split_group_col: str | None = None,
+    start_age_col: str | None = None,
 ) -> EventData:
     path = Path(path)
     if max_sequences is not None and max_sequences < 1:
@@ -642,6 +701,10 @@ def load_event_data(
         bound_columns = [sequence_col, resolved_start_col, resolved_end_col]
         if financial_weight_col is not None:
             bound_columns.append(financial_weight_col)
+        if split_group_col is not None:
+            bound_columns.append(split_group_col)
+        if start_age_col is not None:
+            bound_columns.append(start_age_col)
         bounds = _read_parquet_dir(sibling, bound_columns)
 
     # In a sparse event stream a valid exposed sequence may have no event row.
@@ -682,6 +745,8 @@ def load_event_data(
         end_col=resolved_end_col or "end_month",
         mark_col=mark_col,
         financial_weight_col=financial_weight_col,
+        split_group_col=split_group_col,
+        start_age_col=start_age_col,
         preprocessing_provenance=preprocessing_provenance,
     )
 
@@ -761,6 +826,7 @@ def split_contexts(
     seed: int = 111,
     stratify_target: bool = False,
     fit_negative_sample_size: int | None = None,
+    strategy: str = "random_sequence",
 ) -> ThreeWayContexts:
     n_parts = 3
     if len(fractions) != n_parts or any(v <= 0 for v in fractions) or not math.isclose(sum(fractions), 1.0):
@@ -786,7 +852,76 @@ def split_contexts(
 
     desired_sizes = apportioned_sizes(data.n_sequences)
 
-    if stratify_target:
+    split_groups: tuple[
+        tuple[object, ...], tuple[object, ...], tuple[object, ...]
+    ] | None = None
+    if strategy not in {"random_sequence", "ordered_group"}:
+        raise ValueError("split strategy must be random_sequence or ordered_group")
+    if strategy == "ordered_group":
+        if stratify_target:
+            raise ValueError(
+                "ordered-group splitting cannot also stratify on the target"
+            )
+        if data.sequence_split_groups is None:
+            raise ValueError(
+                "ordered-group splitting requires sequence split-group metadata"
+            )
+        group_values = np.asarray(data.sequence_split_groups)
+        if group_values.shape != (data.n_sequences,):
+            raise ValueError("sequence split groups do not align with entities")
+        unique_groups = np.unique(group_values)
+        if len(unique_groups) < n_parts:
+            raise ValueError("ordered-group splitting requires at least three groups")
+        group_members = [
+            np.flatnonzero(group_values == group) for group in unique_groups
+        ]
+        target_sizes = np.asarray(desired_sizes, dtype=np.float64)
+        best: tuple[float, int, int, np.ndarray] | None = None
+        for first_cut in range(1, len(unique_groups) - 1):
+            for second_cut in range(first_cut + 1, len(unique_groups)):
+                sizes = np.asarray(
+                    [
+                        sum(len(v) for v in group_members[:first_cut]),
+                        sum(len(v) for v in group_members[first_cut:second_cut]),
+                        sum(len(v) for v in group_members[second_cut:]),
+                    ],
+                    dtype=np.int64,
+                )
+                score = float(
+                    np.sum(
+                        ((sizes.astype(np.float64) - target_sizes) / data.n_sequences)
+                        ** 2
+                    )
+                )
+                candidate = (score, first_cut, second_cut, sizes)
+                if best is None or candidate[:3] < best[:3]:
+                    best = candidate
+        assert best is not None
+        _score, first_cut, second_cut, _sizes = best
+        grouped_parts = (
+            group_members[:first_cut],
+            group_members[first_cut:second_cut],
+            group_members[second_cut:],
+        )
+        parts = [
+            np.concatenate(values).astype(np.int64, copy=False)
+            for values in grouped_parts
+        ]
+        split_groups = (
+            tuple(unique_groups[:first_cut].tolist()),
+            tuple(unique_groups[first_cut:second_cut].tolist()),
+            tuple(unique_groups[second_cut:].tolist()),
+        )
+        target_counts = np.bincount(
+            data.sequence_codes,
+            weights=data.targets.astype(np.float64),
+            minlength=data.n_sequences,
+        )
+        if any(not np.any(target_counts[part] > 0) for part in parts):
+            raise ValueError(
+                "ordered-group split produced a target-free evaluation partition"
+            )
+    elif stratify_target:
         target_counts = np.bincount(
             data.sequence_codes,
             weights=data.targets.astype(np.float64),
@@ -885,4 +1020,6 @@ def split_contexts(
         fit_population_sequence_count=fit_population_count,
         fit_population_negative_count=fit_population_negative_count,
         fit_sampled_negative_count=sampled_negative_count,
+        split_strategy=strategy,
+        split_groups=split_groups,
     )

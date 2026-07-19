@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ctypes
 import hashlib
+import math
 import os
 import subprocess
 import tempfile
@@ -153,6 +154,107 @@ def _load_completion_library() -> ctypes.CDLL | None:
                 ctypes.POINTER(ctypes.c_int64),
             ]
             partitioned_grouping.restype = ctypes.c_int64
+            sparse_design_grouping = (
+                library.certscr_group_sparse_design_partitioned
+            )
+            float_pointer = ctypes.POINTER(ctypes.c_float)
+            double_pointer = ctypes.POINTER(ctypes.c_double)
+            sparse_design_grouping.argtypes = [
+                int64_pointer,
+                double_pointer,
+                ctypes.c_int64,
+                ctypes.POINTER(int64_pointer),
+                ctypes.POINTER(float_pointer),
+                ctypes.POINTER(float_pointer),
+                int64_pointer,
+                int_pointer,
+                float_pointer,
+                ctypes.c_int32,
+                ctypes.c_int64,
+                double_pointer,
+                ctypes.c_double,
+                ctypes.c_int32,
+                float_pointer,
+                double_pointer,
+                int64_pointer,
+                ctypes.c_int64,
+                int64_pointer,
+                int64_pointer,
+            ]
+            sparse_design_grouping.restype = ctypes.c_int64
+            sparse_base_refinement = (
+                library.certscr_refine_sparse_base_partitioned
+            )
+            sparse_base_refinement.argtypes = [
+                int64_pointer,
+                double_pointer,
+                ctypes.c_int64,
+                int64_pointer,
+                int64_pointer,
+                ctypes.c_int64,
+                float_pointer,
+                double_pointer,
+                ctypes.c_int64,
+                ctypes.c_int64,
+                ctypes.c_int32,
+                float_pointer,
+                ctypes.POINTER(int64_pointer),
+                ctypes.POINTER(float_pointer),
+                ctypes.POINTER(float_pointer),
+                int64_pointer,
+                int_pointer,
+                float_pointer,
+                ctypes.c_int32,
+                ctypes.c_int64,
+                double_pointer,
+                ctypes.c_int32,
+                float_pointer,
+                double_pointer,
+                int64_pointer,
+                ctypes.c_int64,
+                int_pointer,
+                int_pointer,
+                int_pointer,
+                int64_pointer,
+            ]
+            sparse_base_refinement.restype = ctypes.c_int64
+            sparse_partition_update = (
+                library.certscr_update_sparse_design_partitioned
+            )
+            sparse_partition_update.argtypes = [
+                int64_pointer,
+                double_pointer,
+                ctypes.c_int64,
+                int_pointer,
+                ctypes.c_int64,
+                float_pointer,
+                double_pointer,
+                ctypes.c_int64,
+                int_pointer,
+                ctypes.c_int64,
+                float_pointer,
+                ctypes.c_int64,
+                double_pointer,
+                ctypes.POINTER(int64_pointer),
+                ctypes.POINTER(float_pointer),
+                ctypes.POINTER(float_pointer),
+                int64_pointer,
+                int_pointer,
+                int_pointer,
+                float_pointer,
+                ctypes.c_int32,
+                ctypes.c_int32,
+                ctypes.c_int32,
+                float_pointer,
+                double_pointer,
+                int64_pointer,
+                ctypes.c_int64,
+                int_pointer,
+                int_pointer,
+                int_pointer,
+                int64_pointer,
+            ]
+            sparse_partition_update.restype = ctypes.c_int64
             pair_grouping = library.certscr_group_float32_rows_pair
             pair_grouping.argtypes = [
                 ctypes.POINTER(ctypes.c_float),
@@ -165,6 +267,23 @@ def _load_completion_library() -> ctypes.CDLL | None:
                 ctypes.POINTER(ctypes.c_double),
             ]
             pair_grouping.restype = ctypes.c_int64
+            sparse_delta_grouping = library.certscr_group_sparse_delta_rows
+            sparse_delta_grouping.argtypes = [
+                int_pointer,
+                int64_pointer,
+                int_pointer,
+                float_pointer,
+                double_pointer,
+                ctypes.c_int64,
+                ctypes.c_int64,
+                int_pointer,
+                int64_pointer,
+                int_pointer,
+                float_pointer,
+                double_pointer,
+                int64_pointer,
+            ]
+            sparse_delta_grouping.restype = ctypes.c_int64
             sparse_block = library.certscr_sparse_kernel_block
             sparse_block.argtypes = [
                 ctypes.POINTER(ctypes.c_int64),
@@ -180,7 +299,6 @@ def _load_completion_library() -> ctypes.CDLL | None:
             ]
             sparse_block.restype = ctypes.c_int64
             cone_fit = library.certscr_fit_prepared_cone
-            double_pointer = ctypes.POINTER(ctypes.c_double)
             cone_fit.argtypes = [
                 double_pointer,
                 ctypes.c_int64,
@@ -199,6 +317,62 @@ def _load_completion_library() -> ctypes.CDLL | None:
                 int_pointer,
             ]
             cone_fit.restype = ctypes.c_int64
+            sparse_delta_fit = library.certscr_fit_sparse_delta_cone
+            sparse_delta_fit.argtypes = [
+                double_pointer,
+                ctypes.c_int64,
+                ctypes.c_int64,
+                ctypes.c_int32,
+                double_pointer,
+                double_pointer,
+                int_pointer,
+                int64_pointer,
+                int_pointer,
+                float_pointer,
+                double_pointer,
+                ctypes.c_int64,
+                ctypes.c_int64,
+                int_pointer,
+                int64_pointer,
+                int_pointer,
+                float_pointer,
+                double_pointer,
+                ctypes.c_int64,
+                ctypes.c_int64,
+                ctypes.c_int32,
+                ctypes.c_int32,
+                ctypes.c_int32,
+                ctypes.c_int32,
+                ctypes.c_int32,
+                ctypes.c_double,
+                double_pointer,
+                double_pointer,
+                double_pointer,
+                double_pointer,
+                int_pointer,
+            ]
+            sparse_delta_fit.restype = ctypes.c_int64
+            batched_rule_moments = (
+                library.certscr_batched_sparse_rule_moments
+            )
+            batched_rule_moments.argtypes = [
+                float_pointer,
+                double_pointer,
+                int64_pointer,
+                ctypes.c_int64,
+                ctypes.c_int64,
+                ctypes.c_int32,
+                ctypes.c_int32,
+                float_pointer,
+                double_pointer,
+                double_pointer,
+                ctypes.c_int64,
+                ctypes.c_int32,
+                ctypes.c_int32,
+                double_pointer,
+                double_pointer,
+            ]
+            batched_rule_moments.restype = ctypes.c_int64
             _LIBRARY = library
         except (OSError, AttributeError, subprocess.SubprocessError):
             # The NumPy implementation remains an exact portable fallback.
@@ -268,6 +442,8 @@ def linear_completions(
 
 def sorted_unique_int64_union(
     arrays: Sequence[np.ndarray],
+    *,
+    allow_wide: bool = False,
 ) -> np.ndarray | None:
     """Union strictly increasing int64 arrays without concatenate/sort copies."""
     library = _load_completion_library()
@@ -285,7 +461,7 @@ def sorted_unique_int64_union(
     # The allocation-free head scan wins consistently for the q<=3
     # antecedent/completion path.  Wider support unions are faster in NumPy's
     # vectorized contiguous sort on the target CPU.
-    if len(values) > 3:
+    if len(values) > 3 and not allow_wide:
         return None
     capacity = int(sum(len(value) for value in values))
     output = np.empty(capacity, dtype=np.int64)
@@ -544,7 +720,7 @@ def aggregate_float32_rows_partitioned(
     grid_weights: np.ndarray,
     *,
     inplace: bool = False,
-) -> tuple[np.ndarray, int, np.ndarray] | None:
+) -> tuple[np.ndarray, int, np.ndarray, np.ndarray] | None:
     """Group event/grid rows separately into one exact output allocation."""
     library = _load_completion_library()
     if library is None:
@@ -636,6 +812,474 @@ def aggregate_float32_rows_pair(
     return output_design, output_first, output_second
 
 
+def aggregate_sparse_design_partitioned(
+    active_rows: np.ndarray,
+    active_weights: np.ndarray,
+    grid_indices: Sequence[np.ndarray],
+    grid_values: Sequence[np.ndarray],
+    event_values: Sequence[np.ndarray],
+    signs: Sequence[float],
+    event_weights: np.ndarray,
+    inactive_weight: float,
+    *,
+    return_active_groups: bool = False,
+) -> tuple[np.ndarray, int, np.ndarray, np.ndarray] | tuple[
+    np.ndarray, int, np.ndarray, np.ndarray, np.ndarray
+] | None:
+    """Assemble and group an all-sparse design in one exact native sweep."""
+    library = _load_completion_library()
+    if library is None:
+        return None
+    rows = np.ascontiguousarray(active_rows, dtype=np.int64).reshape(-1)
+    row_mass = np.ascontiguousarray(active_weights, dtype=np.float64).reshape(-1)
+    index_blocks = [
+        np.ascontiguousarray(value, dtype=np.int64).reshape(-1)
+        for value in grid_indices
+    ]
+    grid_blocks = [
+        np.ascontiguousarray(value, dtype=np.float32)
+        for value in grid_values
+    ]
+    event_blocks = [
+        np.ascontiguousarray(value, dtype=np.float32)
+        for value in event_values
+    ]
+    sign_values = np.ascontiguousarray(signs, dtype=np.float32).reshape(-1)
+    event_mass = np.ascontiguousarray(event_weights, dtype=np.float64).reshape(-1)
+    block_count = len(index_blocks)
+    if (
+        block_count < 1
+        or len(grid_blocks) != block_count
+        or len(event_blocks) != block_count
+        or sign_values.shape != (block_count,)
+        or row_mass.shape != rows.shape
+        or not math.isfinite(float(inactive_weight))
+        or float(inactive_weight) < 0.0
+    ):
+        raise ValueError("native sparse design inputs are not aligned")
+    widths = np.asarray([value.shape[1] for value in grid_blocks], dtype=np.int32)
+    event_count = int(len(event_mass))
+    for indices, grid, events, width in zip(
+        index_blocks, grid_blocks, event_blocks, widths, strict=True
+    ):
+        if (
+            grid.ndim != 2
+            or events.ndim != 2
+            or len(grid) != len(indices)
+            or grid.shape[1] != int(width)
+            or events.shape != (event_count, int(width))
+            or int(width) < 1
+        ):
+            raise ValueError("native sparse design block dimensions differ")
+    columns = 1 + int(np.sum(widths, dtype=np.int64))
+    capacity = event_count + len(rows) + int(float(inactive_weight) > 0.0)
+    if capacity == 0:
+        raise ValueError("native sparse design has no positive-mass rows")
+    output_design = np.empty((capacity, columns), dtype=np.float32)
+    output_mass = np.empty(capacity, dtype=np.float64)
+    output_representatives = np.empty(capacity, dtype=np.int64)
+    output_active_groups = (
+        np.empty(len(rows), dtype=np.int64)
+        if return_active_groups
+        else None
+    )
+    int64_pointer = ctypes.POINTER(ctypes.c_int64)
+    float_pointer = ctypes.POINTER(ctypes.c_float)
+    index_pointers = (int64_pointer * block_count)(
+        *(value.ctypes.data_as(int64_pointer) for value in index_blocks)
+    )
+    grid_pointers = (float_pointer * block_count)(
+        *(value.ctypes.data_as(float_pointer) for value in grid_blocks)
+    )
+    event_pointers = (float_pointer * block_count)(
+        *(value.ctypes.data_as(float_pointer) for value in event_blocks)
+    )
+    lengths = np.asarray([len(value) for value in index_blocks], dtype=np.int64)
+    output_events = ctypes.c_int64(0)
+    written = int(
+        library.certscr_group_sparse_design_partitioned(
+            rows.ctypes.data_as(int64_pointer),
+            row_mass.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
+            len(rows),
+            index_pointers,
+            grid_pointers,
+            event_pointers,
+            lengths.ctypes.data_as(int64_pointer),
+            widths.ctypes.data_as(ctypes.POINTER(ctypes.c_int32)),
+            sign_values.ctypes.data_as(float_pointer),
+            block_count,
+            event_count,
+            event_mass.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
+            float(inactive_weight),
+            columns,
+            output_design.ctypes.data_as(float_pointer),
+            output_mass.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
+            output_representatives.ctypes.data_as(int64_pointer),
+            capacity,
+            (
+                output_active_groups.ctypes.data_as(int64_pointer)
+                if output_active_groups is not None
+                else None
+            ),
+            ctypes.byref(output_events),
+        )
+    )
+    if written < 0:
+        raise RuntimeError(
+            f"native sparse design grouping failed with status {written}"
+        )
+    output_design.resize((written, columns), refcheck=False)
+    output_mass.resize(written, refcheck=False)
+    output_representatives.resize(written, refcheck=False)
+    result = (
+        output_design,
+        int(output_events.value),
+        output_mass,
+        output_representatives,
+    )
+    if output_active_groups is not None:
+        return (*result, output_active_groups)
+    return result
+
+
+def refine_sparse_base_partitioned(
+    active_rows: np.ndarray,
+    active_weights: np.ndarray,
+    base_source_rows: np.ndarray,
+    base_source_groups: np.ndarray,
+    base_grid_design: np.ndarray,
+    base_grid_weights: np.ndarray,
+    zero_base_group: int | None,
+    base_event_design: np.ndarray,
+    grid_indices: Sequence[np.ndarray],
+    grid_values: Sequence[np.ndarray],
+    event_values: Sequence[np.ndarray],
+    signs: Sequence[float],
+    event_weights: np.ndarray,
+    *,
+    return_group_maps: bool = False,
+) -> tuple[np.ndarray, int, np.ndarray, np.ndarray] | tuple[
+    np.ndarray,
+    int,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+] | None:
+    """Exactly refine a reusable fixed-nuisance row partition.
+
+    Only rows touched by the candidate-specific blocks are revisited.  Their
+    mass is subtracted from the fixed nuisance groups and then reinserted with
+    the additional columns; untouched rows retain their already aggregated
+    sufficient statistics.
+    """
+    library = _load_completion_library()
+    if library is None:
+        return None
+    rows = np.ascontiguousarray(active_rows, dtype=np.int64).reshape(-1)
+    row_mass = np.ascontiguousarray(active_weights, dtype=np.float64).reshape(-1)
+    source_rows = np.ascontiguousarray(base_source_rows, dtype=np.int64).reshape(-1)
+    source_groups = np.ascontiguousarray(base_source_groups, dtype=np.int64).reshape(-1)
+    base_grid = np.ascontiguousarray(base_grid_design, dtype=np.float32)
+    base_mass = np.ascontiguousarray(base_grid_weights, dtype=np.float64).reshape(-1)
+    base_events = np.ascontiguousarray(base_event_design, dtype=np.float32)
+    index_blocks = [
+        np.ascontiguousarray(value, dtype=np.int64).reshape(-1)
+        for value in grid_indices
+    ]
+    grid_blocks = [np.ascontiguousarray(value, dtype=np.float32) for value in grid_values]
+    event_blocks = [np.ascontiguousarray(value, dtype=np.float32) for value in event_values]
+    sign_values = np.ascontiguousarray(signs, dtype=np.float32).reshape(-1)
+    event_mass = np.ascontiguousarray(event_weights, dtype=np.float64).reshape(-1)
+    block_count = len(index_blocks)
+    if (
+        block_count < 1
+        or len(grid_blocks) != block_count
+        or len(event_blocks) != block_count
+        or sign_values.shape != (block_count,)
+        or row_mass.shape != rows.shape
+        or source_groups.shape != source_rows.shape
+        or base_grid.ndim != 2
+        or base_mass.shape != (len(base_grid),)
+        or base_events.ndim != 2
+        or base_events.shape[1] != base_grid.shape[1]
+        or np.any(source_groups < 0)
+        or np.any(source_groups >= len(base_grid))
+    ):
+        raise ValueError("sparse base-refinement inputs are not aligned")
+    widths = np.asarray([value.shape[1] for value in grid_blocks], dtype=np.int32)
+    event_count = int(len(event_mass))
+    if base_events.shape[0] != event_count:
+        raise ValueError("base event design does not align with event weights")
+    for indices, grid, events, width in zip(
+        index_blocks, grid_blocks, event_blocks, widths, strict=True
+    ):
+        if (
+            grid.ndim != 2
+            or events.ndim != 2
+            or len(grid) != len(indices)
+            or grid.shape[1] != int(width)
+            or events.shape != (event_count, int(width))
+            or int(width) < 1
+        ):
+            raise ValueError("sparse refinement block dimensions differ")
+    columns = int(base_grid.shape[1]) + int(np.sum(widths, dtype=np.int64))
+    capacity = event_count + len(rows) + len(base_grid)
+    output_design = np.empty((capacity, columns), dtype=np.float32)
+    output_mass = np.empty(capacity, dtype=np.float64)
+    output_representatives = np.empty(capacity, dtype=np.int64)
+    output_active_groups = (
+        np.empty(len(rows), dtype=np.int32) if return_group_maps else None
+    )
+    output_background_groups = (
+        np.empty(len(base_grid), dtype=np.int32) if return_group_maps else None
+    )
+    output_event_groups = (
+        np.empty(event_count, dtype=np.int32) if return_group_maps else None
+    )
+    int64_pointer = ctypes.POINTER(ctypes.c_int64)
+    float_pointer = ctypes.POINTER(ctypes.c_float)
+    index_pointers = (int64_pointer * block_count)(
+        *(value.ctypes.data_as(int64_pointer) for value in index_blocks)
+    )
+    grid_pointers = (float_pointer * block_count)(
+        *(value.ctypes.data_as(float_pointer) for value in grid_blocks)
+    )
+    event_pointers = (float_pointer * block_count)(
+        *(value.ctypes.data_as(float_pointer) for value in event_blocks)
+    )
+    lengths = np.asarray([len(value) for value in index_blocks], dtype=np.int64)
+    output_events = ctypes.c_int64(0)
+    written = int(
+        library.certscr_refine_sparse_base_partitioned(
+            rows.ctypes.data_as(int64_pointer),
+            row_mass.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
+            len(rows),
+            source_rows.ctypes.data_as(int64_pointer),
+            source_groups.ctypes.data_as(int64_pointer),
+            len(source_rows),
+            base_grid.ctypes.data_as(float_pointer),
+            base_mass.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
+            len(base_grid),
+            -1 if zero_base_group is None else int(zero_base_group),
+            base_grid.shape[1],
+            base_events.ctypes.data_as(float_pointer),
+            index_pointers,
+            grid_pointers,
+            event_pointers,
+            lengths.ctypes.data_as(int64_pointer),
+            widths.ctypes.data_as(ctypes.POINTER(ctypes.c_int32)),
+            sign_values.ctypes.data_as(float_pointer),
+            block_count,
+            event_count,
+            event_mass.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
+            columns,
+            output_design.ctypes.data_as(float_pointer),
+            output_mass.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
+            output_representatives.ctypes.data_as(int64_pointer),
+            capacity,
+            (
+                output_active_groups.ctypes.data_as(ctypes.POINTER(ctypes.c_int32))
+                if output_active_groups is not None
+                else None
+            ),
+            (
+                output_background_groups.ctypes.data_as(ctypes.POINTER(ctypes.c_int32))
+                if output_background_groups is not None
+                else None
+            ),
+            (
+                output_event_groups.ctypes.data_as(ctypes.POINTER(ctypes.c_int32))
+                if output_event_groups is not None
+                else None
+            ),
+            ctypes.byref(output_events),
+        )
+    )
+    if written < 0:
+        raise RuntimeError(
+            f"native sparse base refinement failed with status {written}"
+        )
+    output_design.resize((written, columns), refcheck=False)
+    output_mass.resize(written, refcheck=False)
+    output_representatives.resize(written, refcheck=False)
+    result = (
+        output_design,
+        int(output_events.value),
+        output_mass,
+        output_representatives,
+    )
+    if return_group_maps:
+        assert output_active_groups is not None
+        assert output_background_groups is not None
+        assert output_event_groups is not None
+        return (
+            *result,
+            output_active_groups,
+            output_background_groups,
+            output_event_groups,
+        )
+    return result
+
+
+def update_sparse_design_partitioned(
+    active_rows: np.ndarray,
+    active_weights: np.ndarray,
+    old_grid_group_map: np.ndarray,
+    old_grid_design: np.ndarray,
+    old_grid_weights: np.ndarray,
+    old_event_group_map: np.ndarray,
+    old_event_design: np.ndarray,
+    event_weights: np.ndarray,
+    grid_indices: Sequence[np.ndarray],
+    grid_values: Sequence[np.ndarray],
+    event_values: Sequence[np.ndarray],
+    column_offsets: Sequence[int],
+    signs: Sequence[float],
+    *,
+    output_columns: int | None = None,
+) -> tuple[
+    np.ndarray,
+    int,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+] | None:
+    """Apply sparse updates or append blocks to an exact grouped partition.
+
+    With ``output_columns`` unset, updates are written into the existing
+    design width (the cumulative-W path).  A larger width appends new sparse
+    columns while copying the old grouped prefix exactly; this lets support
+    fitting reuse a hierarchy-closure partition without regrouping it.
+    """
+    library = _load_completion_library()
+    if library is None:
+        return None
+    rows = np.ascontiguousarray(active_rows, dtype=np.int64).reshape(-1)
+    row_mass = np.ascontiguousarray(active_weights, dtype=np.float64).reshape(-1)
+    grid_map = np.ascontiguousarray(old_grid_group_map, dtype=np.int32).reshape(-1)
+    grid_design = np.ascontiguousarray(old_grid_design, dtype=np.float32)
+    grid_mass = np.ascontiguousarray(old_grid_weights, dtype=np.float64).reshape(-1)
+    event_map = np.ascontiguousarray(old_event_group_map, dtype=np.int32).reshape(-1)
+    event_design = np.ascontiguousarray(old_event_design, dtype=np.float32)
+    event_mass = np.ascontiguousarray(event_weights, dtype=np.float64).reshape(-1)
+    index_blocks = [np.ascontiguousarray(value, dtype=np.int64).reshape(-1) for value in grid_indices]
+    grid_blocks = [np.ascontiguousarray(value, dtype=np.float32) for value in grid_values]
+    event_blocks = [np.ascontiguousarray(value, dtype=np.float32) for value in event_values]
+    widths = np.asarray([value.shape[1] for value in grid_blocks], dtype=np.int32)
+    offsets = np.ascontiguousarray(column_offsets, dtype=np.int32).reshape(-1)
+    sign_values = np.ascontiguousarray(signs, dtype=np.float32).reshape(-1)
+    block_count = len(index_blocks)
+    old_columns = int(grid_design.shape[1]) if grid_design.ndim == 2 else 0
+    columns = (
+        old_columns if output_columns is None else int(output_columns)
+    )
+    if (
+        block_count < 1
+        or len(grid_blocks) != block_count
+        or len(event_blocks) != block_count
+        or offsets.shape != (block_count,)
+        or sign_values.shape != (block_count,)
+        or row_mass.shape != rows.shape
+        or grid_mass.shape != (len(grid_design),)
+        or event_design.ndim != 2
+        or event_design.shape[1] != old_columns
+        or columns < old_columns
+        or event_map.shape != event_mass.shape
+        or np.any(rows < 0)
+        or np.any(rows >= len(grid_map))
+    ):
+        raise ValueError("incremental sparse-design inputs are not aligned")
+    for indices, grid, events, width, offset in zip(
+        index_blocks, grid_blocks, event_blocks, widths, offsets, strict=True
+    ):
+        if (
+            grid.ndim != 2
+            or events.ndim != 2
+            or len(grid) != len(indices)
+            or grid.shape[1] != int(width)
+            or events.shape != (len(event_mass), int(width))
+            or int(offset) < 0
+            or int(offset) + int(width) > columns
+        ):
+            raise ValueError("incremental sparse block dimensions differ")
+    capacity = len(event_mass) + len(rows) + len(grid_design)
+    output_design = np.empty((capacity, columns), dtype=np.float32)
+    output_mass = np.empty(capacity, dtype=np.float64)
+    representatives = np.empty(capacity, dtype=np.int64)
+    active_groups = np.empty(len(rows), dtype=np.int32)
+    background_groups = np.empty(len(grid_design), dtype=np.int32)
+    output_event_groups = np.empty(len(event_mass), dtype=np.int32)
+    int64_pointer = ctypes.POINTER(ctypes.c_int64)
+    int_pointer = ctypes.POINTER(ctypes.c_int32)
+    float_pointer = ctypes.POINTER(ctypes.c_float)
+    index_pointers = (int64_pointer * block_count)(
+        *(value.ctypes.data_as(int64_pointer) for value in index_blocks)
+    )
+    grid_pointers = (float_pointer * block_count)(
+        *(value.ctypes.data_as(float_pointer) for value in grid_blocks)
+    )
+    event_pointers = (float_pointer * block_count)(
+        *(value.ctypes.data_as(float_pointer) for value in event_blocks)
+    )
+    lengths = np.asarray([len(value) for value in index_blocks], dtype=np.int64)
+    output_events = ctypes.c_int64(0)
+    written = int(
+        library.certscr_update_sparse_design_partitioned(
+            rows.ctypes.data_as(int64_pointer),
+            row_mass.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
+            len(rows),
+            grid_map.ctypes.data_as(int_pointer),
+            len(grid_map),
+            grid_design.ctypes.data_as(float_pointer),
+            grid_mass.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
+            len(grid_design),
+            event_map.ctypes.data_as(int_pointer),
+            len(event_mass),
+            event_design.ctypes.data_as(float_pointer),
+            len(event_design),
+            event_mass.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
+            index_pointers,
+            grid_pointers,
+            event_pointers,
+            lengths.ctypes.data_as(int64_pointer),
+            widths.ctypes.data_as(int_pointer),
+            offsets.ctypes.data_as(int_pointer),
+            sign_values.ctypes.data_as(float_pointer),
+            block_count,
+            old_columns,
+            columns,
+            output_design.ctypes.data_as(float_pointer),
+            output_mass.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
+            representatives.ctypes.data_as(int64_pointer),
+            capacity,
+            active_groups.ctypes.data_as(int_pointer),
+            background_groups.ctypes.data_as(int_pointer),
+            output_event_groups.ctypes.data_as(int_pointer),
+            ctypes.byref(output_events),
+        )
+    )
+    if written < 0:
+        raise RuntimeError(
+            f"native incremental sparse-design update failed with status {written}"
+        )
+    output_design.resize((written, columns), refcheck=False)
+    output_mass.resize(written, refcheck=False)
+    representatives.resize(written, refcheck=False)
+    return (
+        output_design,
+        int(output_events.value),
+        output_mass,
+        representatives,
+        active_groups,
+        background_groups,
+        output_event_groups,
+    )
+
+
 def sparse_kernel_block(
     base_indices: np.ndarray,
     occurrence_times: np.ndarray,
@@ -690,6 +1334,105 @@ def sparse_kernel_block(
     output_indices.resize(written, refcheck=False)
     output_values.resize((written, kernels.shape[0]), refcheck=False)
     return output_indices, output_values
+
+
+def batched_sparse_rule_moments(
+    grid_values: np.ndarray,
+    grid_weights_by_state: np.ndarray,
+    event_values: np.ndarray,
+    event_first_by_state: np.ndarray,
+    event_second_by_state: np.ndarray,
+    *,
+    include_event_second: bool,
+    worker_count: int = 1,
+    grid_weight_positions: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray] | None:
+    """Compute every rule score/Fisher moment in one native row pass.
+
+    The returned gradient has shape ``(width, states)`` and information has
+    shape ``(states, width, width)``.  A missing compiler fails open to the
+    established NumPy reductions.
+    """
+    library = _load_completion_library()
+    if library is None:
+        return None
+    grid = np.ascontiguousarray(grid_values, dtype=np.float32)
+    grid_weights = np.ascontiguousarray(
+        grid_weights_by_state, dtype=np.float64
+    )
+    events = np.ascontiguousarray(event_values, dtype=np.float32)
+    event_first = np.ascontiguousarray(
+        event_first_by_state, dtype=np.float64
+    )
+    event_second = np.ascontiguousarray(
+        event_second_by_state, dtype=np.float64
+    )
+    positions = (
+        None
+        if grid_weight_positions is None
+        else np.ascontiguousarray(grid_weight_positions, dtype=np.int64)
+    )
+    if (
+        grid.ndim != 2
+        or grid_weights.ndim != 2
+        or grid_weights.shape[1] < len(grid)
+        or events.ndim != 2
+        or events.shape[1] != grid.shape[1]
+        or event_first.ndim != 2
+        or event_second.shape != event_first.shape
+        or event_first.shape[1] != len(events)
+        or grid_weights.shape[0] != event_first.shape[0]
+        or (positions is not None and positions.shape != (len(grid),))
+        or (
+            positions is not None
+            and len(positions)
+            and (
+                int(positions[0]) < 0
+                or int(positions[-1]) >= grid_weights.shape[1]
+            )
+        )
+        or grid.shape[1] < 1
+        or grid_weights.shape[0] < 1
+    ):
+        raise ValueError("native batched rule moments are not aligned")
+    width = int(grid.shape[1])
+    states = int(grid_weights.shape[0])
+    gradient = np.empty((width, states), dtype=np.float64)
+    information_moment_major = np.empty(
+        (width, width, states), dtype=np.float64
+    )
+    float_pointer = ctypes.POINTER(ctypes.c_float)
+    double_pointer = ctypes.POINTER(ctypes.c_double)
+    written = int(
+        library.certscr_batched_sparse_rule_moments(
+            grid.ctypes.data_as(float_pointer),
+            grid_weights.ctypes.data_as(double_pointer),
+            (
+                None
+                if positions is None
+                else positions.ctypes.data_as(
+                    ctypes.POINTER(ctypes.c_int64)
+                )
+            ),
+            grid_weights.shape[1],
+            len(grid),
+            states,
+            width,
+            events.ctypes.data_as(float_pointer),
+            event_first.ctypes.data_as(double_pointer),
+            event_second.ctypes.data_as(double_pointer),
+            len(events),
+            int(bool(include_event_second)),
+            max(1, int(worker_count)),
+            gradient.ctypes.data_as(double_pointer),
+            information_moment_major.ctypes.data_as(double_pointer),
+        )
+    )
+    if written < 0:
+        raise RuntimeError(
+            f"native batched rule moments failed with status {written}"
+        )
+    return gradient, information_moment_major.transpose(2, 0, 1)
 
 
 def fit_prepared_cone_float64(
@@ -764,4 +1507,195 @@ def fit_prepared_cone_float64(
         return None
     if status < 0:
         raise RuntimeError(f"native prepared-cone fit failed with status {status}")
+    return output, float(objective.value), float(kkt.value), int(iterations.value)
+
+
+def group_sparse_delta_rows(
+    base_groups: np.ndarray,
+    row_offsets: np.ndarray,
+    columns: np.ndarray,
+    values: np.ndarray,
+    weights: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray] | None:
+    """Bit-exact in-place grouping of identical base-group/CSR rows."""
+    library = _load_completion_library()
+    if library is None:
+        return None
+    groups = np.ascontiguousarray(base_groups, dtype=np.int32)
+    offsets = np.ascontiguousarray(row_offsets, dtype=np.int64)
+    cols = np.ascontiguousarray(columns, dtype=np.int32)
+    data = np.ascontiguousarray(values, dtype=np.float32)
+    mass = np.ascontiguousarray(weights, dtype=np.float64)
+    groups = groups if groups.flags.owndata else groups.copy()
+    offsets = offsets if offsets.flags.owndata else offsets.copy()
+    cols = cols if cols.flags.owndata else cols.copy()
+    data = data if data.flags.owndata else data.copy()
+    mass = mass if mass.flags.owndata else mass.copy()
+    if (
+        groups.ndim != 1
+        or offsets.shape != (len(groups) + 1,)
+        or cols.shape != data.shape
+        or mass.shape != groups.shape
+        or int(offsets[-1]) != len(data)
+    ):
+        raise ValueError("sparse delta grouping inputs are not aligned")
+    int_pointer = ctypes.POINTER(ctypes.c_int32)
+    int64_pointer = ctypes.POINTER(ctypes.c_int64)
+    float_pointer = ctypes.POINTER(ctypes.c_float)
+    double_pointer = ctypes.POINTER(ctypes.c_double)
+    output_nnz = ctypes.c_int64(0)
+    written = int(
+        library.certscr_group_sparse_delta_rows(
+            groups.ctypes.data_as(int_pointer),
+            offsets.ctypes.data_as(int64_pointer),
+            cols.ctypes.data_as(int_pointer),
+            data.ctypes.data_as(float_pointer),
+            mass.ctypes.data_as(double_pointer),
+            len(groups),
+            len(data),
+            groups.ctypes.data_as(int_pointer),
+            offsets.ctypes.data_as(int64_pointer),
+            cols.ctypes.data_as(int_pointer),
+            data.ctypes.data_as(float_pointer),
+            mass.ctypes.data_as(double_pointer),
+            ctypes.byref(output_nnz),
+        )
+    )
+    if written < 0:
+        raise RuntimeError(
+            f"native sparse-delta grouping failed with status {written}"
+        )
+    nnz = int(output_nnz.value)
+    groups.resize(written, refcheck=False)
+    offsets.resize(written + 1, refcheck=False)
+    cols.resize(nnz, refcheck=False)
+    data.resize(nnz, refcheck=False)
+    mass.resize(written, refcheck=False)
+    return groups, offsets, cols, data, mass
+
+
+def fit_sparse_delta_cone_float64(
+    base_design: np.ndarray,
+    residual_event_weights: np.ndarray,
+    residual_grid_weights: np.ndarray,
+    grid_base_groups: np.ndarray,
+    grid_row_offsets: np.ndarray,
+    grid_columns: np.ndarray,
+    grid_values: np.ndarray,
+    grid_weights: np.ndarray,
+    event_base_groups: np.ndarray,
+    event_row_offsets: np.ndarray,
+    event_columns: np.ndarray,
+    event_values: np.ndarray,
+    event_weights: np.ndarray,
+    constrained_start: int,
+    initial_values: np.ndarray,
+    *,
+    occurrence_likelihood: str,
+    max_iter: int,
+    tolerance: float,
+    stored_delta_columns: int | None = None,
+    return_nonconverged: bool = False,
+) -> tuple[np.ndarray, float, float, int] | None:
+    """Solve the exact residual-base plus CSR-delta cone likelihood."""
+    library = _load_completion_library()
+    if library is None:
+        return None
+    base = np.ascontiguousarray(base_design, dtype=np.float64)
+    residual_events = np.ascontiguousarray(
+        residual_event_weights, dtype=np.float64
+    )
+    residual_grid = np.ascontiguousarray(
+        residual_grid_weights, dtype=np.float64
+    )
+    grid_groups = np.ascontiguousarray(grid_base_groups, dtype=np.int32)
+    grid_offsets = np.ascontiguousarray(grid_row_offsets, dtype=np.int64)
+    grid_cols = np.ascontiguousarray(grid_columns, dtype=np.int32)
+    grid_data = np.ascontiguousarray(grid_values, dtype=np.float32)
+    grid_mass = np.ascontiguousarray(grid_weights, dtype=np.float64)
+    event_groups = np.ascontiguousarray(event_base_groups, dtype=np.int32)
+    event_offsets = np.ascontiguousarray(event_row_offsets, dtype=np.int64)
+    event_cols = np.ascontiguousarray(event_columns, dtype=np.int32)
+    event_data = np.ascontiguousarray(event_values, dtype=np.float32)
+    event_mass = np.ascontiguousarray(event_weights, dtype=np.float64)
+    initial = np.ascontiguousarray(initial_values, dtype=np.float64)
+    base_event_rows = len(residual_events)
+    base_grid_rows = len(residual_grid)
+    delta_columns = len(initial) - base.shape[1]
+    stored_width = (
+        int(stored_delta_columns)
+        if stored_delta_columns is not None
+        else delta_columns
+    )
+    if (
+        base.ndim != 2
+        or len(base) != base_event_rows + base_grid_rows
+        or grid_groups.shape != grid_mass.shape
+        or grid_offsets.shape != (len(grid_groups) + 1,)
+        or grid_cols.shape != grid_data.shape
+        or int(grid_offsets[-1]) != len(grid_data)
+        or event_groups.shape != event_mass.shape
+        or event_offsets.shape != (len(event_groups) + 1,)
+        or event_cols.shape != event_data.shape
+        or int(event_offsets[-1]) != len(event_data)
+        or delta_columns < 1
+        or stored_width < delta_columns
+        or not base.shape[1] <= int(constrained_start) <= len(initial)
+    ):
+        raise ValueError("native sparse-delta inputs are not aligned")
+    likelihood_code = {
+        "poisson": 0,
+        "first_event_cloglog": 1,
+    }.get(str(occurrence_likelihood))
+    if likelihood_code is None:
+        raise ValueError(f"unknown occurrence likelihood: {occurrence_likelihood}")
+    output = np.empty_like(initial)
+    objective = ctypes.c_double(float("inf"))
+    kkt = ctypes.c_double(float("inf"))
+    iterations = ctypes.c_int32(0)
+    double_pointer = ctypes.POINTER(ctypes.c_double)
+    int_pointer = ctypes.POINTER(ctypes.c_int32)
+    int64_pointer = ctypes.POINTER(ctypes.c_int64)
+    float_pointer = ctypes.POINTER(ctypes.c_float)
+    status = int(
+        library.certscr_fit_sparse_delta_cone(
+            base.ctypes.data_as(double_pointer),
+            base_event_rows,
+            base_grid_rows,
+            base.shape[1],
+            residual_events.ctypes.data_as(double_pointer),
+            residual_grid.ctypes.data_as(double_pointer),
+            grid_groups.ctypes.data_as(int_pointer),
+            grid_offsets.ctypes.data_as(int64_pointer),
+            grid_cols.ctypes.data_as(int_pointer),
+            grid_data.ctypes.data_as(float_pointer),
+            grid_mass.ctypes.data_as(double_pointer),
+            len(grid_groups),
+            len(grid_data),
+            event_groups.ctypes.data_as(int_pointer),
+            event_offsets.ctypes.data_as(int64_pointer),
+            event_cols.ctypes.data_as(int_pointer),
+            event_data.ctypes.data_as(float_pointer),
+            event_mass.ctypes.data_as(double_pointer),
+            len(event_groups),
+            len(event_data),
+            stored_width,
+            delta_columns,
+            int(constrained_start),
+            likelihood_code,
+            int(max_iter),
+            float(tolerance),
+            initial.ctypes.data_as(double_pointer),
+            output.ctypes.data_as(double_pointer),
+            ctypes.byref(objective),
+            ctypes.byref(kkt),
+            ctypes.byref(iterations),
+        )
+    )
+    if status == 1 and not return_nonconverged:
+        return None
+    if status < 0:
+        raise RuntimeError(
+            f"native sparse-delta cone fit failed with status {status}"
+        )
     return output, float(objective.value), float(kkt.value), int(iterations.value)

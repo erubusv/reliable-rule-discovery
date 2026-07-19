@@ -113,6 +113,11 @@ def run_self_test(device: str) -> dict:
         solver_tolerance=3.0e-5,
         identity_profile="exact",
         triplet_generation="all",
+        # The smoke test explicitly checks the known A+AB intermediate
+        # structure.  The production terminal_atoms family intentionally
+        # reports only standalone atoms and local terminals, so retain the
+        # positive visited state here as an audit fixture.
+        support_family="visited_pool",
     )
     pipeline = CertSCRPipeline(data, rule_predicates=("pred_a", "pred_b"), config=config)
     result = pipeline.run()
@@ -213,6 +218,20 @@ def parse_args() -> argparse.Namespace:
         help="after the full cohort split, keep every target-positive D_fit sequence and sample this many negatives with IPW",
     )
     parser.add_argument(
+        "--persistent-response-store",
+        type=Path,
+        help=(
+            "optional mmap directory for exact retained D_fit sparse responses; "
+            "keys include a cohort digest"
+        ),
+    )
+    parser.add_argument(
+        "--persistent-response-gb",
+        type=float,
+        default=0.0,
+        help="maximum on-disk exact response bytes; zero disables the store",
+    )
+    parser.add_argument(
         "--hybrid-full-acceptance",
         action="store_true",
         help=(
@@ -220,7 +239,34 @@ def parse_args() -> argparse.Namespace:
             "atoms, supports, and terminal kernels on the complete D_fit population"
         ),
     )
+    parser.add_argument(
+        "--multifidelity-skeleton-screen",
+        action="store_true",
+        help=(
+            "exact-profile every skeleton on sampled/IPW D_fit, retain every skeleton with positive "
+            "block-MDL, then independently re-profile every finite W/sign identity of each survivor "
+            "on the complete D_fit population"
+        ),
+    )
     parser.add_argument("--sample-seed", type=int, default=111)
+    parser.add_argument(
+        "--split-strategy",
+        choices=("random_sequence", "ordered_group"),
+        default="random_sequence",
+        help=(
+            "random_sequence uses the ordinary entity split; ordered_group keeps "
+            "all rows of each ordered cohort together and chooses two target-blind "
+            "group boundaries closest to the requested fractions"
+        ),
+    )
+    parser.add_argument(
+        "--split-group-column",
+        help="sequence-table column used by --split-strategy ordered_group",
+    )
+    parser.add_argument(
+        "--start-age-column",
+        help="sequence-table nonnegative integer age used by --loan-age-baseline",
+    )
     parser.add_argument(
         "--financial-weight-column",
         help=(
@@ -245,7 +291,7 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help=(
             "optional computational ablation; unset searches up to the complete "
-            "frozen profiled-rule library and stops by exact one-exchange stationarity"
+            "frozen profiled-rule library and stops by the configured exact neighborhood stationarity"
         ),
     )
     parser.add_argument("--fit-fraction", type=float, default=0.60)
@@ -287,7 +333,7 @@ def parse_args() -> argparse.Namespace:
         choices=("all_atoms", "stratified_budget"),
         default="all_atoms",
         help=(
-            "all_atoms starts exact one-exchange ascent from the empty support and every "
+            "all_atoms starts exact finite ascent from the empty support and every "
             "profiled rule atom; stratified_budget retains the legacy --active-restarts ablation"
         ),
     )
@@ -296,6 +342,31 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=8,
         help="restart budget used only by --active-start-policy stratified_budget",
+    )
+    parser.add_argument(
+        "--active-neighbor-strategy",
+        choices=(
+            "gradient_first_exact_audit",
+            "mdl_score_working_set",
+            "exact_one_exchange",
+        ),
+        default="exact_one_exchange",
+        help=(
+            "gradient_first_exact_audit orders add/drop and then swap moves by exact local "
+            "gradient pricing, exact-fits until the first improvement, and performs a full "
+            "one-exchange terminal audit; mdl_score_working_set exact-fits every drop but "
+            "only additions whose fused conditional block score pays their incremental MDL "
+            "code (no top-k/budget), and terminates at block-score stationarity; "
+            "exact_one_exchange performs complete-batch best-improvement at every state"
+        ),
+    )
+    parser.add_argument(
+        "--no-conditional-safe-mdl-screen",
+        action="store_true",
+        help=(
+            "disable the support-conditioned rigorous likelihood upper bound "
+            "used after MDL score admission (performance ablation only)"
+        ),
     )
     parser.add_argument(
         "--support-family",
@@ -390,6 +461,15 @@ def parse_args() -> argparse.Namespace:
             "(default: true; use --no-target-history-control only for first-event/renewal ablations)"
         ),
     )
+    parser.add_argument(
+        "--loan-age-baseline",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "add registered outcome-blind age-epoch nuisance clocks for monthly "
+            "first-event data; requires --start-age-column"
+        ),
+    )
     parser.add_argument("--calibration-tolerance", type=float)
     parser.add_argument(
         "--occurrence-likelihood",
@@ -477,6 +557,14 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--self-test", action="store_true")
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help=(
+            "restore a signature-matched frozen profile and converged support "
+            "fits from OUTPUT.checkpoint.json"
+        ),
+    )
     return parser.parse_args()
 
 
@@ -497,6 +585,16 @@ def main() -> None:
             "--mark-column and legacy --financial-weight-column are mutually exclusive"
         )
     checkpoint_path = Path(f"{args.output}.checkpoint.json")
+    resume_payload: dict = {}
+    if args.resume and checkpoint_path.is_file():
+        try:
+            resume_payload = json.loads(
+                checkpoint_path.read_text(encoding="utf-8")
+            )
+        except (OSError, ValueError, TypeError) as error:
+            raise SystemExit(
+                f"cannot read resume checkpoint {checkpoint_path}: {error}"
+            ) from error
     rule_predicates = (
         list(resolve_predicate_policy(args.predicate_policy))
         if args.predicate_policy is not None
@@ -513,6 +611,8 @@ def main() -> None:
         sample_seed=args.sample_seed,
         mark_col=args.mark_column,
         financial_weight_col=args.financial_weight_column,
+        split_group_col=args.split_group_column,
+        start_age_col=args.start_age_column,
     )
     config = CertSCRConfig(
         q_max=args.q_max,
@@ -521,6 +621,7 @@ def main() -> None:
         max_formation_window=args.max_window,
         max_support_size=args.max_support_size,
         split_fractions=(args.fit_fraction, args.cert_fraction, args.test_fraction),
+        split_strategy=args.split_strategy,
         stratify_target_sequences=bool(args.stratify_target_sequences),
         fit_negative_sample_size=args.fit_negative_sample_size,
         split_seed=args.sample_seed,
@@ -533,6 +634,7 @@ def main() -> None:
         early_warning_horizon=args.early_warning_horizon,
         early_warning_threshold=args.early_warning_threshold,
         target_history_control=bool(args.target_history_control),
+        loan_age_baseline=bool(args.loan_age_baseline),
         occurrence_likelihood=args.occurrence_likelihood,
         calibration_tolerance=args.calibration_tolerance,
         solver_device=args.device,
@@ -547,6 +649,14 @@ def main() -> None:
         solver_max_iter=args.solver_max_iter,
         solver_tolerance=args.solver_tolerance,
         feature_cache_bytes=int(args.feature_cache_gb * 1024**3),
+        persistent_response_dir=(
+            str(args.persistent_response_store)
+            if args.persistent_response_store is not None
+            else None
+        ),
+        persistent_response_bytes=int(
+            args.persistent_response_gb * 1024**3
+        ),
         loss_summary_cache_bytes=int(args.loss_summary_cache_gb * 1024**3),
         fit_summary_cache_bytes=int(args.fit_summary_cache_gb * 1024**3),
         response_workers=args.response_workers,
@@ -561,6 +671,10 @@ def main() -> None:
         triplet_generation=args.triplet_generation,
         active_start_policy=args.active_start_policy,
         active_restarts=args.active_restarts,
+        active_neighbor_strategy=args.active_neighbor_strategy,
+        conditional_safe_mdl_screen=not bool(
+            args.no_conditional_safe_mdl_screen
+        ),
         support_family=args.support_family,
         max_gradient_triplets=args.max_gradient_triplets,
         support_pool_size=args.support_pool_size,
@@ -575,7 +689,168 @@ def main() -> None:
         if args.financial_weight_column or args.certification_mode == "predictive"
         else "EW-CertSCR-TPP"
     )
-    if args.hybrid_full_acceptance:
+    if args.multifidelity_skeleton_screen and args.hybrid_full_acceptance:
+        raise SystemExit(
+            "--multifidelity-skeleton-screen and --hybrid-full-acceptance are mutually exclusive"
+        )
+    if args.multifidelity_skeleton_screen:
+        if args.fit_negative_sample_size is None:
+            raise SystemExit(
+                "--multifidelity-skeleton-screen requires --fit-negative-sample-size"
+            )
+        if config.identity_profile != "dictionary_mdl":
+            raise SystemExit(
+                "--multifidelity-skeleton-screen requires --identity-profile dictionary_mdl"
+            )
+        multifidelity_started = time.perf_counter()
+        screen_pipeline = CertSCRPipeline(
+            data,
+            rule_predicates=rule_predicates,
+            control_predicates=control_predicates,
+            config=replace(config, gradient_pricing_only=False),
+            predicate_policy_name=args.predicate_policy,
+        )
+        screen_started = time.perf_counter()
+        saved_screen = resume_payload.get("multifidelity_skeleton_screen")
+        screen_signature = screen_pipeline.checkpoint_signature()
+        resumed_screen = bool(
+            isinstance(saved_screen, dict)
+            and saved_screen.get("checkpoint_signature") == screen_signature
+            and isinstance(saved_screen.get("surviving_antecedents"), list)
+        )
+        if resumed_screen:
+            skeleton_screen = dict(saved_screen)
+            survivor_antecedents = tuple(
+                sorted(
+                    tuple(int(value) for value in item)
+                    for item in skeleton_screen["surviving_antecedents"]
+                )
+            )
+            skeleton_screen["resumed_from_checkpoint"] = True
+            skeleton_screen["resume_load_seconds"] = (
+                time.perf_counter() - screen_started
+            )
+            screen_done = time.perf_counter()
+        else:
+            screen_pipeline.fit_baseline()
+            sampled_rules = screen_pipeline.profile_rule_identities()
+            screen_done = time.perf_counter()
+            survivor_antecedents = tuple(
+                sorted({tuple(rule.antecedent) for rule in sampled_rules})
+            )
+            survivor_counts = {
+                str(order): sum(
+                    len(item) == order for item in survivor_antecedents
+                )
+                for order in range(1, int(config.q_max) + 1)
+            }
+            skeleton_screen = {
+                "method": "sampled_ipw_exact_dictionary_mdl_skeleton_screen",
+                "contract": (
+                    "sampled D_fit can retain or reject only an antecedent skeleton; "
+                    "its selected W/sign/shape is never seeded into complete D_fit"
+                ),
+                "checkpoint_signature": screen_signature,
+                "resumed_from_checkpoint": False,
+                "sampled_negative_sequences": screen_pipeline.splits.fit_sampled_negative_count,
+                "sampled_fit_sequences": screen_pipeline.splits.fit.n_sequences,
+                "fit_population_sequences": screen_pipeline.splits.fit_population_sequence_count,
+                "kish_effective_sample_size": screen_pipeline.fit_sampling_ess,
+                "evaluated_skeleton_count": len(screen_pipeline.profile_logs),
+                "surviving_skeleton_count": len(survivor_antecedents),
+                "surviving_skeleton_count_by_order": survivor_counts,
+                "surviving_antecedents": [list(item) for item in survivor_antecedents],
+                "sample_selected_rules_for_diagnostics_only": [
+                    screen_pipeline._rule_dict(rule) for rule in sampled_rules
+                ],
+                "window_profiles": [
+                    {key: value for key, value in row.items() if key != "candidates"}
+                    for row in screen_pipeline.profile_logs
+                ],
+                "diagnostics": dict(screen_pipeline._safe_screen_stats),
+                "timing_seconds": screen_done - screen_started,
+            }
+        save_result(
+            {
+                "algorithm": checkpoint_algorithm,
+                "checkpoint_stage": "sampled_exact_skeleton_screen_complete",
+                "elapsed_seconds": screen_done - multifidelity_started,
+                "multifidelity_skeleton_screen": skeleton_screen,
+            },
+            checkpoint_path,
+        )
+        del screen_pipeline
+        gc.collect()
+
+        full_config = replace(
+            config,
+            fit_negative_sample_size=None,
+            gradient_pricing_only=False,
+        )
+        pipeline = CertSCRPipeline(
+            data,
+            rule_predicates=rule_predicates,
+            control_predicates=control_predicates,
+            config=full_config,
+            predicate_policy_name=args.predicate_policy,
+        )
+        reprofile_started = time.perf_counter()
+        resumed_profile = False
+        if resume_payload.get("profile_state") is not None:
+            pipeline.restore_profile_state(resume_payload["profile_state"])
+            full_profiled_rules = list(pipeline.profiled_rules)
+            resumed_profile = True
+        else:
+            full_profiled_rules = pipeline.profile_rule_identities(
+                antecedent_subset=survivor_antecedents
+            )
+        reprofile_done = time.perf_counter()
+        restored_support_fit_count = 0
+        if resume_payload.get("support_fit_cache") is not None:
+            restored_support_fit_count = pipeline.restore_fit_cache_state(
+                resume_payload["support_fit_cache"]
+            )
+        full_reprofiling = {
+            "method": "complete_d_fit_all_finite_w_sign_reprofiling_of_screen_survivors",
+            "screen_survivor_count": len(survivor_antecedents),
+            "full_d_fit_retained_rule_count": len(full_profiled_rules),
+            "retained_rules": [pipeline._rule_dict(rule) for rule in full_profiled_rules],
+            "diagnostics": dict(pipeline._safe_screen_stats),
+            "timing_seconds": reprofile_done - reprofile_started,
+            "resumed_from_checkpoint": resumed_profile,
+            "restored_support_fit_count": restored_support_fit_count,
+        }
+        save_result(
+            {
+                "algorithm": checkpoint_algorithm,
+                "checkpoint_stage": "complete_d_fit_survivor_reprofiling_complete",
+                "elapsed_seconds": reprofile_done - multifidelity_started,
+                "multifidelity_skeleton_screen": skeleton_screen,
+                "full_survivor_reprofiling": full_reprofiling,
+                "profile_state": pipeline.export_profile_state(),
+                "support_fit_cache": pipeline.export_fit_cache_state(),
+            },
+            checkpoint_path,
+        )
+        result = pipeline.run(checkpoint_path=checkpoint_path)
+        result["multifidelity_skeleton_screen"] = skeleton_screen
+        result["full_survivor_reprofiling"] = full_reprofiling
+        result["profile"] = (
+            "sampled-ipw-exact-skeleton-screen-then-complete-d-fit-"
+            "finite-w-sign-survivor-reprofiling"
+        )
+        result["profile_limitation"] = (
+            "Antecedent skeletons with nonpositive exact dictionary block-MDL on the "
+            "sampled/IPW D_fit screen are not profiled on complete D_fit, so an oracle "
+            "over the complete skeleton population is not claimed. No top-k or candidate "
+            "budget is used. For every surviving skeleton, complete D_fit independently "
+            "re-evaluates the full finite W/sign family; the sampled identity is not seeded. "
+            + str(result.get("profile_limitation", ""))
+        )
+        result["timing_seconds"]["multifidelity_end_to_end_total"] = (
+            time.perf_counter() - multifidelity_started
+        )
+    elif args.hybrid_full_acceptance:
         if args.fit_negative_sample_size is None:
             raise SystemExit("--hybrid-full-acceptance requires --fit-negative-sample-size")
         hybrid_started = time.perf_counter()
@@ -638,6 +913,10 @@ def main() -> None:
             identity_candidates=identity_candidates,
             dictionary_shapes=dictionary_shapes,
         )
+        if resume_payload.get("support_fit_cache") is not None:
+            pipeline.restore_fit_cache_state(
+                resume_payload["support_fit_cache"]
+            )
         acceptance_started = time.perf_counter()
         full_acceptance = pipeline.accept_seeded_rules_on_fit()
         acceptance_done = time.perf_counter()
@@ -671,6 +950,12 @@ def main() -> None:
             config=config,
             predicate_policy_name=args.predicate_policy,
         )
+        if resume_payload.get("profile_state") is not None:
+            pipeline.restore_profile_state(resume_payload["profile_state"])
+        if resume_payload.get("support_fit_cache") is not None:
+            pipeline.restore_fit_cache_state(
+                resume_payload["support_fit_cache"]
+            )
         result = pipeline.run(checkpoint_path=checkpoint_path)
     save_result(result, args.output)
     checkpoint_path.unlink(missing_ok=True)

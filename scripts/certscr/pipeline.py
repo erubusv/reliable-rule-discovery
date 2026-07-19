@@ -3,6 +3,8 @@ from __future__ import annotations
 import copy
 import ctypes
 import ctypes.util
+import gc
+import hashlib
 import itertools
 import json
 import math
@@ -47,19 +49,35 @@ from .marked import (
 )
 from .model import (
     ClosureTerm,
+    DeltaFactorizedSupportDesign,
     FitResult,
+    IncrementalSupportPartition,
     PreparedFixedSupportDesign,
+    SparseNuisancePartition,
+    SparseDeltaSupportDesign,
+    aggregate_duplicate_design_rows,
+    append_rules_to_incremental_partition,
     cluster_exposure,
     cluster_nll,
     cloglog_event_nll,
     cloglog_event_terms,
     fixed_support_projected_kkt,
     fit_fixed_support,
+    fit_delta_factorized_support,
+    fit_sparse_delta_support,
+    fit_sparse_delta_closure,
     fit_unconstrained_prepared_batch,
     group_saturated_poisson_lower_bound,
     prepare_fixed_support_design,
+    prepare_delta_factorized_support_design,
+    prepare_sparse_delta_support_design,
+    prepare_sparse_nuisance_partition,
     project_prepared_support_design,
     promote_prepared_design_float64,
+    refine_sparse_nuisance_partition,
+    factorized_rule_recession_columns,
+    sparse_delta_rule_recession_columns,
+    update_incremental_support_partition,
 )
 from .occurrence import (
     CompletionEvents,
@@ -70,6 +88,7 @@ from .occurrence import (
 )
 from .native import (
     add_sparse_linear_predictor,
+    batched_sparse_rule_moments,
     sparse_component_integral,
     sorted_unique_int64_union,
     sorted_unique_int64_union_with_positions,
@@ -87,6 +106,60 @@ from .statistics import (
 _MKL_LOCAL_THREAD_SETTER: object | None = None
 _MKL_LOCAL_THREAD_LOOKUP_DONE = False
 _MKL_LOCAL_THREAD_GUARD = threading.Lock()
+_NATIVE_HEAP_TRIM_GUARD = threading.Lock()
+_NATIVE_HEAP_TRIMMER: object | None = None
+_NATIVE_HEAP_TRIM_LOOKUP_DONE = False
+_NATIVE_HEAP_LAST_TRIM = -math.inf
+
+
+def _release_unused_native_heap() -> bool:
+    """Return dead NumPy/native arenas to the OS after a support-fit wave.
+
+    Large closure partitions are intentionally short lived.  CPython releases
+    their owners after a wave, but glibc may otherwise retain the underlying
+    pages in a worker arena indefinitely.  That allocator retention, rather
+    than live model state, caused the Freddie exact-audit process to grow until
+    it was killed.  Collection and ``malloc_trim`` change neither a cached
+    sufficient statistic nor a numerical result; unsupported allocators simply
+    take the no-op path.
+    """
+    global _NATIVE_HEAP_TRIMMER, _NATIVE_HEAP_TRIM_LOOKUP_DONE
+    global _NATIVE_HEAP_LAST_TRIM
+    if os.environ.get("CERTSCR_MALLOC_TRIM", "1") == "0":
+        return False
+    with _NATIVE_HEAP_TRIM_GUARD:
+        now = time.monotonic()
+        try:
+            interval = max(
+                0.0,
+                float(
+                    os.environ.get(
+                        "CERTSCR_MALLOC_TRIM_INTERVAL_SECONDS", "30"
+                    )
+                ),
+            )
+        except ValueError:
+            interval = 30.0
+        if now - _NATIVE_HEAP_LAST_TRIM < interval:
+            return False
+        _NATIVE_HEAP_LAST_TRIM = now
+        gc.collect()
+        if not _NATIVE_HEAP_TRIM_LOOKUP_DONE:
+            try:
+                function = ctypes.CDLL(None).malloc_trim
+                function.argtypes = [ctypes.c_size_t]
+                function.restype = ctypes.c_int
+                _NATIVE_HEAP_TRIMMER = function
+            except (AttributeError, OSError):
+                _NATIVE_HEAP_TRIMMER = None
+            _NATIVE_HEAP_TRIM_LOOKUP_DONE = True
+        function = _NATIVE_HEAP_TRIMMER
+        if function is None:
+            return False
+        try:
+            return bool(function(0))
+        except (OSError, TypeError, ValueError):
+            return False
 
 
 def _mkl_local_thread_setter():
@@ -135,6 +208,7 @@ class CertSCRConfig:
     max_support_size: int | None = None
     split_fractions: tuple[float, float, float] = (0.60, 0.20, 0.20)
     split_seed: int = 111
+    split_strategy: str = "random_sequence"
     alpha_fit_screen: float = 0.05
     alpha_family: float = 0.05
     financial_threshold: float = 0.0
@@ -156,6 +230,11 @@ class CertSCRConfig:
     # block, never a rule antecedent.  CLI runs enable it by default; direct
     # library callers opt in explicitly to preserve existing estimands.
     target_history_control: bool = False
+    # Outcome-blind seasoning nuisance for monthly first-event data. Separate
+    # age-epoch clocks receive the same M-knot basis used by the TPP over each
+    # impact_lag-month epoch, preventing rule atoms from proxying the ordinary
+    # duration dependence of mortgage hazard.
+    loan_age_baseline: bool = False
     # ``auto`` maps recurrent streams to the event-time Poisson likelihood and
     # monthly terminal outcomes to the exact interval-censored cloglog hazard.
     occurrence_likelihood: str = "auto"
@@ -179,11 +258,27 @@ class CertSCRConfig:
     # ablation for older experiments.
     active_start_policy: str = "all_atoms"
     active_restarts: int = 8
+    # ``gradient_first_exact_audit`` uses score/Fisher pricing only to order
+    # the complete add/drop coordinate neighborhood, takes the first exactly
+    # fitted improvement, and stops only after a complete exact add/drop/swap
+    # terminal audit. No budget or threshold removes a candidate, so its
+    # reported terminal has the same one-exchange stationarity guarantee as
+    # best-improvement, although the deterministic ascent path and attained
+    # local terminal may differ. ``exact_one_exchange`` retains full-batch
+    # best-improvement as a computational/comparative estimator.
+    # ``mdl_score_working_set`` is the scalable estimator: every feasible
+    # absent block is priced in one fused pass, but an exact child solve is
+    # launched only when its cone-score gain pays its *exact incremental MDL
+    # code length*.  There is no top-k, beam width, or candidate budget.  Its
+    # terminal is block-score stationary (not exact one-exchange stationary),
+    # while every accepted move is still decided by the ordinary exact fit and
+    # scalar support objective.
+    active_neighbor_strategy: str = "exact_one_exchange"
     # The reportable discovery family is fixed before D_cert.  The primary
-    # estimator returns every positive standalone atom (including triplets),
-    # every positive strict hierarchy-link pair, and every unique atom-start
-    # one-exchange terminal. Intermediate path states are optimization traces,
-    # not additional scientific hypotheses.
+    # estimator returns every positive standalone atom (including triplets)
+    # and every unique atom-start terminal under the configured exact
+    # neighborhood. Intermediate path
+    # states are optimization traces, not additional scientific hypotheses.
     # ``visited_pool`` preserves the legacy broad-family ablation.
     support_family: str = "terminal_atoms"
     # No outcome-dependent family cap by default.  An explicit finite cap is
@@ -199,6 +294,11 @@ class CertSCRConfig:
     triplet_generation: str = "all"
     fit_negative_sample_size: int | None = None
     feature_cache_bytes: int = 16 * 1024**3
+    # Optional exact mmap store for retained D_fit rule/closure responses.
+    # It changes only recomputation and resident-memory behavior; zero bytes
+    # disables it.  The context/cohort digest is part of every on-disk key.
+    persistent_response_dir: str | None = None
+    persistent_response_bytes: int = 0
     # Exact entity-loss summaries for repeated hierarchy-null fits.  This is a
     # pure byte-bounded memoization layer; zero disables it without changing
     # any fitted model or test.
@@ -217,6 +317,11 @@ class CertSCRConfig:
     # whose best possible block-MDL is nonpositive.  Disabling this is a
     # performance ablation; it does not define a different statistical model.
     safe_mdl_screen: bool = True
+    # After the local score working set admits an Add, compare a rigorous
+    # support-specific likelihood upper bound with the current incumbent.
+    # This is stronger than screening only against zero MDL and cannot remove
+    # an exact improving move.  It is ignored by the legacy search modes.
+    conditional_safe_mdl_screen: bool = True
 
     def validate(self) -> None:
         if not 1 <= self.q_max <= 3:
@@ -233,11 +338,24 @@ class CertSCRConfig:
             or not math.isclose(sum(self.split_fractions), 1.0)
         ):
             raise ValueError("three positive split fractions must sum to one")
+        if self.split_strategy not in {"random_sequence", "ordered_group"}:
+            raise ValueError(
+                "split strategy must be random_sequence or ordered_group"
+            )
         if self.support_search not in {"active_set", "exhaustive"}:
             raise ValueError("support search must be active_set or exhaustive")
         if self.active_start_policy not in {"all_atoms", "stratified_budget"}:
             raise ValueError(
                 "active start policy must be all_atoms or stratified_budget"
+            )
+        if self.active_neighbor_strategy not in {
+            "gradient_first_exact_audit",
+            "mdl_score_working_set",
+            "exact_one_exchange",
+        }:
+            raise ValueError(
+                "active neighbor strategy must be gradient_first_exact_audit, "
+                "mdl_score_working_set, or exact_one_exchange"
             )
         if self.support_family not in {"terminal_atoms", "visited_pool"}:
             raise ValueError(
@@ -259,6 +377,12 @@ class CertSCRConfig:
             raise ValueError("fit negative sample size must be positive")
         if self.feature_cache_bytes < 0:
             raise ValueError("feature cache bytes must be nonnegative")
+        if self.persistent_response_bytes < 0:
+            raise ValueError("persistent response bytes must be nonnegative")
+        if self.persistent_response_bytes and not self.persistent_response_dir:
+            raise ValueError(
+                "persistent response bytes require a response-store directory"
+            )
         if self.loss_summary_cache_bytes < 0:
             raise ValueError("loss summary cache bytes must be nonnegative")
         if self.fit_summary_cache_bytes < 0:
@@ -269,6 +393,8 @@ class CertSCRConfig:
             raise ValueError("max gradient triplets must be positive")
         if not isinstance(self.target_history_control, bool):
             raise ValueError("target history control flag must be boolean")
+        if not isinstance(self.loan_age_baseline, bool):
+            raise ValueError("loan-age baseline flag must be boolean")
         if self.occurrence_likelihood not in {
             "auto",
             "poisson",
@@ -279,6 +405,10 @@ class CertSCRConfig:
             )
         if not isinstance(self.safe_mdl_screen, bool):
             raise ValueError("safe MDL screen flag must be boolean")
+        if not isinstance(self.conditional_safe_mdl_screen, bool):
+            raise ValueError(
+                "conditional safe MDL screen flag must be boolean"
+            )
         if self.active_restarts < 1:
             raise ValueError("active-set restarts must be positive")
         if self.support_pool_size is not None and self.support_pool_size < 1:
@@ -515,6 +645,8 @@ class CertSCRPipeline:
                 "intensity calibration tolerance is not a probability calibration test for first-event cloglog"
             )
         self.target_history_source_id: int | None = None
+        self.loan_age_baseline_source_ids: tuple[int, ...] = ()
+        self.loan_age_baseline_milestones: tuple[int, ...] = ()
         self.target_history_control_requested = bool(
             self.config.target_history_control
         )
@@ -577,6 +709,58 @@ class CertSCRPipeline:
                     np.int32, copy=False
                 ),
             )
+        age_baseline_sources: dict[int, SourceEvents] = {}
+        if self.config.loan_age_baseline:
+            if self.target_process_mode != "first_event":
+                raise ValueError(
+                    "loan-age baseline is defined only for first-event data"
+                )
+            if data.sequence_start_ages is None:
+                raise ValueError(
+                    "loan-age baseline requires start_loan_age in the sequence table"
+                )
+            start_ages = np.asarray(data.sequence_start_ages, dtype=np.int64)
+            if start_ages.shape != (data.n_sequences,) or np.any(start_ages < 0):
+                raise ValueError("invalid sequence start ages")
+            start_times = data.start_times.astype(np.int64)
+            end_times = data.end_times.astype(np.int64)
+            end_ages = start_ages + end_times - start_times
+            interval = int(self.config.impact_lag)
+            max_age = int(np.max(end_ages, initial=0))
+            milestones = tuple(range(0, max_age + 1, interval))
+            next_source_id = int(data.n_predicates) + int(
+                self.target_history_source_id is not None
+            )
+            source_ids: list[int] = []
+            retained_milestones: list[int] = []
+            for milestone in milestones:
+                source_time = start_times - start_ages + int(milestone)
+                # A clock may be left of the observed prefix. Retain it exactly
+                # when one of its predictable lags 1..L intersects observed
+                # risk time; no target value enters this construction.
+                included = (
+                    (source_time + 1 <= end_times)
+                    & (source_time + interval >= start_times)
+                )
+                if not np.any(included):
+                    continue
+                sequences = np.flatnonzero(included).astype(np.int32)
+                times = source_time[included].astype(np.int32)
+                offsets = np.zeros(data.n_sequences + 1, dtype=np.int64)
+                offsets[1:] = np.cumsum(
+                    included.astype(np.int64), dtype=np.int64
+                )
+                source_id = next_source_id + len(source_ids)
+                age_baseline_sources[source_id] = SourceEvents(
+                    sequence_codes=sequences,
+                    times=times,
+                    offsets=offsets,
+                    populated_sequences=sequences.copy(),
+                )
+                source_ids.append(source_id)
+                retained_milestones.append(int(milestone))
+            self.loan_age_baseline_source_ids = tuple(source_ids)
+            self.loan_age_baseline_milestones = tuple(retained_milestones)
         self.predicate_policy_name = (
             str(predicate_policy_name) if predicate_policy_name is not None else None
         )
@@ -600,6 +784,7 @@ class CertSCRPipeline:
             # the mark amount and therefore cannot select favorable outcomes.
             stratify_target=(self.config.stratify_target_sequences or self.marked),
             fit_negative_sample_size=self.config.fit_negative_sample_size,
+            strategy=self.config.split_strategy,
         )
         self.fit_sampling_weights = self.splits.fit_sampling_weights.astype(np.float64, copy=True)
         raw_fit_weights = self.certification_loss.weights(self.splits.fit) * self.fit_sampling_weights
@@ -615,6 +800,9 @@ class CertSCRPipeline:
         # weights keep Newton/KKT numerics comparable between currency-valued
         # financial exposure and the ordinary predictive likelihood.
         self.fit_cluster_weights = raw_fit_weights / self.fit_weight_scale
+        self.fit_cluster_weights_are_unit = bool(
+            np.all(self.fit_cluster_weights == 1.0)
+        )
         population_loss_weights = self.certification_loss.global_sequence_weights
         self.fit_population_loss_weight_mean = (
             1.0
@@ -644,8 +832,13 @@ class CertSCRPipeline:
             lag=self.config.impact_lag,
             knot_count=self.config.knot_count,
             feature_cache_bytes=self.config.feature_cache_bytes,
+            persistent_response_dir=self.config.persistent_response_dir,
+            persistent_response_bytes=self.config.persistent_response_bytes,
             max_completion_span=self.config.max_formation_window,
-            extra_source_events=target_history_sources,
+            extra_source_events={
+                **target_history_sources,
+                **age_baseline_sources,
+            },
         )
         # Weighted total exposure is needed by every fixed-support fit.  Cache
         # the exact per-sequence quadrature sums once instead of scanning the
@@ -675,6 +868,16 @@ class CertSCRPipeline:
             tuple[tuple[RuleIdentity, ...], tuple[ClosureTerm, ...]],
             PreparedFixedSupportDesign,
         ] = {}
+        self._fixed_nuisance_partitions: dict[str, SparseNuisancePartition] = {}
+        self._fixed_nuisance_partition_guard = threading.Lock()
+        # Profiling computes the exact new-block KKT at the converged closure
+        # null before staging a child design.  Keys enter this set only when
+        # that residual already proves the expanded null is not optimal; the
+        # scalar fitter can then skip an otherwise duplicate full Hessian pass.
+        # The marker changes no warm start, objective or convergence test.
+        self._prepared_profile_nonoptimal_keys: set[
+            tuple[tuple[RuleIdentity, ...], tuple[ClosureTerm, ...]]
+        ] = set()
         # Stage-local parent design used only while one nested support group is
         # screened.  The mutable slot is worker-local and released at the group
         # boundary, so peak memory is independent of the number of supports.
@@ -688,6 +891,14 @@ class CertSCRPipeline:
         ] = {}
         self._event_grid_count_cache: dict[str, tuple[np.ndarray, np.ndarray]] = {}
         self._inference_weight_cache: dict[str, np.ndarray] = {}
+        # Stage-local union of dictionary response rows for fused multi-state
+        # pricing.  Atom-start waves usually differ only in which one rule is
+        # absent, so their union dictionary is identical.  Retain one int64
+        # row vector, not another copy of any response value, and release it
+        # when support search completes.
+        self._support_pricing_union_cache: tuple[
+            tuple[RuleIdentity, ...], np.ndarray
+        ] | None = None
         # Early-warning geometry depends only on the frozen split and rule
         # identity, yet the same rule is tested in many support models.  Cache
         # sequence labels, quadrature and event multiplicities once per rule;
@@ -752,13 +963,33 @@ class CertSCRPipeline:
             "active_fit_thread_batches": 0,
             "active_fit_process_batches": 0,
             "active_fit_closure_groups": 0,
+            "active_fit_dynamic_jobs": 0,
+            "active_fit_dynamic_worker_launches": 0,
+            "active_fit_dynamic_thread_tasks": 0,
+            "active_fit_shared_closure_null_prefits": 0,
+            "active_fit_closure_shards": 0,
+            "support_closure_partitions": 0,
+            "support_closure_partition_child_reuses": 0,
+            "support_closure_partition_fallbacks": 0,
+            "support_joint_null_kkt_screens": 0,
+            "support_delta_factorized_fits": 0,
+            "support_sparse_delta_fits": 0,
+            "support_sparse_delta_closure_groups": 0,
+            "support_sparse_delta_fallbacks": 0,
+            "support_nested_exact_kkt_screens": 0,
+            "support_semantic_warm_starts": 0,
             "profile_fit_results_reused": 0,
             "profile_null_fit_batches": 0,
             "profile_null_models_batched": 0,
             "profile_null_models_scalar": 0,
+            "profile_window_null_warm_starts": 0,
             "identity_zero_boundary_kkt_screens": 0,
             "identity_sign_pair_parent_designs": 0,
             "identity_sign_pair_child_reuses": 0,
+            "identity_fused_profile_exact_fits": 0,
+            "identity_redundant_null_kkt_passes_skipped": 0,
+            "identity_no_event_activation_screens": 0,
+            "identity_incremental_partition_rebuilds": 0,
             "nested_prepared_parent_designs": 0,
             "nested_prepared_child_reuses": 0,
             "rule_recession_support_rejections": 0,
@@ -776,6 +1007,11 @@ class CertSCRPipeline:
         self.last_certification: dict | None = None
         self.search_diagnostics: dict = {}
         self._active_support_workers: list[CertSCRPipeline] = []
+        self._runtime_checkpoint_path: Path | None = None
+        self._runtime_checkpoint_started = 0.0
+        self._runtime_checkpoint_last_write = -math.inf
+        self._runtime_checkpoint_interval = 60.0
+        self._checkpoint_signature_cache: str | None = None
         self._identity_refinement_keys: set[
             tuple[RuleIdentity, ...]
         ] = set()
@@ -922,6 +1158,16 @@ class CertSCRPipeline:
                 "omitted_as_structural_zero": self.target_history_structural_zero,
                 "role": "registered recurrent-target nuisance; excluded from rule grammar",
                 "strict_minimum_lag": 1,
+            },
+            "loan_age_baseline": {
+                "requested": bool(self.config.loan_age_baseline),
+                "enabled": bool(self.loan_age_baseline_source_ids),
+                "milestones": list(self.loan_age_baseline_milestones),
+                "epoch_width_months": int(self.config.impact_lag),
+                "role": (
+                    "registered target-blind first-event seasoning nuisance; "
+                    "excluded from rule grammar"
+                ),
             },
             "failure_reasons": reasons,
             "scope": (
@@ -1135,6 +1381,7 @@ class CertSCRPipeline:
         response: SparseKernelResponse,
         *,
         grid_eta: np.ndarray | None = None,
+        event_eta: np.ndarray | None = None,
     ) -> tuple[np.ndarray, np.ndarray]:
         """Exact score/Fisher moments without any full-grid response or weight."""
         m = int(response.shape[1])
@@ -1183,8 +1430,18 @@ class CertSCRPipeline:
                 gradient -= event_design.T @ event_weights
                 event_information_weight = np.zeros(ctx.n_events, dtype=np.float64)
             else:
-                event_eta = self._eta_on_events(null_fit, ctx)
-                _loss, event_gradient, event_hessian = cloglog_event_terms(event_eta)
+                event_predictor = (
+                    self._eta_on_events(null_fit, ctx)
+                    if event_eta is None
+                    else np.asarray(event_eta, dtype=np.float64)
+                )
+                if event_predictor.shape != (ctx.n_events,):
+                    raise ValueError(
+                        "precomputed event predictor does not align with response"
+                    )
+                _loss, event_gradient, event_hessian = cloglog_event_terms(
+                    event_predictor
+                )
                 gradient += event_design.T @ (event_weights * event_gradient)
                 event_information_weight = event_weights * event_hessian
         information = block.T @ (grid_weights[:, None] * block)
@@ -1192,6 +1449,68 @@ class CertSCRPipeline:
             information += event_design.T @ (
                 event_information_weight[:, None] * event_design
             )
+        return gradient, 0.5 * (information + information.T)
+
+    def _identity_moments_from_grouped_parent(
+        self,
+        null_fit: FitResult,
+        parent: PreparedFixedSupportDesign,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Exact new-block score/Fisher from an already grouped W parent.
+
+        The full-M parent is a finer sufficient-statistic partition of the
+        closure null and contains the candidate block in its final columns.
+        Re-evaluating the same moments from sparse source streams regenerated
+        every hierarchy convolution and then scanned the ungrouped active
+        grid.  Chunked promotion of the grouped rows preserves the float32
+        design values and performs the identical weighted derivatives with a
+        bounded temporary.
+        """
+        if len(parent.rules) != 1:
+            raise ValueError("identity moment parent must contain one full-M rule")
+        left = int(parent.constrained_start)
+        m = int(parent.knot_count)
+        if m < 1 or parent.design.shape[1] != left + m:
+            raise ValueError("identity moment parent has an invalid block layout")
+        if len(null_fit.gamma) != int(parent.control_width):
+            raise ValueError("identity null coefficients do not match grouped parent")
+        coefficients = np.concatenate(
+            (np.asarray([null_fit.alpha], dtype=np.float64), null_fit.gamma)
+        )
+        gradient = np.zeros(m, dtype=np.float64)
+        information = np.zeros((m, m), dtype=np.float64)
+        chunk_size = 262_144
+
+        def accumulate(start: int, stop: int, *, event: bool) -> None:
+            weights_source = parent.event_weights if event else parent.grid_weights
+            source_offset = 0 if event else int(parent.n_events)
+            for row_left in range(start, stop, chunk_size):
+                row_right = min(row_left + chunk_size, stop)
+                raw = parent.design[row_left:row_right]
+                prefix = raw[:, :left].astype(np.float64, copy=False)
+                block = raw[:, left:].astype(np.float64, copy=False)
+                eta = prefix @ coefficients
+                weights = weights_source[
+                    row_left - source_offset : row_right - source_offset
+                ]
+                if event:
+                    if parent.occurrence_likelihood == "poisson":
+                        first = -weights
+                        second = np.zeros_like(weights)
+                    else:
+                        _loss, first, second = cloglog_event_terms(eta)
+                        first = weights * first
+                        second = weights * second
+                else:
+                    first = weights * np.exp(eta)
+                    second = first
+                gradient[:] += block.T @ first
+                information[:] += block.T @ (block * second[:, None])
+
+        if parent.n_events:
+            accumulate(0, int(parent.n_events), event=True)
+        if parent.n_events < len(parent.design):
+            accumulate(int(parent.n_events), len(parent.design), event=False)
         return gradient, 0.5 * (information + information.T)
 
     def _scores_from_moments(
@@ -1359,6 +1678,7 @@ class CertSCRPipeline:
                 worker._safe_screened_records = dict(self._safe_screened_records)
             worker._hierarchy_closure_cache = dict(self._hierarchy_closure_cache)
             worker._prepared_design_cache = {}
+            worker._prepared_profile_nonoptimal_keys = set()
             worker._nuisance_event_design_cache = dict(self._nuisance_event_design_cache)
             worker._mark_base_residualizer_cache = dict(self._mark_base_residualizer_cache)
             worker._marked_response_cache = dict(self._marked_response_cache)
@@ -1374,6 +1694,32 @@ class CertSCRPipeline:
             worker._identity_refinement_keys = set()
             workers.append(worker)
         self._active_support_workers = workers
+
+    @staticmethod
+    def _exact_fit_worker_limit(available_workers: int) -> int:
+        """Bound simultaneous large designs without changing fitted models.
+
+        Worker objects remain available for response pricing. Only the number
+        of concurrently resident exact support/refinement designs is limited;
+        every requested model is still solved with the same objective and KKT
+        tolerance. The environment value is execution-only and deliberately
+        excluded from the statistical checkpoint signature.
+        """
+        available = max(1, int(available_workers))
+        raw = os.environ.get("CERTSCR_MAX_CONCURRENT_EXACT_FITS")
+        if raw is None:
+            return available
+        try:
+            requested = int(raw)
+        except ValueError as error:
+            raise ValueError(
+                "CERTSCR_MAX_CONCURRENT_EXACT_FITS must be an integer"
+            ) from error
+        if requested < 1:
+            raise ValueError(
+                "CERTSCR_MAX_CONCURRENT_EXACT_FITS must be positive"
+            )
+        return min(available, requested)
 
     def _stage_nested_prepared_designs(
         self,
@@ -1422,19 +1768,12 @@ class CertSCRPipeline:
                 # lazy preparation path untouched.
                 if len(children) < 2:
                     continue
-                nuisance = self.sparse_nuisance_blocks(
-                    self.splits.fit, closure_terms
-                )
-                parent_prepared = prepare_fixed_support_design(
+                parent_prepared = self.prepare_partitioned_support_design(
                     self.splits.fit,
-                    nuisance,
+                    closure_terms,
                     self.sparse_features(self.splits.fit, parent),
                     parent,
                     cluster_weights=self.fit_cluster_weights,
-                    sequence_exposures=self.sequence_exposures(
-                        self.splits.fit
-                    ),
-                    occurrence_likelihood=self.occurrence_likelihood,
                 )
                 self._prepared_design_cache[(parent, closure_terms)] = (
                     parent_prepared
@@ -1461,6 +1800,531 @@ class CertSCRPipeline:
                         "nested_prepared_child_reuses"
                     ] += reused
 
+    def _semantic_support_warm_start(
+        self,
+        prepared: DeltaFactorizedSupportDesign,
+        closure_terms: tuple[ClosureTerm, ...],
+        closure_baseline: FitResult,
+    ) -> FitResult:
+        """Map the closest cached model into the target's exact column semantics.
+
+        This is initialization only.  Missing or non-cone-compatible columns
+        remain zero, and the factorized solver independently rejects any warm
+        point whose objective is worse than its intercept initialization.
+        """
+        rules = prepared.rules
+        knot_count = int(self.config.knot_count)
+        target_rule_width = int(prepared.knot_count)
+        target_fixed_width = int(prepared.control_width) - knot_count * len(
+            closure_terms
+        )
+        if target_fixed_width < 0:
+            return closure_baseline
+        with self._fit_key_locks_guard:
+            cached = tuple(self._fit_cache.values())
+
+        def raw_rule_coefficients(
+            fit: FitResult,
+            rule: RuleIdentity,
+        ) -> np.ndarray | None:
+            try:
+                index = fit.rules.index(rule)
+            except ValueError:
+                return None
+            row = np.asarray(fit.theta[index], dtype=np.float64)
+            if len(row) == knot_count:
+                return float(rule.sign) * row
+            shape = self.rule_dictionary_shapes.get(rule)
+            if len(row) == 1 and shape is not None and len(shape) == knot_count:
+                return float(rule.sign) * float(row[0]) * np.asarray(
+                    shape, dtype=np.float64
+                )
+            return None
+
+        best = closure_baseline
+        best_score = target_fixed_width + knot_count * len(closure_terms)
+        for source in cached:
+            if not source.converged:
+                continue
+            source_fixed_width = len(source.gamma) - knot_count * len(
+                source.closure_terms
+            )
+            if source_fixed_width != target_fixed_width:
+                continue
+            gamma = np.zeros(prepared.control_width, dtype=np.float64)
+            if target_fixed_width:
+                gamma[:target_fixed_width] = source.gamma[:target_fixed_width]
+            theta = np.zeros(
+                (len(rules), target_rule_width), dtype=np.float64
+            )
+            score = target_fixed_width
+            source_closure_index = {
+                term: index
+                for index, term in enumerate(source.closure_terms)
+            }
+            for target_index, term in enumerate(closure_terms):
+                left = target_fixed_width + target_index * knot_count
+                source_index = source_closure_index.get(term)
+                if source_index is not None:
+                    source_left = (
+                        source_fixed_width + source_index * knot_count
+                    )
+                    gamma[left : left + knot_count] = source.gamma[
+                        source_left : source_left + knot_count
+                    ]
+                    score += knot_count
+                    continue
+                source_rule = next(
+                    (
+                        rule
+                        for rule in source.rules
+                        if (rule.antecedent, int(rule.window)) == term
+                    ),
+                    None,
+                )
+                if source_rule is not None:
+                    raw = raw_rule_coefficients(source, source_rule)
+                    if raw is not None:
+                        gamma[left : left + knot_count] = raw
+                        score += knot_count
+            for target_index, rule in enumerate(rules):
+                if rule in source.rules:
+                    source_index = source.rules.index(rule)
+                    source_theta = np.asarray(
+                        source.theta[source_index], dtype=np.float64
+                    )
+                    if len(source_theta) == target_rule_width:
+                        theta[target_index] = np.maximum(source_theta, 0.0)
+                        score += 2 * target_rule_width
+                        continue
+                term = (rule.antecedent, int(rule.window))
+                source_index = source_closure_index.get(term)
+                if source_index is None:
+                    continue
+                source_left = source_fixed_width + source_index * knot_count
+                raw = float(rule.sign) * source.gamma[
+                    source_left : source_left + knot_count
+                ]
+                if target_rule_width == knot_count:
+                    theta[target_index] = np.maximum(raw, 0.0)
+                    score += target_rule_width
+                else:
+                    shape = self.rule_dictionary_shapes.get(rule)
+                    if shape is not None and len(shape) == knot_count:
+                        shape64 = np.asarray(shape, dtype=np.float64)
+                        denominator = float(shape64 @ shape64)
+                        if denominator > 0.0:
+                            theta[target_index, 0] = max(
+                                0.0, float(shape64 @ raw) / denominator
+                            )
+                            score += 1
+            if score <= best_score:
+                continue
+            best_score = score
+            best = replace(
+                source,
+                rules=rules,
+                closure_terms=closure_terms,
+                gamma=gamma,
+                theta=theta,
+                mark_fit=None,
+                solver_hessian=None,
+            )
+        if best is not closure_baseline:
+            with self._diagnostic_guard:
+                self._safe_screen_stats[
+                    "support_semantic_warm_starts"
+                ] += 1
+        return best
+
+    def _fit_one_closure_group_sparse(
+        self,
+        ordered: Sequence[tuple[RuleIdentity, ...]],
+        closure_terms: tuple[ClosureTerm, ...],
+        *,
+        profile: str,
+    ) -> list[SupportRecord] | None:
+        """Execute one closure group without materializing dense closure rows.
+
+        This is an exact CPU-float64 backend.  Any construction or convergence
+        failure returns ``None`` and the caller runs the canonical grouped
+        implementation, so the acceleration cannot remove a candidate or
+        weaken its KKT requirement.
+        """
+        if (
+            self.marked
+            or not str(self.config.solver_device).startswith("cpu")
+            or self.config.solver_dtype != "float64"
+        ):
+            return None
+        try:
+            fixed = self.fixed_nuisance_partition(self.splits.fit)
+            closure_blocks = self.sparse_closure_blocks(
+                self.splits.fit, closure_terms
+            )
+            null_key = ((), closure_terms)
+            closure_baseline = self._fit_cache.get(null_key)
+            if closure_baseline is None and not closure_terms:
+                closure_baseline = self.fit_model((), ())
+            if closure_baseline is not None and not closure_baseline.converged:
+                return None
+
+            output: list[SupportRecord] = []
+            nested_screened: dict[tuple[RuleIdentity, ...], FitResult] = {}
+            if closure_baseline is not None:
+                by_parent: dict[
+                    tuple[RuleIdentity, ...],
+                    list[tuple[tuple[RuleIdentity, ...], tuple[RuleIdentity, ...]]],
+                ] = {}
+                for key in ordered:
+                    if (key, closure_terms) in self._fit_cache:
+                        continue
+                    parents = [
+                        subset
+                        for subset in (
+                            key[:index] + key[index + 1 :]
+                            for index in range(len(key))
+                        )
+                        if subset
+                        and (
+                            candidate := self._fit_cache.get(
+                                (subset, closure_terms)
+                            )
+                        ) is not None
+                        and candidate.converged
+                    ]
+                    if not parents:
+                        continue
+                    parent = max(parents, key=lambda item: (len(item), item))
+                    missing = tuple(rule for rule in key if rule not in parent)
+                    by_parent.setdefault(parent, []).append((key, missing))
+                for parent_key, children in by_parent.items():
+                    parent_fit = self._fit_cache[(parent_key, closure_terms)]
+                    missing_rules = tuple(
+                        sorted(
+                            {
+                                rule
+                                for _key, missing in children
+                                for rule in missing
+                            }
+                        )
+                    )
+                    prices = self._support_rule_gradient_prices(
+                        parent_fit, missing_rules
+                    )
+                    for key, missing in children:
+                        joint_kkt = max(
+                            float(parent_fit.kkt_residual),
+                            max(
+                                (float(prices[rule][1]) for rule in missing),
+                                default=0.0,
+                            ),
+                        )
+                        if joint_kkt > float(self.config.solver_tolerance):
+                            continue
+                        widths = {
+                            int(block.shape[1])
+                            for block in self.sparse_features(
+                                self.splits.fit, key
+                            )
+                        }
+                        if len(widths) != 1:
+                            raise ValueError(
+                                "nested KKT screen found inconsistent rule widths"
+                            )
+                        width = widths.pop()
+                        theta = np.zeros(
+                            (len(key), width), dtype=np.float64
+                        )
+                        parent_index = {
+                            rule: index
+                            for index, rule in enumerate(parent_fit.rules)
+                        }
+                        compatible = parent_fit.theta.shape[1] == width
+                        if compatible:
+                            for index, rule in enumerate(key):
+                                source = parent_index.get(rule)
+                                if source is not None:
+                                    theta[index] = parent_fit.theta[source]
+                        if not compatible:
+                            continue
+                        fit = replace(
+                            parent_fit,
+                            rules=key,
+                            theta=theta,
+                            kkt_residual=float(joint_kkt),
+                            converged=True,
+                            iterations=0,
+                            mark_fit=None,
+                            solver_hessian=None,
+                        )
+                        nested_screened[key] = fit
+                        with self._fit_key_locks_guard:
+                            self._fit_cache[(key, closure_terms)] = fit
+                        with self._diagnostic_guard:
+                            self._safe_screen_stats[
+                                "support_nested_exact_kkt_screens"
+                            ] += 1
+            for key in ordered:
+                model_key = (key, closure_terms)
+                fit = nested_screened.get(key) or self._fit_cache.get(model_key)
+                if fit is None:
+                    sparse_support = prepare_sparse_delta_support_design(
+                        self.splits.fit,
+                        fixed,
+                        closure_blocks,
+                        closure_terms,
+                        self.sparse_features(self.splits.fit, key),
+                        key,
+                        cluster_weights=self.fit_cluster_weights,
+                        occurrence_likelihood=self.occurrence_likelihood,
+                    )
+                    if closure_baseline is None:
+                        fixed_baseline = self.fit_model((), ())
+                        closure_baseline = fit_sparse_delta_closure(
+                            sparse_support,
+                            max_iter=self.config.solver_max_iter,
+                            tolerance=self.config.solver_tolerance,
+                            baseline=fixed_baseline,
+                        )
+                        if closure_baseline is None:
+                            return None
+                        with self._fit_key_locks_guard:
+                            self._fit_cache[null_key] = closure_baseline
+                            self._null_fit_cache[
+                                closure_terms
+                            ] = closure_baseline
+                    recession_columns = sparse_delta_rule_recession_columns(
+                        sparse_support
+                    )
+                    if recession_columns:
+                        fit = self._nonattained_support_fit(
+                            key,
+                            closure_baseline,
+                            int(sparse_support.knot_count),
+                            recession_columns,
+                        )
+                    else:
+                        initial = self._semantic_support_warm_start(
+                            sparse_support,
+                            closure_terms,
+                            closure_baseline,
+                        )
+                        fit = fit_sparse_delta_support(
+                            sparse_support,
+                            max_iter=self.config.solver_max_iter,
+                            tolerance=self.config.solver_tolerance,
+                            initial=initial,
+                            baseline=closure_baseline,
+                        )
+                        if fit is None:
+                            return None
+                    with self._fit_key_locks_guard:
+                        self._fit_cache[model_key] = fit
+                    with self._diagnostic_guard:
+                        self._safe_screen_stats[
+                            "support_sparse_delta_fits"
+                        ] += 1
+                output.append(
+                    SupportRecord(
+                        rules=key,
+                        fit=fit,
+                        closure_baseline_fit=closure_baseline,
+                        search_nll_improvement=float(
+                            closure_baseline.nll - fit.nll
+                        ),
+                        profile=profile,
+                    )
+                )
+            if closure_baseline is None:
+                return None
+            with self._diagnostic_guard:
+                self._safe_screen_stats[
+                    "support_sparse_delta_closure_groups"
+                ] += 1
+            return output
+        except (FloatingPointError, MemoryError, RuntimeError, ValueError):
+            with self._diagnostic_guard:
+                self._safe_screen_stats[
+                    "support_sparse_delta_fallbacks"
+                ] += 1
+            return None
+
+    def _fit_one_closure_group(
+        self,
+        keys: Sequence[tuple[RuleIdentity, ...]],
+        *,
+        profile: str,
+    ) -> list[SupportRecord]:
+        """Fit one closure-local support group from one exact partition.
+
+        The old path built ``fixed + closure`` once for the null and again for
+        every support.  Here the closure partition is retained, its null is
+        solved once, and each rule set is appended by sparse partition
+        refinement.  A native failure falls back to the canonical cold design;
+        no candidate, objective, row mass or KKT tolerance changes.
+        """
+        ordered = list(dict.fromkeys(tuple(sorted(key)) for key in keys))
+        if not ordered:
+            return []
+        closure_terms = self.hierarchy_closure(ordered[0])
+        if any(self.hierarchy_closure(key) != closure_terms for key in ordered):
+            raise ValueError("closure-local fit group contains different closures")
+        if all(
+            (key, closure_terms) in self._fit_cache
+            or (key, closure_terms) in self._prepared_design_cache
+            for key in ordered
+        ):
+            return [self._support_record(key, profile=profile) for key in ordered]
+        sparse_output = self._fit_one_closure_group_sparse(
+            ordered, closure_terms, profile=profile
+        )
+        if sparse_output is not None:
+            return sparse_output
+        partition = self.prepare_partitioned_support_design(
+            self.splits.fit,
+            closure_terms,
+            [],
+            [],
+            cluster_weights=self.fit_cluster_weights,
+            return_partition=True,
+        )
+        if not isinstance(partition, IncrementalSupportPartition):
+            return [self._support_record(key, profile=profile) for key in ordered]
+        with self._diagnostic_guard:
+            self._safe_screen_stats["support_closure_partitions"] += 1
+
+        null_key = ((), closure_terms)
+        if null_key not in self._fit_cache:
+            self._prepared_design_cache[null_key] = partition.prepared
+        closure_baseline = self.fit_model((), closure_terms)
+        output: list[SupportRecord] = []
+        remaining = list(ordered)
+
+        # KKT conditions at a converged convex null are jointly sufficient for
+        # a zero rule block.  Price a shared closure group in one sparse-union
+        # pass; this exact screen is worthwhile only when at least two support
+        # candidates reuse that pass.  Marked models are excluded because an
+        # occurrence-zero block can still own a nonzero conditional-mark head.
+        if (
+            not self.marked
+            and closure_baseline.converged
+            and len(remaining) > 1
+        ):
+            group_rules = tuple(
+                sorted({rule for key in remaining for rule in key})
+            )
+            prices = self._support_rule_gradient_prices(
+                closure_baseline,
+                group_rules,
+            )
+            unscreened: list[tuple[RuleIdentity, ...]] = []
+            for key in remaining:
+                rule_kkt = max(
+                    (float(prices[rule][1]) for rule in key), default=0.0
+                )
+                joint_kkt = max(
+                    float(closure_baseline.kkt_residual), rule_kkt
+                )
+                if joint_kkt > float(self.config.solver_tolerance):
+                    unscreened.append(key)
+                    continue
+                widths = {
+                    int(block.shape[1])
+                    for block in self.sparse_features(self.splits.fit, key)
+                }
+                if len(widths) != 1:
+                    raise ValueError("joint-null screen found inconsistent rule widths")
+                width = widths.pop()
+                zero_fit = replace(
+                    closure_baseline,
+                    rules=key,
+                    theta=np.zeros((len(key), width), dtype=np.float64),
+                    kkt_residual=joint_kkt,
+                    converged=True,
+                    iterations=0,
+                    mark_fit=None,
+                    solver_hessian=None,
+                )
+                with self._fit_key_locks_guard:
+                    self._fit_cache[(key, closure_terms)] = zero_fit
+                output.append(
+                    SupportRecord(
+                        rules=key,
+                        fit=zero_fit,
+                        closure_baseline_fit=closure_baseline,
+                        search_nll_improvement=0.0,
+                        profile=f"{profile}-exact-joint-null-kkt-screen",
+                    )
+                )
+                with self._diagnostic_guard:
+                    self._safe_screen_stats[
+                        "support_joint_null_kkt_screens"
+                    ] += 1
+            remaining = unscreened
+
+        for key in remaining:
+            model_key = (key, closure_terms)
+            cached_fit = self._fit_cache.get(model_key)
+            if (
+                cached_fit is None
+                and model_key not in self._prepared_design_cache
+            ):
+                features = self.sparse_features(self.splits.fit, key)
+                try:
+                    factorized = prepare_delta_factorized_support_design(
+                        self.splits.fit,
+                        partition,
+                        features,
+                        key,
+                        cluster_weights=self.fit_cluster_weights,
+                        occurrence_likelihood=self.occurrence_likelihood,
+                    )
+                except RuntimeError:
+                    factorized = None
+                    with self._diagnostic_guard:
+                        self._safe_screen_stats[
+                            "support_closure_partition_fallbacks"
+                        ] += 1
+                if factorized is not None:
+                    recession_columns = factorized_rule_recession_columns(
+                        factorized
+                    )
+                    if recession_columns:
+                        fit = self._nonattained_support_fit(
+                            key,
+                            closure_baseline,
+                            int(factorized.knot_count),
+                            recession_columns,
+                        )
+                    else:
+                        initial = self._semantic_support_warm_start(
+                            factorized,
+                            closure_terms,
+                            closure_baseline,
+                        )
+                        fit = fit_delta_factorized_support(
+                            factorized,
+                            closure_terms,
+                            max_iter=self.config.solver_max_iter,
+                            tolerance=self.config.solver_tolerance,
+                            initial=initial,
+                            baseline=closure_baseline,
+                        )
+                        fit = self._attach_mark_head(fit, self.splits.fit)
+                    with self._fit_key_locks_guard:
+                        self._fit_cache[model_key] = fit
+                    with self._diagnostic_guard:
+                        self._safe_screen_stats[
+                            "support_closure_partition_child_reuses"
+                        ] += 1
+                        self._safe_screen_stats[
+                            "support_delta_factorized_fits"
+                        ] += 1
+            output.append(self._support_record(key, profile=profile))
+        by_key = {record.rules: record for record in output}
+        return [by_key[key] for key in ordered]
+
     def _fit_support_records_batch(
         self,
         rule_sets: Sequence[Sequence[RuleIdentity]],
@@ -1472,7 +2336,22 @@ class CertSCRPipeline:
             return []
         workers = self._active_support_workers
         if len(workers) <= 1:
-            return [self._support_record(key, profile=profile) for key in keys]
+            by_closure: dict[
+                tuple[ClosureTerm, ...], list[tuple[RuleIdentity, ...]]
+            ] = {}
+            for key in keys:
+                by_closure.setdefault(self.hierarchy_closure(key), []).append(
+                    key
+                )
+            fitted: list[SupportRecord] = []
+            for group in by_closure.values():
+                fitted.extend(
+                    self._fit_one_closure_group(group, profile=profile)
+                )
+            by_key = {record.rules: record for record in fitted}
+            _release_unused_native_heap()
+            self._maybe_checkpoint_support_fits()
+            return [by_key[key] for key in keys]
 
         # Safe-bound evaluation can fit new hierarchy-null models on the
         # parent between batches.  Publish them before dispatch so workers do
@@ -1508,6 +2387,22 @@ class CertSCRPipeline:
                 group[0],
             )
         )
+        # Compact closure/delta arrays and completed fits are immutable and can
+        # be shared by long-lived thread workers.  Making rolling fork the
+        # default copied Python/cache pages in every microjob and exhausted
+        # memory on the full Freddie run.  NumPy matrix products execute in
+        # compiled MKL outside the GIL, while the local limiter prevents nested
+        # BLAS pools.  Retain the old exact process route only as an explicit
+        # systems fallback; it changes neither candidates nor optimization.
+        use_fork_batch = bool(
+            os.environ.get("CERTSCR_PROCESS_FITS", "0") == "1"
+            and os.name == "posix"
+            and not self.config.support_devices
+            and not self.config.safe_mdl_screen
+            and str(self.config.solver_device).startswith("cpu")
+            and int(self.config.solver_workers) > 1
+            and len(keys) >= 16 * len(workers)
+        )
         chunks: list[list[tuple[RuleIdentity, ...]]] = [
             [] for _ in range(len(workers))
         ]
@@ -1519,29 +2414,16 @@ class CertSCRPipeline:
             )
             chunks[worker_index].extend(group)
             chunk_loads[worker_index] += sum(1 + len(key) for key in group)
-        # Safe-bound construction has already produced the exact grouped
-        # solver partition. Transfer ownership by reference to the worker that
-        # consumes it, then remove the parent entry to keep peak memory bounded.
-        for worker, chunk in zip(workers, chunks, strict=True):
-            for rules in chunk:
-                model_key = (rules, self.hierarchy_closure(rules))
-                prepared = self._prepared_design_cache.pop(model_key, None)
-                if prepared is not None:
-                    worker._prepared_design_cache[model_key] = prepared
-
         def fit_chunk(
             worker: CertSCRPipeline,
             chunk: list[tuple[RuleIdentity, ...]],
         ) -> list[SupportRecord]:
             with _single_threaded_local_blas():
                 output: list[SupportRecord] = []
-                # Supports sharing a closure often contain exact nested
-                # add/drop models. Assemble the maximal sparse design once,
-                # then select/regroup its child columns. A partition grouped
-                # on more columns is an exact finer sufficient statistic for
-                # every nested child, so this removes repeated full-grid
-                # assembly without changing a row, mass, objective or KKT
-                # tolerance.
+                # Build each distinct hierarchy-closure partition once and
+                # append the rule blocks of its children through exact native
+                # repartitioning.  No child candidate or sufficient-statistic
+                # mass is changed.
                 closure_chunks: dict[
                     tuple[ClosureTerm, ...],
                     list[tuple[RuleIdentity, ...]],
@@ -1551,27 +2433,15 @@ class CertSCRPipeline:
                         worker.hierarchy_closure(key), []
                     ).append(key)
                 for closure_keys in closure_chunks.values():
-                    worker._stage_nested_prepared_designs(closure_keys)
                     output.extend(
-                        worker._support_record(key, profile=profile)
-                        for key in closure_keys
+                        worker._fit_one_closure_group(
+                            closure_keys,
+                            profile=profile,
+                        )
                     )
                 return output
 
         records: list[SupportRecord] = []
-        use_fork_batch = bool(
-            os.name == "posix"
-            and not self.config.support_devices
-            and not self.config.safe_mdl_screen
-            and str(self.config.solver_device).startswith("cpu")
-            and int(self.config.solver_workers) > 1
-            # Fork startup/IPC is a systems dispatch cost, not a statistical
-            # screen.  After closure-local scheduling, measurements on this
-            # host put the crossover between 108 and 300 fits (108: threads
-            # 4.76s vs fork 5.17s; 300: threads 12.96s vs fork 12.40s).
-            # Smaller batches retain the exact threaded path.
-            and len(keys) >= 16 * len(workers)
-        )
         with self._diagnostic_guard:
             self._safe_screen_stats[
                 "active_fit_process_batches"
@@ -1584,6 +2454,29 @@ class CertSCRPipeline:
         if use_fork_batch:
             context = mp.get_context("fork")
             result_queue = context.Queue()
+
+            # Static one-chunk-per-worker scheduling treated every pair as
+            # equally expensive and left most cores idle behind two closure
+            # stragglers.  Preserve each closure group, but pack it into small
+            # bounded jobs consumed by a rolling process pool.  Job order and
+            # completion order affect only warm starts; every convex key still
+            # receives the same fit and host-float64 KKT certificate.
+            target_job_supports = 16
+            dynamic_chunks: list[list[tuple[RuleIdentity, ...]]] = []
+            current_chunk: list[tuple[RuleIdentity, ...]] = []
+            for group in closure_groups:
+                if (
+                    current_chunk
+                    and len(current_chunk) + len(group) > target_job_supports
+                ):
+                    dynamic_chunks.append(current_chunk)
+                    current_chunk = []
+                current_chunk.extend(group)
+                if len(current_chunk) >= target_job_supports:
+                    dynamic_chunks.append(current_chunk)
+                    current_chunk = []
+            if current_chunk:
+                dynamic_chunks.append(current_chunk)
 
             def process_fit_chunk(
                 chunk_index: int,
@@ -1600,19 +2493,29 @@ class CertSCRPipeline:
                         support_devices=(),
                     )
                     worker._active_support_workers = []
-                    worker._prepared_design_cache = {}
+                    chunk_set = set(chunk)
+                    worker._prepared_design_cache = {
+                        model_key: prepared
+                        for model_key, prepared in self._prepared_design_cache.items()
+                        if model_key[0] in chunk_set
+                    }
                     worker._information_design_parent = None
-                    worker._stage_nested_prepared_designs(chunk)
-                    values = [
-                        worker._support_record(key, profile=profile)
-                        for key in chunk
-                    ]
-                    result_queue.put((True, chunk_index, values, None))
+                    diagnostic_before = dict(worker._safe_screen_stats)
+                    values = fit_chunk(worker, chunk)
+                    diagnostic_updates = {
+                        key: int(value) - int(diagnostic_before.get(key, 0))
+                        for key, value in worker._safe_screen_stats.items()
+                        if int(value) != int(diagnostic_before.get(key, 0))
+                    }
+                    result_queue.put(
+                        (True, chunk_index, values, diagnostic_updates, None)
+                    )
                 except BaseException:
                     result_queue.put(
                         (
                             False,
                             chunk_index,
+                            None,
                             None,
                             traceback.format_exc(),
                         )
@@ -1620,58 +2523,221 @@ class CertSCRPipeline:
 
             process_jobs = [
                 (index, chunk)
-                for index, chunk in enumerate(chunks)
+                for index, chunk in enumerate(dynamic_chunks)
                 if chunk
             ]
-            processes = [
-                context.Process(
-                    target=process_fit_chunk,
-                    args=(index, chunk),
-                )
-                for index, chunk in process_jobs
-            ]
-            for process in processes:
-                process.start()
             received: dict[int, list[SupportRecord]] = {}
-            first_error: str | None = None
-            while len(received) < len(processes):
+            pending = iter(process_jobs)
+            active: dict[int, mp.Process] = {}
+
+            def launch_next() -> bool:
                 try:
-                    ok, chunk_index, values, error = result_queue.get(
-                        timeout=5.0
-                    )
-                except queue.Empty:
-                    if any(process.is_alive() for process in processes):
-                        continue
-                    raise RuntimeError(
-                        "forked support-fit workers exited before returning all results"
-                    )
-                received[int(chunk_index)] = values if ok else []
-                if not ok and first_error is None:
-                    first_error = str(error)
-            for process in processes:
-                process.join()
-            result_queue.close()
-            if first_error is not None:
-                raise RuntimeError(
-                    "forked support fitting failed:\n" + first_error
+                    chunk_index, chunk = next(pending)
+                except StopIteration:
+                    return False
+                process = context.Process(
+                    target=process_fit_chunk,
+                    args=(chunk_index, chunk),
                 )
-            bad_exit = [
-                process.exitcode
-                for process in processes
-                if process.exitcode not in {0, None}
-            ]
-            if bad_exit:
-                raise RuntimeError(
-                    f"forked support-fit workers exited with codes {bad_exit}"
+                process.start()
+                active[chunk_index] = process
+                with self._diagnostic_guard:
+                    self._safe_screen_stats[
+                        "active_fit_dynamic_worker_launches"
+                    ] += 1
+                return True
+
+            for _ in range(min(len(workers), len(process_jobs))):
+                launch_next()
+            with self._diagnostic_guard:
+                self._safe_screen_stats["active_fit_dynamic_jobs"] += len(
+                    process_jobs
                 )
+            try:
+                while len(received) < len(process_jobs):
+                    try:
+                        (
+                            ok,
+                            chunk_index,
+                            values,
+                            diagnostic_updates,
+                            error,
+                        ) = result_queue.get(timeout=5.0)
+                    except queue.Empty:
+                        failed = [
+                            (index, process.exitcode)
+                            for index, process in active.items()
+                            if not process.is_alive()
+                            and process.exitcode not in {0, None}
+                        ]
+                        if not failed and any(
+                            process.is_alive() for process in active.values()
+                        ):
+                            continue
+                        raise RuntimeError(
+                            "rolling support-fit workers exited before returning a result: "
+                            + ", ".join(
+                                f"job {index} (exit {code})"
+                                for index, code in failed
+                            )
+                        )
+                    chunk_index = int(chunk_index)
+                    process = active.pop(chunk_index, None)
+                    if process is None:
+                        raise RuntimeError(
+                            "rolling support worker returned unknown job "
+                            f"{chunk_index}"
+                        )
+                    process.join()
+                    if not ok:
+                        raise RuntimeError(
+                            "forked support fitting failed:\n" + str(error)
+                        )
+                    if process.exitcode not in {0, None}:
+                        raise RuntimeError(
+                            f"rolling support worker {chunk_index} exited with code "
+                            f"{process.exitcode}"
+                        )
+                    chunk_records = values or []
+                    received[chunk_index] = chunk_records
+                    # Publish completed immutable fits before launching the
+                    # next fork.  The new child inherits them copy-on-write
+                    # and can use exact nested-null warm starts without
+                    # retaining the finished worker's large response/design
+                    # arenas.
+                    for record in chunk_records:
+                        self._fit_cache[
+                            (record.fit.rules, record.fit.closure_terms)
+                        ] = record.fit
+                        self._fit_cache[
+                            ((), record.fit.closure_terms)
+                        ] = record.closure_baseline_fit
+                        self._null_fit_cache[
+                            record.fit.closure_terms
+                        ] = record.closure_baseline_fit
+                        self._prepared_design_cache.pop(
+                            (record.fit.rules, record.fit.closure_terms), None
+                        )
+                    if diagnostic_updates:
+                        with self._diagnostic_guard:
+                            for key, delta in diagnostic_updates.items():
+                                self._safe_screen_stats[key] = int(
+                                    self._safe_screen_stats.get(key, 0)
+                                ) + int(delta)
+                    launch_next()
+            finally:
+                for outstanding in active.values():
+                    if outstanding.is_alive():
+                        outstanding.terminate()
+                for outstanding in active.values():
+                    outstanding.join()
+                result_queue.close()
             for chunk_index, _chunk in process_jobs:
                 records.extend(received[chunk_index])
         else:
-            with ThreadPoolExecutor(max_workers=len(workers)) as executor:
+            # A closure group is an execution-reuse unit, not an optimization
+            # dependency.  When fewer closure groups than physical workers
+            # remain, keeping all children on one worker serializes expensive
+            # high-order refits.  Host workers share immutable caches: fit each
+            # missing closure null once, then shard its independent exact
+            # children across the idle workers.  Every child retains the same
+            # convex feasible set, objective and KKT tolerance; only its warm
+            # start and dispatch worker may differ.
+            fit_worker_count = self._exact_fit_worker_limit(len(workers))
+            fit_workers = workers[:fit_worker_count]
+            available: queue.SimpleQueue[CertSCRPipeline] = queue.SimpleQueue()
+            for worker in fit_workers:
+                available.put(worker)
+
+            shared_host_caches = all(
+                worker._fit_cache is self._fit_cache
+                and worker._null_fit_cache is self._null_fit_cache
+                for worker in workers
+            )
+            shard_closures = bool(
+                shared_host_caches
+                and len(closure_groups) < len(workers)
+                and any(len(group) > 1 for group in closure_groups)
+            )
+
+            def prefit_closure_null(
+                closure_terms: tuple[ClosureTerm, ...],
+            ) -> None:
+                worker = available.get()
+                try:
+                    with _single_threaded_local_blas():
+                        worker.fit_model((), closure_terms)
+                finally:
+                    available.put(worker)
+
+            thread_groups = closure_groups
+            prefitted_closures = 0
+            if shard_closures:
+                missing_closures = [
+                    self.hierarchy_closure(group[0])
+                    for group in closure_groups
+                    if ((), self.hierarchy_closure(group[0]))
+                    not in self._fit_cache
+                ]
+                if missing_closures:
+                    # Nulls are distinct convex cache keys and can be solved
+                    # concurrently.  The per-key fit lock is still active, so
+                    # a concurrent safe-bound request cannot duplicate one.
+                    with ThreadPoolExecutor(
+                        max_workers=min(
+                            fit_worker_count, len(missing_closures)
+                        )
+                    ) as null_executor:
+                        list(
+                            null_executor.map(
+                                prefit_closure_null, missing_closures
+                            )
+                        )
+                    prefitted_closures = len(missing_closures)
+                # A singleton task is deliberate here.  At most
+                # ``fit_worker_count``
+                # tasks execute concurrently, so live design memory has the
+                # same bound as an ordinary multi-closure wave while one large
+                # closure can no longer strand the remaining workers.
+                thread_groups = [
+                    [key]
+                    for group in closure_groups
+                    for key in group
+                ]
+
+            def fit_closure_task(
+                closure_keys: list[tuple[RuleIdentity, ...]],
+            ) -> list[SupportRecord]:
+                worker = available.get()
+                try:
+                    for rules in closure_keys:
+                        model_key = (
+                            rules,
+                            worker.hierarchy_closure(rules),
+                        )
+                        prepared = self._prepared_design_cache.pop(
+                            model_key, None
+                        )
+                        if prepared is not None:
+                            worker._prepared_design_cache[model_key] = prepared
+                    return fit_chunk(worker, closure_keys)
+                finally:
+                    available.put(worker)
+
+            with self._diagnostic_guard:
+                self._safe_screen_stats[
+                    "active_fit_dynamic_thread_tasks"
+                ] += len(thread_groups)
+                self._safe_screen_stats[
+                    "active_fit_shared_closure_null_prefits"
+                ] += prefitted_closures
+                self._safe_screen_stats[
+                    "active_fit_closure_shards"
+                ] += max(0, len(thread_groups) - len(closure_groups))
+            with ThreadPoolExecutor(max_workers=fit_worker_count) as executor:
                 futures = [
-                    executor.submit(fit_chunk, worker, chunk)
-                    for worker, chunk in zip(workers, chunks, strict=True)
-                    if chunk
+                    executor.submit(fit_closure_task, group)
+                    for group in thread_groups
                 ]
                 for future in futures:
                     records.extend(future.result())
@@ -1686,6 +2752,15 @@ class CertSCRPipeline:
             if worker._fit_cache is not self._fit_cache:
                 worker._fit_cache.update(self._fit_cache)
                 worker._null_fit_cache.update(self._null_fit_cache)
+            # Every staged design in this batch has now either been consumed
+            # or superseded by its immutable FitResult.  Keeping the grouped
+            # matrix on a worker cannot accelerate a later request for the
+            # same cache key and was the principal source of live peak-memory
+            # growth in long all-atom searches.
+            worker._prepared_design_cache.clear()
+            worker._information_design_parent = None
+        _release_unused_native_heap()
+        self._maybe_checkpoint_support_fits()
         by_key = {record.rules: record for record in records}
         return [by_key[key] for key in keys]
 
@@ -1696,6 +2771,7 @@ class CertSCRPipeline:
         source_ids = (
             *((self.target_history_source_id,) if self.target_history_source_id is not None else ()),
             *self.control_source_ids,
+            *self.loan_age_baseline_source_ids,
         )
         return tuple(self.engine.response(ctx, (source,), 0) for source in source_ids)
 
@@ -1738,6 +2814,165 @@ class CertSCRPipeline:
             )
         return output
 
+    def _stage_profile_window_designs(
+        self,
+        rules: Sequence[RuleIdentity],
+        response: SparseKernelResponse,
+        *,
+        full_m_parent: PreparedFixedSupportDesign | None = None,
+    ) -> None:
+        """Stage exact one-rule designs directly from one fused W response.
+
+        ``iter_window_sparse_responses`` has already swept every completion
+        exactly once.  Re-entering ``sparse_response`` during the subsequent
+        exact identity fit used to repeat that convolution for each W/sign.
+        Build the signed candidates' common parent while the cumulative W
+        response is live, then project/regroup each one-rule child.  A parent
+        partition is only a finer exact sufficient statistic, so the child
+        objective, derivatives and KKT problem are unchanged.
+        """
+        candidates = tuple(sorted(set(rules)))
+        if not candidates:
+            return
+        closure_terms = self.hierarchy_closure((candidates[0],))
+        if any(
+            self.hierarchy_closure((candidate,)) != closure_terms
+            or candidate.antecedent != candidates[0].antecedent
+            or int(candidate.window) != int(candidates[0].window)
+            for candidate in candidates
+        ):
+            raise ValueError("fused profile candidates must share one W and closure")
+        if full_m_parent is not None:
+            source_rules = tuple(full_m_parent.rules)
+            if (
+                len(source_rules) != 1
+                or source_rules[0].antecedent != candidates[0].antecedent
+                or int(source_rules[0].window) != int(candidates[0].window)
+                or int(full_m_parent.knot_count) != self.config.knot_count
+            ):
+                raise ValueError("full-M profile parent does not match candidate W")
+            source_rule = source_rules[0]
+            raw_block = full_m_parent.design[
+                :,
+                full_m_parent.constrained_start :
+                full_m_parent.constrained_start + full_m_parent.knot_count,
+            ]
+            by_shape: dict[bytes, list[RuleIdentity]] = {}
+            shape_values: dict[bytes, np.ndarray] = {}
+            for candidate in candidates:
+                shape = self.rule_dictionary_shapes.get(candidate)
+                if shape is None:
+                    raise ValueError("dictionary child is missing its frozen shape")
+                canonical_shape = np.ascontiguousarray(shape, dtype=np.float32)
+                shape_key = canonical_shape.tobytes()
+                by_shape.setdefault(shape_key, []).append(candidate)
+                shape_values[shape_key] = canonical_shape
+            for shape_key, shape_candidates in by_shape.items():
+                # Every parent group has one bit-identical full-M rule vector.
+                # Projecting that vector is therefore exactly the same rowwise
+                # float32 GEMV used by SparseKernelResponse.projected, including
+                # for background groups carried across incremental W updates.
+                activation = (raw_block @ shape_values[shape_key]).astype(
+                    np.float32, copy=False
+                )
+                activation *= np.float32(source_rule.sign)
+                selected = np.ascontiguousarray(
+                    np.column_stack(
+                        (
+                            full_m_parent.design[
+                                :, : full_m_parent.constrained_start
+                            ],
+                            activation,
+                        )
+                    ),
+                    dtype=full_m_parent.design.dtype,
+                )
+                (
+                    selected,
+                    selected_events,
+                    selected_event_weights,
+                    selected_grid_weights,
+                ) = aggregate_duplicate_design_rows(
+                    selected,
+                    full_m_parent.n_events,
+                    full_m_parent.event_weights,
+                    full_m_parent.grid_weights,
+                    inplace=True,
+                )
+                for candidate in shape_candidates:
+                    if candidate.sign > 0:
+                        candidate_design = selected
+                    elif len(shape_candidates) == 1:
+                        candidate_design = selected
+                        candidate_design[:, -1] *= np.float32(-1.0)
+                    else:
+                        candidate_design = selected.copy()
+                        candidate_design[:, -1] *= np.float32(-1.0)
+                    child = (candidate,)
+                    self._prepared_design_cache[(child, closure_terms)] = (
+                        PreparedFixedSupportDesign(
+                            design=candidate_design,
+                            n_events=selected_events,
+                            event_weights=selected_event_weights,
+                            grid_weights=selected_grid_weights,
+                            constrained_start=int(full_m_parent.constrained_start),
+                            control_width=int(full_m_parent.control_width),
+                            knot_count=1,
+                            active_grid_rows=int(full_m_parent.active_grid_rows),
+                            rules=child,
+                            occurrence_likelihood=(
+                                full_m_parent.occurrence_likelihood
+                            ),
+                        )
+                    )
+            with self._diagnostic_guard:
+                self._safe_screen_stats["identity_sign_pair_parent_designs"] += 1
+                self._safe_screen_stats[
+                    "identity_sign_pair_child_reuses"
+                ] += len(candidates)
+            self._prepared_profile_nonoptimal_keys.update(
+                ((candidate,), closure_terms) for candidate in candidates
+            )
+            return
+        features: list[SparseKernelResponse] = []
+        for candidate in candidates:
+            shape = self.rule_dictionary_shapes.get(candidate)
+            features.append(
+                response.projected(shape) if shape is not None else response
+            )
+        parent = self.prepare_partitioned_support_design(
+            self.splits.fit,
+            closure_terms,
+            features,
+            candidates,
+            cluster_weights=self.fit_cluster_weights,
+        )
+        if len(candidates) == 1:
+            self._prepared_design_cache[(candidates, closure_terms)] = parent
+            self._prepared_profile_nonoptimal_keys.add(
+                (candidates, closure_terms)
+            )
+            return
+        for candidate in candidates:
+            child = (candidate,)
+            self._prepared_design_cache[(child, closure_terms)] = (
+                project_prepared_support_design(
+                    parent,
+                    child,
+                    source_closure_terms=closure_terms,
+                    target_closure_terms=closure_terms,
+                    regroup=True,
+                )
+            )
+        with self._diagnostic_guard:
+            self._safe_screen_stats["identity_sign_pair_parent_designs"] += 1
+            self._safe_screen_stats["identity_sign_pair_child_reuses"] += len(
+                candidates
+            )
+        self._prepared_profile_nonoptimal_keys.update(
+            ((candidate,), closure_terms) for candidate in candidates
+        )
+
     def sequence_exposures(self, ctx: QueryContext) -> np.ndarray:
         """Return exact per-sequence quadrature mass, cached by context."""
         cached = self._sequence_exposures.get(ctx.name)
@@ -1755,6 +2990,7 @@ class CertSCRPipeline:
         source_ids = (
             *((self.target_history_source_id,) if self.target_history_source_id is not None else ()),
             *self.control_source_ids,
+            *self.loan_age_baseline_source_ids,
         )
         blocks = [self.engine.sparse_response(ctx, (source,), 0) for source in source_ids]
         blocks.extend(
@@ -1762,6 +2998,69 @@ class CertSCRPipeline:
             for antecedent, window in sorted(closure_terms)
         )
         return tuple(blocks)
+
+    def sparse_closure_blocks(
+        self,
+        ctx: QueryContext,
+        closure_terms: Sequence[ClosureTerm],
+    ) -> tuple[SparseKernelResponse, ...]:
+        """Return only candidate-dependent hierarchy nuisance blocks."""
+        return tuple(
+            self.engine.sparse_response(ctx, antecedent, window)
+            for antecedent, window in sorted(closure_terms)
+        )
+
+    def fixed_nuisance_partition(
+        self,
+        ctx: QueryContext,
+    ) -> SparseNuisancePartition:
+        """Return the exact fixed control/age partition shared by all supports."""
+        cached = self._fixed_nuisance_partitions.get(ctx.name)
+        if cached is not None:
+            return cached
+        with self._fixed_nuisance_partition_guard:
+            cached = self._fixed_nuisance_partitions.get(ctx.name)
+            if cached is not None:
+                return cached
+            # Only the empty-closure blocks are candidate invariant. Hierarchy
+            # terms remain in every fitted model and are added by exact
+            # partition refinement below; no coefficient is frozen or omitted.
+            fixed = self.sparse_nuisance_blocks(ctx, ())
+            partition = prepare_sparse_nuisance_partition(
+                ctx,
+                fixed,
+                cluster_weights=(
+                    self.fit_cluster_weights
+                    if ctx.name == self.splits.fit.name
+                    else None
+                ),
+                sequence_exposures=self.sequence_exposures(ctx),
+                occurrence_likelihood=self.occurrence_likelihood,
+            )
+            self._fixed_nuisance_partitions[ctx.name] = partition
+            return partition
+
+    def prepare_partitioned_support_design(
+        self,
+        ctx: QueryContext,
+        closure_terms: Sequence[ClosureTerm],
+        features: Sequence[SparseKernelResponse],
+        rules: Sequence[RuleIdentity],
+        *,
+        cluster_weights: np.ndarray | None = None,
+        return_partition: bool = False,
+    ) -> PreparedFixedSupportDesign | IncrementalSupportPartition:
+        """Assemble a support by refining the shared fixed-nuisance partition."""
+        return refine_sparse_nuisance_partition(
+            ctx,
+            self.fixed_nuisance_partition(ctx),
+            self.sparse_closure_blocks(ctx, closure_terms),
+            features,
+            rules,
+            cluster_weights=cluster_weights,
+            occurrence_likelihood=self.occurrence_likelihood,
+            return_partition=return_partition,
+        )
 
     def mark_rule_activations(
         self,
@@ -2063,6 +3362,7 @@ class CertSCRPipeline:
             converged=False,
             iterations=0,
             mark_fit=None,
+            solver_hessian=None,
         )
 
     def _fit_model_uncached(
@@ -2134,6 +3434,7 @@ class CertSCRPipeline:
                         closure_terms=closure_terms,
                         gamma=expanded_gamma,
                         mark_fit=None,
+                        solver_hessian=None,
                     )
                     nested_null_warm_start = True
                     with self._diagnostic_guard:
@@ -2159,19 +3460,73 @@ class CertSCRPipeline:
                 )
             elif initial.closure_terms != closure_terms:
                 raise ValueError("warm start and target model must use the same hierarchy closure")
-        nuisance = self.sparse_nuisance_blocks(self.splits.fit, closure_terms)
-        features = self.sparse_features(self.splits.fit, rules)
+        if (
+            not rules
+            and closure_terms
+            and not self.marked
+            and str(self.config.solver_device).startswith("cpu")
+            and self.config.solver_dtype == "float64"
+            and key not in self._prepared_design_cache
+        ):
+            try:
+                sparse_null = prepare_sparse_delta_support_design(
+                    self.splits.fit,
+                    self.fixed_nuisance_partition(self.splits.fit),
+                    self.sparse_closure_blocks(
+                        self.splits.fit, closure_terms
+                    ),
+                    closure_terms,
+                    (),
+                    (),
+                    cluster_weights=self.fit_cluster_weights,
+                    occurrence_likelihood=self.occurrence_likelihood,
+                )
+                baseline = self.fit_model((), ())
+                sparse_fit = fit_sparse_delta_support(
+                    sparse_null,
+                    max_iter=self.config.solver_max_iter,
+                    tolerance=self.config.solver_tolerance,
+                    initial=initial,
+                    baseline=baseline,
+                )
+            except (FloatingPointError, MemoryError, RuntimeError, ValueError):
+                sparse_fit = None
+            if sparse_fit is not None:
+                with self._fit_key_locks_guard:
+                    self._fit_cache[key] = sparse_fit
+                    self._null_fit_cache[closure_terms] = sparse_fit
+                with self._diagnostic_guard:
+                    self._safe_screen_stats[
+                        "support_sparse_delta_closure_groups"
+                    ] += 1
+                return sparse_fit
         prepared = self._prepared_design_cache.pop(key, None)
+        profile_null_known_nonoptimal = (
+            key in self._prepared_profile_nonoptimal_keys
+        )
+        self._prepared_profile_nonoptimal_keys.discard(key)
+        nuisance: Sequence[SparseKernelResponse] = ()
+        # Profiling can hand the exact grouped design produced by its fused
+        # cumulative-W sweep directly to the solver.  In that case rebuilding
+        # the rule response merely to validate its width would repeat the
+        # dominant convolution. ``fit_fixed_support`` validates the rule
+        # identities and knot width against ``prepared`` itself.
+        features = (
+            []
+            if prepared is not None
+            else self.sparse_features(self.splits.fit, rules)
+        )
         if prepared is None:
-            prepared = prepare_fixed_support_design(
+            prepared = self.prepare_partitioned_support_design(
                 self.splits.fit,
-                nuisance,
+                closure_terms,
                 features,
                 rules,
                 cluster_weights=self.fit_cluster_weights,
-                sequence_exposures=self.sequence_exposures(self.splits.fit),
-                occurrence_likelihood=self.occurrence_likelihood,
             )
+            # ``prepared`` is now the complete sufficient statistic.  Avoid
+            # regenerating fixed/closure responses merely for width checks.
+            features = []
         if (
             str(self.config.solver_device).startswith("cpu")
             and self.config.solver_dtype == "float64"
@@ -2192,10 +3547,11 @@ class CertSCRPipeline:
                 int(prepared.knot_count),
                 recession_columns,
             )
-            self._fit_cache[key] = fit
+            with self._fit_key_locks_guard:
+                self._fit_cache[key] = fit
             return fit
         if initial is not None and initial.converged:
-            knot_count = int(features[0].shape[1]) if features else 0
+            knot_count = int(prepared.knot_count) if rules else 0
             expanded_theta = np.zeros((len(rules), knot_count), dtype=np.float64)
             initial_rule_index = {rule: index for index, rule in enumerate(initial.rules)}
             for new_index, rule in enumerate(rules):
@@ -2219,6 +3575,7 @@ class CertSCRPipeline:
                 closure_terms=closure_terms,
                 theta=expanded_theta,
                 mark_fit=expanded_mark,
+                solver_hessian=None,
             )
             # ``prepared`` already contains the exact grouped sufficient
             # statistics.  A former sparse rule-only prefilter scanned the
@@ -2226,7 +3583,11 @@ class CertSCRPipeline:
             # neither accept a fit nor inspect nuisance coordinates and was
             # 40x slower than the complete check on IBM; bypassing it changes
             # no objective, tolerance, fitted point, or shortcut decision.
-            if rules and not nested_null_warm_start:
+            if (
+                rules
+                and not nested_null_warm_start
+                and not profile_null_known_nonoptimal
+            ):
                 already_optimal, initial_kkt, _initial_objective = (
                     fixed_support_projected_kkt(
                         prepared,
@@ -2237,6 +3598,11 @@ class CertSCRPipeline:
             else:
                 already_optimal = False
                 initial_kkt = math.inf
+                if rules and profile_null_known_nonoptimal:
+                    with self._diagnostic_guard:
+                        self._safe_screen_stats[
+                            "identity_redundant_null_kkt_passes_skipped"
+                        ] += 1
             if already_optimal:
                 fit = replace(
                     expanded_initial,
@@ -2246,7 +3612,8 @@ class CertSCRPipeline:
                 )
                 if self.marked and fit.mark_fit is None:
                     fit = self._attach_mark_head(fit, self.splits.fit)
-                self._fit_cache[key] = fit
+                with self._fit_key_locks_guard:
+                    self._fit_cache[key] = fit
                 if not rules:
                     with self._fit_key_locks_guard:
                         self._null_fit_cache[closure_terms] = fit
@@ -2270,7 +3637,8 @@ class CertSCRPipeline:
             occurrence_likelihood=self.occurrence_likelihood,
         )
         fit = self._attach_mark_head(fit, self.splits.fit)
-        self._fit_cache[key] = fit
+        with self._fit_key_locks_guard:
+            self._fit_cache[key] = fit
         if not rules:
             with self._fit_key_locks_guard:
                 self._null_fit_cache[closure_terms] = fit
@@ -2286,12 +3654,13 @@ class CertSCRPipeline:
     ) -> None:
         """Fit profiling nulls with the fastest measured exact backend.
 
-        Triplet W profiling uses up to 13 hierarchy-null Poisson GLMs with the
-        same parameter width.  The batched solver pads only zero-weight grouped
-        rows and certifies every result with ``fixed_support_projected_kkt`` in
-        host float64; any item that misses that tolerance falls back to the
-        ordinary scalar solver.  Thus this changes dispatch, not an objective,
-        candidate, constraint, or convergence requirement.
+        Triplet W profiling uses up to 13 hierarchy-null occurrence GLMs with
+        the same parameter width.  The batched solver pads only zero-weight
+        grouped rows and certifies every result with
+        ``fixed_support_projected_kkt`` in host float64; any item that misses
+        that tolerance falls back to the ordinary scalar solver.  Thus this
+        changes dispatch, not an objective, candidate, constraint, or
+        convergence requirement.
         """
         ordered = list(
             dict.fromkeys(tuple(sorted(terms)) for terms in closure_sets)
@@ -2308,15 +3677,12 @@ class CertSCRPipeline:
 
         if (
             str(self.config.solver_device).startswith("cpu")
-            or self.occurrence_likelihood == "first_event_cloglog"
+            and self.occurrence_likelihood == "poisson"
         ):
             # On the audited IBM grouped designs, host scalar solves are faster
-            # end-to-end than tensor padding (13 nulls: 1.83s vs 2.10s), even
-            # though the batched Newton kernel alone is faster.  Do not pass the
-            # preceding W fit positionally: its closure columns denote different
-            # W-specific functions and that arbitrary warm start caused 9/13
-            # false nonconvergences.  ``fit_model`` may still use an exactly
-            # mapped cached subset closure by term identity.
+            # end-to-end than tensor padding. Do not pass the preceding W fit
+            # positionally: its closure columns denote different W-specific
+            # functions.
             for terms in missing:
                 self.fit_model((), terms)
             with self._diagnostic_guard:
@@ -2331,14 +3697,12 @@ class CertSCRPipeline:
             nuisance = self.sparse_nuisance_blocks(self.splits.fit, terms)
             controls.append(nuisance)
             prepared.append(
-                prepare_fixed_support_design(
+                self.prepare_partitioned_support_design(
                     self.splits.fit,
-                    nuisance,
+                    terms,
                     [],
                     [],
                     cluster_weights=self.fit_cluster_weights,
-                    sequence_exposures=self.sequence_exposures(self.splits.fit),
-                    occurrence_likelihood=self.occurrence_likelihood,
                 )
             )
 
@@ -2371,8 +3735,8 @@ class CertSCRPipeline:
             for index, intensity_fit in zip(indices, batch_fits, strict=True):
                 terms = missing[index]
                 fit = self._attach_mark_head(intensity_fit, self.splits.fit)
-                self._fit_cache[((), terms)] = fit
                 with self._fit_key_locks_guard:
+                    self._fit_cache[((), terms)] = fit
                     self._null_fit_cache[terms] = fit
 
     def fit_frozen_support_on_context(
@@ -2385,10 +3749,21 @@ class CertSCRPipeline:
         """Refit a frozen support without reopening discovery or certification."""
         rules = tuple(sorted(rules))
         closure_terms = self.hierarchy_closure(rules)
+        prepared = self.prepare_partitioned_support_design(
+            ctx,
+            closure_terms,
+            self.sparse_features(ctx, rules),
+            rules,
+            cluster_weights=(
+                self.fit_cluster_weights
+                if ctx.name == self.splits.fit.name
+                else None
+            ),
+        )
         fit = fit_fixed_support(
             ctx,
-            self.sparse_nuisance_blocks(ctx, closure_terms),
-            self.sparse_features(ctx, rules),
+            (),
+            (),
             rules,
             device=self.config.solver_device,
             dtype=self.config.solver_dtype,
@@ -2396,8 +3771,13 @@ class CertSCRPipeline:
             tolerance=self.config.solver_tolerance,
             initial=initial,
             closure_terms=closure_terms,
-            cluster_weights=None,
+            cluster_weights=(
+                self.fit_cluster_weights
+                if ctx.name == self.splits.fit.name
+                else None
+            ),
             sequence_exposures=self.sequence_exposures(ctx),
+            prepared_design=prepared,
             occurrence_likelihood=self.occurrence_likelihood,
         )
         return self._attach_mark_head(fit, ctx)
@@ -2496,10 +3876,47 @@ class CertSCRPipeline:
         )
         return amplitude > numeric
 
-    def profile_rule_identities(self) -> list[RuleIdentity]:
+    def profile_rule_identities(
+        self,
+        *,
+        antecedent_subset: Sequence[tuple[int, ...]] | None = None,
+    ) -> list[RuleIdentity]:
+        """Profile every finite W/sign identity for the requested skeletons.
+
+        ``antecedent_subset`` restricts only the antecedent skeleton population.
+        It does not seed or freeze a W/sign identity: every finite window and
+        both signs for each retained skeleton still enter the ordinary exact
+        profile below.  This distinction is required by the multi-fidelity
+        screen, whose sampled/IPW stage may reject skeletons but may not choose
+        the identity that is later fitted on complete D_fit.
+        """
         baseline = self.fit_baseline()
+        # Build the candidate-invariant control/age row partition once in the
+        # parent. POSIX workers inherit it copy-on-write, so no child rescans
+        # the full risk grid merely to reconstruct the same nuisance patterns.
+        self.fixed_nuisance_partition(self.splits.fit)
         fit_seq = self.splits.fit.global_sequence_ids
-        antecedents = self.engine.antecedents(self.rule_source_ids, self.config.q_max)
+        complete_antecedents = self.engine.antecedents(
+            self.rule_source_ids, self.config.q_max
+        )
+        if antecedent_subset is None:
+            antecedents = complete_antecedents
+        else:
+            complete_set = set(complete_antecedents)
+            requested = {tuple(int(value) for value in item) for item in antecedent_subset}
+            invalid = requested - complete_set
+            if invalid:
+                raise ValueError(
+                    "antecedent subset contains skeletons outside the finite family: "
+                    + ", ".join(str(item) for item in sorted(invalid))
+                )
+            # Retain the canonical finite-family order so sequential and forked
+            # execution have identical tie-breaking and reporting order.
+            antecedents = [
+                antecedent
+                for antecedent in complete_antecedents
+                if antecedent in requested
+            ]
         candidate_rules: list[RuleIdentity] = []
         logs: list[dict] = []
 
@@ -2517,10 +3934,59 @@ class CertSCRPipeline:
                 return [], (), {"antecedent": list(antecedent), "status": "no_fit_completion"}
             if pipeline.config.identity_profile in {"score_mdl", "dictionary_mdl"}:
                 dictionary_mode = pipeline.config.identity_profile == "dictionary_mdl"
+                minimum_event_span = pipeline.engine.minimum_event_activating_span(
+                    pipeline.splits.fit,
+                    antecedent,
+                    max_window=int(windows[-1]),
+                )
+                if minimum_event_span is None:
+                    identities = tuple(
+                        RuleIdentity(antecedent, int(window), sign)
+                        for window in windows.tolist()
+                        for sign in (-1, 1)
+                    )
+                    with pipeline._diagnostic_guard:
+                        pipeline._safe_screen_stats[
+                            "identity_no_event_activation_screens"
+                        ] += len(identities)
+                    return [], identities, {
+                        "antecedent": list(antecedent),
+                        "antecedent_names": [
+                            pipeline.data.predicate_names[idx]
+                            for idx in antecedent
+                        ],
+                        "status": "structurally_excluded_no_event_activation",
+                        "candidate_count": len(identities),
+                        "minimum_event_activating_span": None,
+                        "candidates": [
+                            {
+                                "window": int(rule.window),
+                                "sign": int(rule.sign),
+                                "joint_occurrence_mark_quadratic_gain": 0.0,
+                                "dictionary_shape_index": None,
+                                "exact_fit_status": (
+                                    "zero_boundary_certified_no_event_activation"
+                                    if rule.sign > 0
+                                    else "rejected_nonattained_no_event_activation"
+                                ),
+                            }
+                            for rule in identities
+                        ],
+                    }
+                fused_dictionary_designs = bool(
+                    dictionary_mode
+                    and not pipeline.config.gradient_pricing_only
+                    and not pipeline.marked
+                    and not pipeline.config.safe_mdl_screen
+                )
                 scored: list[tuple[float, RuleIdentity, FitResult, int | None]] = []
                 candidate_log: list[dict] = []
                 identities: list[RuleIdentity] = []
-                if not pipeline.config.gradient_pricing_only:
+                prefitted_records: dict[RuleIdentity, SupportRecord] = {}
+                if (
+                    not pipeline.config.gradient_pricing_only
+                    and not fused_dictionary_designs
+                ):
                     # All W values remain in the finite identity family.  Only
                     # their equal-width hierarchy nulls are solved together;
                     # each is still independently certified at the configured
@@ -2548,8 +4014,53 @@ class CertSCRPipeline:
                     antecedent,
                     windows.tolist(),
                 )
+                previous_full_partition: IncrementalSupportPartition | None = None
+                previous_partition_window: int | None = None
+                previous_profile_null: FitResult | None = None
                 for window, sparse_response in response_iterator:
+                    window_candidates: list[tuple[RuleIdentity, dict]] = []
                     probe = RuleIdentity(antecedent=antecedent, window=int(window), sign=1)
+                    # A nonnegative activation that is zero at every observed
+                    # target event cannot own a finite nonzero rule optimum.
+                    # Excitation has an everywhere nonnegative objective
+                    # derivative and is minimized at amplitude zero; inhibition
+                    # either has the same zero solution (no grid activation) or
+                    # a nonattained recession direction.  This is an exact
+                    # structural likelihood certificate, independent of the
+                    # nuisance coefficients, and avoids constructing its dense
+                    # hierarchy design.
+                    if not np.any(sparse_response.event_values != 0.0):
+                        for sign in (-1, 1):
+                            rule = RuleIdentity(
+                                antecedent=antecedent,
+                                window=int(window),
+                                sign=sign,
+                            )
+                            identities.append(rule)
+                            candidate_log.append(
+                                {
+                                    "window": int(window),
+                                    "sign": int(sign),
+                                    "joint_occurrence_mark_quadratic_gain": 0.0,
+                                    "dictionary_shape_index": None,
+                                    "null_boundary_projected_kkt": 0.0,
+                                    "null_boundary_kkt_certified": sign > 0,
+                                    "exact_fit_status": (
+                                        "zero_boundary_certified_no_event_activation"
+                                        if sign > 0
+                                        else "rejected_nonattained_no_event_activation"
+                                    ),
+                                    "exact_nll": None,
+                                    "exact_block_mdl": None,
+                                    "exact_converged": False,
+                                }
+                            )
+                        with pipeline._diagnostic_guard:
+                            pipeline._safe_screen_stats[
+                                "identity_no_event_activation_screens"
+                            ] += 2
+                        continue
+                    full_m_parent: PreparedFixedSupportDesign | None = None
                     if pipeline.config.gradient_pricing_only:
                         # Sampled pricing is a deliberately inclusive gradient
                         # screen.  Re-fitting a different hierarchical null for
@@ -2562,13 +4073,154 @@ class CertSCRPipeline:
                         closure_baseline = baseline
                     else:
                         closure_terms = pipeline.hierarchy_closure((probe,))
-                        closure_baseline = pipeline.fit_model((), closure_terms)
+                        null_key = ((), closure_terms)
+                        if (
+                            fused_dictionary_designs
+                            and null_key not in pipeline._fit_cache
+                        ):
+                            if (
+                                previous_full_partition is not None
+                                and previous_partition_window is not None
+                            ):
+                                delta_controls = [
+                                    pipeline.engine.sparse_window_delta_response(
+                                        pipeline.splits.fit,
+                                        closure_antecedent,
+                                        previous_partition_window,
+                                        int(window),
+                                    )
+                                    for closure_antecedent, _closure_window in closure_terms
+                                ]
+                                delta_rule = (
+                                    pipeline.engine.sparse_window_delta_response(
+                                        pipeline.splits.fit,
+                                        antecedent,
+                                        previous_partition_window,
+                                        int(window),
+                                    )
+                                )
+                                try:
+                                    previous_full_partition = (
+                                        update_incremental_support_partition(
+                                            pipeline.splits.fit,
+                                            previous_full_partition,
+                                            delta_controls,
+                                            (delta_rule,),
+                                            (probe,),
+                                            cluster_weights=pipeline.fit_cluster_weights,
+                                            occurrence_likelihood=(
+                                                pipeline.occurrence_likelihood
+                                            ),
+                                        )
+                                    )
+                                except RuntimeError:
+                                    # The native incremental partition is only
+                                    # an accelerator. Repeated IPW regrouping
+                                    # can accumulate a tiny mass-roundoff
+                                    # history that is not recoverable from the
+                                    # compressed parent alone. Rebuild this W
+                                    # from its cumulative sparse responses;
+                                    # this is the same canonical design used
+                                    # by a cold exact fit, not an approximation.
+                                    rebuilt = (
+                                        pipeline.prepare_partitioned_support_design(
+                                            pipeline.splits.fit,
+                                            closure_terms,
+                                            [sparse_response],
+                                            [probe],
+                                            cluster_weights=(
+                                                pipeline.fit_cluster_weights
+                                            ),
+                                            return_partition=True,
+                                        )
+                                    )
+                                    if not isinstance(
+                                        rebuilt, IncrementalSupportPartition
+                                    ):
+                                        raise RuntimeError(
+                                            "exact incremental fallback did not retain its partition"
+                                        )
+                                    previous_full_partition = rebuilt
+                                    with pipeline._diagnostic_guard:
+                                        pipeline._safe_screen_stats[
+                                            "identity_incremental_partition_rebuilds"
+                                        ] += 1
+                            else:
+                                initial_partition = (
+                                    pipeline.prepare_partitioned_support_design(
+                                        pipeline.splits.fit,
+                                        closure_terms,
+                                        [sparse_response],
+                                        [probe],
+                                        cluster_weights=pipeline.fit_cluster_weights,
+                                        return_partition=True,
+                                    )
+                                )
+                                if not isinstance(
+                                    initial_partition, IncrementalSupportPartition
+                                ):
+                                    raise RuntimeError(
+                                        "incremental identity partition was not retained"
+                                    )
+                                previous_full_partition = initial_partition
+                            previous_partition_window = int(window)
+                            full_m_parent = previous_full_partition.prepared
+                            pipeline._prepared_design_cache[null_key] = (
+                                project_prepared_support_design(
+                                    full_m_parent,
+                                    (),
+                                    source_closure_terms=closure_terms,
+                                    target_closure_terms=closure_terms,
+                                    # The full-M groups are a finer exact null
+                                    # partition. Re-hashing removed at most 2%
+                                    # of Freddie rows but cost another complete
+                                    # pass. Project directly into the solver's
+                                    # float64 dtype and retain the finer masses.
+                                    regroup=False,
+                                    output_dtype=(
+                                        np.float64
+                                        if str(
+                                            pipeline.config.solver_device
+                                        ).startswith("cpu")
+                                        and pipeline.config.solver_dtype == "float64"
+                                        else None
+                                    ),
+                                )
+                            )
+                        null_initial = (
+                            replace(
+                                previous_profile_null,
+                                closure_terms=closure_terms,
+                                mark_fit=None,
+                                solver_hessian=None,
+                            )
+                            if previous_profile_null is not None
+                            else None
+                        )
+                        closure_baseline = pipeline.fit_model(
+                            (), closure_terms, initial=null_initial
+                        )
+                        if null_initial is not None:
+                            with pipeline._diagnostic_guard:
+                                pipeline._safe_screen_stats[
+                                    "profile_window_null_warm_starts"
+                                ] += 1
+                        if closure_baseline.converged:
+                            previous_profile_null = closure_baseline
                     if not closure_baseline.converged:
                         continue
-                    gradient, information = pipeline._identity_moments_at_null(
-                        closure_baseline,
-                        sparse_response,
-                    )
+                    if full_m_parent is not None:
+                        gradient, information = (
+                            pipeline._identity_moments_from_grouped_parent(
+                                closure_baseline,
+                                full_m_parent,
+                            )
+                        )
+                    else:
+                        gradient, information = pipeline._identity_moments_at_null(
+                            closure_baseline,
+                            sparse_response,
+                        )
                     mark_gradient = None
                     mark_information = None
                     if pipeline.marked and dictionary_mode:
@@ -2644,8 +4296,7 @@ class CertSCRPipeline:
                                 int(shape_index)
                             ].copy()
                         scored.append((score, rule, closure_baseline, shape_index))
-                        candidate_log.append(
-                            {
+                        row = {
                                 "window": int(window),
                                 "sign": int(sign),
                                 "joint_occurrence_mark_quadratic_gain": float(score),
@@ -2658,7 +4309,40 @@ class CertSCRPipeline:
                                 ),
                                 "closure_baseline_nll": float(closure_baseline.nll),
                             }
-                        )
+                        candidate_log.append(row)
+                        window_candidates.append((rule, row))
+                    # On the unmarked exact-enumeration path, consume the
+                    # cumulative W response before advancing the iterator.
+                    # Previously it was discarded here and rebuilt once per
+                    # sign during the later exact-fit tournament.
+                    if (
+                        not pipeline.config.gradient_pricing_only
+                        and not pipeline.marked
+                        and not pipeline.config.safe_mdl_screen
+                    ):
+                        live_rules = [
+                            rule
+                            for rule, row in window_candidates
+                            if not bool(
+                                row.get("null_boundary_kkt_certified", False)
+                            )
+                        ]
+                        if live_rules:
+                            pipeline._stage_profile_window_designs(
+                                live_rules,
+                                sparse_response,
+                                full_m_parent=full_m_parent,
+                            )
+                            if not pipeline.config.safe_mdl_screen:
+                                for rule in live_rules:
+                                    prefitted_records[rule] = pipeline._support_record(
+                                        (rule,),
+                                        profile="finite-identity-exact-mdl-profile",
+                                    )
+                                with pipeline._diagnostic_guard:
+                                    pipeline._safe_screen_stats[
+                                        "identity_fused_profile_exact_fits"
+                                    ] += len(live_rules)
                 if not scored:
                     return [], tuple(sorted(identities)), {
                         "antecedent": list(antecedent),
@@ -2784,6 +4468,7 @@ class CertSCRPipeline:
                         continue
                     if (
                         not pipeline.config.safe_mdl_screen
+                        and candidate not in prefitted_records
                         and staged_window != int(candidate.window)
                     ):
                         staged_window = int(candidate.window)
@@ -2797,20 +4482,14 @@ class CertSCRPipeline:
                             closure_terms = pipeline.hierarchy_closure(
                                 (parent_rules[0],)
                             )
-                            parent_prepared = prepare_fixed_support_design(
+                            parent_prepared = pipeline.prepare_partitioned_support_design(
                                 pipeline.splits.fit,
-                                pipeline.sparse_nuisance_blocks(
-                                    pipeline.splits.fit, closure_terms
-                                ),
+                                closure_terms,
                                 pipeline.sparse_features(
                                     pipeline.splits.fit, parent_rules
                                 ),
                                 parent_rules,
                                 cluster_weights=pipeline.fit_cluster_weights,
-                                sequence_exposures=pipeline.sequence_exposures(
-                                    pipeline.splits.fit
-                                ),
-                                occurrence_likelihood=pipeline.occurrence_likelihood,
                             )
                             for child in parent_rules:
                                 pipeline._prepared_design_cache[
@@ -2863,10 +4542,12 @@ class CertSCRPipeline:
                         )
                         safely_eliminated_count += 1
                         continue
-                    candidate_record = pipeline._support_record(
-                        (candidate,),
-                        profile="finite-identity-exact-mdl-profile",
-                    )
+                    candidate_record = prefitted_records.get(candidate)
+                    if candidate_record is None:
+                        candidate_record = pipeline._support_record(
+                            (candidate,),
+                            profile="finite-identity-exact-mdl-profile",
+                        )
                     candidate_score = pipeline._support_search_score(candidate_record)
                     exact_fit_count += 1
                     row["exact_fit_status"] = "fitted"
@@ -3035,18 +4716,29 @@ class CertSCRPipeline:
                 "candidates": candidate_log,
             }
 
+        # Share immutable event/response caches by default.  One-process-per-
+        # antecedent duplicated allocator arenas and was observed to terminate
+        # without a result under the full Freddie workload.  Native completion
+        # and NumPy/MKL kernels release the GIL, so long-lived CPU thread
+        # workers retain parallel compiled execution without that replication.
+        # The process implementation remains an explicit exact fallback.
         fork_process_count = (
             int(self.config.solver_workers)
-            if os.name == "posix"
+            if os.environ.get("CERTSCR_PROCESS_PROFILE", "0") == "1"
+            and os.name == "posix"
             and not self.config.support_devices
             and str(self.config.solver_device).startswith("cpu")
             and int(self.config.solver_workers) > 1
             else 0
         )
+        # Count every primitive column in one contiguous pass.  Scanning one
+        # strided column per predicate reread the complete event matrix up to
+        # 12--15 times merely to obtain an outcome-blind LPT scheduling key.
+        primitive_event_counts = np.count_nonzero(
+            self.data.predicates, axis=0
+        )
         source_event_counts = {
-            int(source_id): int(
-                np.count_nonzero(self.data.predicates[:, int(source_id)])
-            )
+            int(source_id): int(primitive_event_counts[int(source_id)])
             for source_id in self.rule_source_ids
             if int(source_id) < self.data.n_predicates
         }
@@ -3102,7 +4794,6 @@ class CertSCRPipeline:
                 # shares immutable data arrays copy-on-write while independent
                 # processes evaluate the exact same complete skeleton family.
                 context = mp.get_context("fork")
-                task_queue = context.Queue()
                 result_queue = context.Queue()
 
                 process_count = min(fork_process_count, len(batch))
@@ -3115,7 +4806,7 @@ class CertSCRPipeline:
                     int(self.config.feature_cache_bytes) // process_count
                 )
 
-                def process_worker() -> None:
+                def process_worker(antecedent: tuple[int, ...]) -> None:
                     setter = _mkl_local_thread_setter()
                     if setter is not None:
                         setter(1)
@@ -3133,90 +4824,92 @@ class CertSCRPipeline:
                     # cap independently. Cache eviction changes recomputation
                     # only; response values and the finite family are exact.
                     worker.engine._feature_cache_limit = per_worker_feature_cache
-                    while True:
-                        antecedent = task_queue.get()
-                        if antecedent is None:
-                            return
-                        try:
-                            profile_started = time.perf_counter()
-                            selected_rules, identities, log = profile_one(
-                                worker, antecedent
+                    try:
+                        diagnostic_before = dict(worker._safe_screen_stats)
+                        profile_started = time.perf_counter()
+                        selected_rules, identities, log = profile_one(
+                            worker, antecedent
+                        )
+                        log["profile_seconds"] = time.perf_counter() - profile_started
+                        result = selected_rules, identities, log
+                        if evict_worker_fit_features_after_each:
+                            worker.engine.retain_antecedent_windows(
+                                worker.splits.fit.name, antecedent, ()
                             )
-                            log["profile_seconds"] = (
-                                time.perf_counter() - profile_started
+                        # Publish only reportable fits.  The process exits after
+                        # this antecedent, releasing every rejected-W design and
+                        # convolution regardless of allocator behaviour.
+                        candidate_fit_keys = [
+                            ((rule,), worker.hierarchy_closure((rule,)))
+                            for rule in selected_rules
+                        ]
+                        fit_updates = {
+                            key: worker._fit_cache[key]
+                            for key in candidate_fit_keys
+                            if key in worker._fit_cache
+                        }
+                        candidate_null_keys = {
+                            worker.hierarchy_closure((rule,))
+                            for rule in identities
+                        }
+                        null_updates = {
+                            key: worker._null_fit_cache[key]
+                            for key in candidate_null_keys
+                            if key in worker._null_fit_cache
+                        }
+                        diagnostic_updates = {
+                            key: int(value) - int(diagnostic_before.get(key, 0))
+                            for key, value in worker._safe_screen_stats.items()
+                            if int(value) != int(diagnostic_before.get(key, 0))
+                        }
+                        result_queue.put(
+                            (
+                                True,
+                                antecedent,
+                                result,
+                                fit_updates,
+                                null_updates,
+                                diagnostic_updates,
+                                None,
                             )
-                            result = selected_rules, identities, log
-                            if evict_worker_fit_features_after_each:
-                                worker.engine.retain_antecedent_windows(
-                                    worker.splits.fit.name,
-                                    antecedent,
-                                    (),
-                                )
-                            # A profile can only publish its selected singleton
-                            # and the hierarchy nulls needed to reproduce later
-                            # local identity fits. Rejected singleton fits are
-                            # dead after their exact scores have been logged;
-                            # serializing all of them through multiprocessing
-                            # wastes memory/IPC without saving a reportable fit.
-                            candidate_fit_keys = [
-                                ((rule,), worker.hierarchy_closure((rule,)))
-                                for rule in selected_rules
-                            ]
-                            fit_updates = {
-                                key: worker._fit_cache[key]
-                                for key in candidate_fit_keys
-                                if key in worker._fit_cache
-                            }
-                            candidate_null_keys = {
-                                worker.hierarchy_closure((rule,))
-                                for rule in identities
-                            }
-                            null_updates = {
-                                key: worker._null_fit_cache[key]
-                                for key in candidate_null_keys
-                                if key in worker._null_fit_cache
-                            }
-                            selected_fit_key_set = set(candidate_fit_keys)
-                            for rule in identities:
-                                key = ((rule,), worker.hierarchy_closure((rule,)))
-                                if key not in selected_fit_key_set:
-                                    worker._fit_cache.pop(key, None)
-                                    worker._safe_bound_cache.pop((rule,), None)
-                                    worker._safe_screened_records.pop((rule,), None)
-                                    worker.rule_dictionary_shapes.pop(rule, None)
-                            result_queue.put(
-                                (
-                                    True,
-                                    antecedent,
-                                    result,
-                                    fit_updates,
-                                    null_updates,
-                                    None,
-                                )
+                        )
+                    except BaseException:
+                        result_queue.put(
+                            (
+                                False,
+                                antecedent,
+                                None,
+                                None,
+                                None,
+                                None,
+                                traceback.format_exc(),
                             )
-                        except BaseException:
-                            result_queue.put(
-                                (
-                                    False,
-                                    antecedent,
-                                    None,
-                                    None,
-                                    None,
-                                    traceback.format_exc(),
-                                )
-                            )
+                        )
 
-                processes = [
-                    context.Process(target=process_worker)
-                    for _ in range(process_count)
-                ]
-                for process in processes:
+                # One antecedent per child is deliberate: long-lived workers
+                # retained allocator arenas and response graphs across many
+                # triplets, so 24 nominally bounded caches still exhausted the
+                # 125-GiB host.  A rolling one-shot pool keeps identical LPT task
+                # order and exact fits while making peak memory independent of
+                # the number of completed skeletons.
+                pending = iter(batch)
+                active: dict[tuple[int, ...], mp.Process] = {}
+
+                def launch_next() -> bool:
+                    try:
+                        antecedent = next(pending)
+                    except StopIteration:
+                        return False
+                    process = context.Process(
+                        target=process_worker, args=(antecedent,)
+                    )
                     process.start()
-                for antecedent in batch:
-                    task_queue.put(antecedent)
-                for _process in processes:
-                    task_queue.put(None)
-                first_error: str | None = None
+                    active[antecedent] = process
+                    return True
+
+                for _ in range(process_count):
+                    if not launch_next():
+                        break
                 received = 0
                 while received < len(batch):
                     try:
@@ -3226,17 +4919,37 @@ class CertSCRPipeline:
                             result,
                             fit_updates,
                             null_updates,
+                            diagnostic_updates,
                             error,
                         ) = result_queue.get(
                             timeout=5.0
                         )
                     except queue.Empty:
-                        if any(process.is_alive() for process in processes):
-                            continue
-                        raise RuntimeError(
-                            "forked identity workers exited before returning all results"
-                        )
+                        failed = [
+                            (antecedent, process.exitcode)
+                            for antecedent, process in active.items()
+                            if not process.is_alive() and process.exitcode not in {0, None}
+                        ]
+                        if failed:
+                            raise RuntimeError(
+                                "forked identity worker exited before returning a result: "
+                                + ", ".join(
+                                    f"{antecedent} (exit {code})"
+                                    for antecedent, code in failed
+                                )
+                            )
+                        continue
                     received += 1
+                    process = active.pop(antecedent, None)
+                    if process is None:
+                        raise RuntimeError(
+                            f"identity worker returned an unknown task {antecedent}"
+                        )
+                    process.join()
+                    if process.exitcode not in {0, None} and ok:
+                        raise RuntimeError(
+                            f"identity worker {antecedent} exited with code {process.exitcode}"
+                        )
                     if ok:
                         assert result is not None
                         results_by_antecedent[antecedent] = result
@@ -3244,25 +4957,31 @@ class CertSCRPipeline:
                             fit_updates or {},
                             null_updates or {},
                         )
-                    elif first_error is None:
-                        first_error = str(error)
-                for process in processes:
+                        if diagnostic_updates:
+                            with self._diagnostic_guard:
+                                for key, delta in diagnostic_updates.items():
+                                    self._safe_screen_stats[key] = int(
+                                        self._safe_screen_stats.get(key, 0)
+                                    ) + int(delta)
+                    else:
+                        # The batch result is unusable after one exact worker
+                        # fails. Do not launch and wait for the remaining
+                        # hundreds of skeletons only to raise the saved error
+                        # at the end of the batch.
+                        for outstanding in active.values():
+                            if outstanding.is_alive():
+                                outstanding.terminate()
+                        for outstanding in active.values():
+                            outstanding.join()
+                        result_queue.close()
+                        raise RuntimeError(
+                            "forked identity profiling failed:\n"
+                            f"antecedent={antecedent}:\n{error}"
+                        )
+                    launch_next()
+                for process in active.values():
                     process.join()
-                task_queue.close()
                 result_queue.close()
-                if first_error is not None:
-                    raise RuntimeError(
-                        "forked identity profiling failed:\n" + first_error
-                    )
-                bad_exit = [
-                    process.exitcode
-                    for process in processes
-                    if process.exitcode not in {0, None}
-                ]
-                if bad_exit:
-                    raise RuntimeError(
-                        f"forked identity workers exited with codes {bad_exit}"
-                    )
                 # POSIX workers fitted the exact singleton and hierarchy-null
                 # models used by the next search stage.  Preserve those small
                 # immutable results instead of discarding them and immediately
@@ -3299,8 +5018,10 @@ class CertSCRPipeline:
                             self, antecedent
                         )
                     return
+                fit_worker_count = self._exact_fit_worker_limit(len(workers))
+                fit_workers = workers[:fit_worker_count]
                 available: queue.SimpleQueue[CertSCRPipeline] = queue.SimpleQueue()
-                for worker in workers:
+                for worker in fit_workers:
                     available.put(worker)
 
                 def profile_task(
@@ -3323,7 +5044,7 @@ class CertSCRPipeline:
                     finally:
                         available.put(worker)
 
-                with ThreadPoolExecutor(max_workers=len(workers)) as fit_executor:
+                with ThreadPoolExecutor(max_workers=fit_worker_count) as fit_executor:
                     futures = [
                         fit_executor.submit(profile_task, antecedent)
                         for antecedent in wave
@@ -3514,6 +5235,30 @@ class CertSCRPipeline:
         for rule in self.profiled_rules:
             canonical_terms.update(self.hierarchy_closure((rule,)))
         self.engine.retain_context_terms(self.splits.fit.name, tuple(canonical_terms))
+        # Persist only the frozen discovery dictionary, never the much larger
+        # pre-profile W/sign population.  Projected one-column rule atoms are
+        # what support search consumes; unrestricted closure blocks retain M
+        # columns.  The mmap store is an exact cache and may decline writes at
+        # its byte cap without changing any subsequent response.
+        if self.config.persistent_response_bytes > 0:
+            for rule in self.profiled_rules:
+                shape = self.rule_dictionary_shapes.get(rule)
+                self.engine.persist_sparse_response(
+                    self.splits.fit,
+                    rule.antecedent,
+                    int(rule.window),
+                    shape=shape,
+                )
+            rule_terms = {
+                (rule.antecedent, int(rule.window))
+                for rule in self.profiled_rules
+            }
+            for antecedent, window in sorted(canonical_terms - rule_terms):
+                self.engine.persist_sparse_response(
+                    self.splits.fit,
+                    antecedent,
+                    int(window),
+                )
         for worker in self._active_support_workers:
             worker.profiled_rules = list(self.profiled_rules)
             worker.identity_candidates = dict(self.identity_candidates)
@@ -3597,15 +5342,22 @@ class CertSCRPipeline:
         nuisance = self.sparse_nuisance_blocks(
             self.splits.fit, closure_terms
         )
-        prepared = prepare_fixed_support_design(
-            self.splits.fit,
-            nuisance,
-            features,
-            rules,
-            cluster_weights=self.fit_cluster_weights,
-            sequence_exposures=self.sequence_exposures(self.splits.fit),
-            occurrence_likelihood=self.occurrence_likelihood,
-        )
+        prepared_key = (rules, closure_terms)
+        # Identity profiling has already assembled this exact child from the
+        # live full-M W parent.  Rebuilding it here made the safe bound more
+        # expensive than the fit it was intended to avoid, so the full runner
+        # had to disable an otherwise exact screen.  Ownership is transferred
+        # out of the stage cache and returned below only when a fit is still
+        # required; no objective row or grouping is changed.
+        prepared = self._prepared_design_cache.pop(prepared_key, None)
+        if prepared is None:
+            prepared = self.prepare_partitioned_support_design(
+                self.splits.fit,
+                closure_terms,
+                features,
+                rules,
+                cluster_weights=self.fit_cluster_weights,
+            )
         occurrence_bound = group_saturated_poisson_lower_bound(
             self.splits.fit,
             nuisance,
@@ -3628,6 +5380,7 @@ class CertSCRPipeline:
                 "reason": "nonfinite_occurrence_lower_bound",
                 "active_grid_rows": occurrence_bound.active_grid_rows,
             }
+            self._prepared_design_cache[prepared_key] = prepared
             self._safe_bound_cache[rules] = result
             return result
         # The null itself is feasible.  Min with its objective protects the
@@ -3651,6 +5404,7 @@ class CertSCRPipeline:
                     "score_upper_bound": math.inf,
                     "reason": "marked_closure_not_initialized",
                 }
+                self._prepared_design_cache[prepared_key] = prepared
                 self._safe_bound_cache[rules] = result
                 return result
             # Independent coefficients for every knot strictly contain the
@@ -3678,6 +5432,7 @@ class CertSCRPipeline:
                     "score_upper_bound": math.inf,
                     "reason": "nonconverged_relaxed_mark_bound",
                 }
+                self._prepared_design_cache[prepared_key] = prepared
                 self._safe_bound_cache[rules] = result
                 return result
             null_mark_nll = float(closure_baseline.mark_fit.nll)
@@ -3718,7 +5473,9 @@ class CertSCRPipeline:
             # Safe screening and the exact solver use the same complete
             # augmented row partition. Reuse it once; fit_model pops the entry
             # so large designs cannot accumulate across the search.
-            self._prepared_design_cache[(rules, closure_terms)] = prepared
+            self._prepared_design_cache[prepared_key] = prepared
+        else:
+            self._prepared_profile_nonoptimal_keys.discard(prepared_key)
         self._safe_bound_cache[rules] = result
         return result
 
@@ -3801,8 +5558,13 @@ class CertSCRPipeline:
                     worker._mark_base_residualizer_cache.update(
                         self._mark_base_residualizer_cache
                     )
-                chunks = [wave[index::len(workers)] for index in range(len(workers))]
-                for worker, chunk in zip(workers, chunks, strict=True):
+                fit_worker_count = self._exact_fit_worker_limit(len(workers))
+                fit_workers = workers[:fit_worker_count]
+                chunks = [
+                    wave[index::fit_worker_count]
+                    for index in range(fit_worker_count)
+                ]
+                for worker, chunk in zip(fit_workers, chunks, strict=True):
                     for rules in chunk:
                         model_key = (rules, self.hierarchy_closure(rules))
                         prepared = self._prepared_design_cache.pop(model_key, None)
@@ -3831,10 +5593,10 @@ class CertSCRPipeline:
                         return output, exact_count
 
                 exact_count = 0
-                with ThreadPoolExecutor(max_workers=len(workers)) as executor:
+                with ThreadPoolExecutor(max_workers=fit_worker_count) as executor:
                     futures = [
                         executor.submit(screen_and_fit_chunk, worker, chunk)
-                        for worker, chunk in zip(workers, chunks, strict=True)
+                        for worker, chunk in zip(fit_workers, chunks, strict=True)
                         if chunk
                     ]
                     for future in futures:
@@ -3929,8 +5691,503 @@ class CertSCRPipeline:
                         neighbors.add(trial)
         return sorted(neighbors)
 
+    def _add_drop_neighbors(
+        self,
+        rules: Sequence[RuleIdentity],
+    ) -> list[tuple[RuleIdentity, ...]]:
+        """Complete one-coordinate neighborhood for column generation.
+
+        A coordinate is either one admitted rule block entering at zero or one
+        active rule block being removed.  No gradient budget is used: every
+        feasible coordinate is present in the terminal exact audit.
+        """
+        current = tuple(sorted(rules))
+        current_set = set(current)
+        current_antecedents = {rule.antecedent for rule in current}
+        neighbors: set[tuple[RuleIdentity, ...]] = set()
+        if len(current) < self._effective_max_support_size():
+            for rule in self.profiled_rules:
+                if rule in current_set or rule.antecedent in current_antecedents:
+                    continue
+                neighbors.add(tuple(sorted((*current, rule))))
+        for index in range(len(current)):
+            neighbors.add(current[:index] + current[index + 1 :])
+        return sorted(neighbors)
+
+    def _support_rule_gradient_prices(
+        self,
+        fit: FitResult,
+        rules: Sequence[RuleIdentity],
+        *,
+        worker_limit: int | None = None,
+    ) -> dict[RuleIdentity, tuple[float, float]]:
+        """Price absent rule blocks at one fitted support in a fused row pass.
+
+        The quadratic gain orders candidates only; exact support likelihood
+        and block-MDL decide every accepted move.  The normalized projected
+        KKT value is also returned for diagnostics.  Computing the fitted
+        predictor once on the union of all candidate rows avoids one complete
+        nuisance/support traversal per rule without changing a response or
+        derivative.
+        """
+        candidates = tuple(sorted(set(rules)))
+        if not candidates:
+            return {}
+        responses = tuple(
+            self.sparse_features(self.splits.fit, (rule,))[0]
+            for rule in candidates
+        )
+        ctx = self.splits.fit
+        event_rows = (
+            np.asarray(ctx.event_grid_rows, dtype=np.int64)
+            if self.occurrence_likelihood == "first_event_cloglog"
+            and ctx.n_events
+            else np.zeros(0, dtype=np.int64)
+        )
+        effective_rows: list[np.ndarray] = []
+        effective_values: list[np.ndarray] = []
+        for response in responses:
+            rows = response.grid_indices
+            values = response.grid_values
+            if len(rows) and len(event_rows):
+                positions = np.searchsorted(event_rows, rows)
+                safe = np.minimum(positions, len(event_rows) - 1)
+                keep = (positions >= len(event_rows)) | (
+                    event_rows[safe] != rows
+                )
+                rows = rows[keep]
+                values = values[keep]
+            effective_rows.append(rows)
+            effective_values.append(values)
+        row_parts = [rows for rows in effective_rows if len(rows)]
+        if not row_parts:
+            union_rows = np.zeros(0, dtype=np.int64)
+        elif len(row_parts) == 1:
+            union_rows = row_parts[0].copy()
+        else:
+            union_rows = sorted_unique_int64_union(
+                row_parts,
+                allow_wide=True,
+            )
+            if union_rows is None:
+                union_rows = np.unique(np.concatenate(row_parts)).astype(
+                    np.int64, copy=False
+                )
+        union_eta = self._eta_on_sparse_grid(fit, ctx, union_rows)
+        sequence_weights = self.fit_cluster_weights
+        with np.errstate(over="ignore", invalid="ignore"):
+            union_mu = (
+                ctx.grid_weights_at(union_rows, assume_valid=True)
+                * sequence_weights[
+                    ctx.grid_sequences_at(
+                        union_rows,
+                        assume_valid=True,
+                        assume_sorted=True,
+                    )
+                ]
+                * np.exp(union_eta)
+            )
+        if np.any(~np.isfinite(union_mu)):
+            raise FloatingPointError(
+                "nonfinite fitted intensity during support pricing"
+            )
+        shared_event_eta = (
+            self._eta_on_events(fit, ctx)
+            if self.occurrence_likelihood == "first_event_cloglog"
+            and ctx.n_events
+            else None
+        )
+        event_weights = sequence_weights[ctx.event_sequence_local]
+        if ctx.n_events:
+            if self.occurrence_likelihood == "poisson":
+                shared_event_gradient_weight = -event_weights
+                shared_event_information_weight = np.zeros(
+                    ctx.n_events, dtype=np.float64
+                )
+            else:
+                assert shared_event_eta is not None
+                (
+                    _event_loss,
+                    event_gradient,
+                    event_hessian,
+                ) = cloglog_event_terms(shared_event_eta)
+                shared_event_gradient_weight = (
+                    event_weights * event_gradient
+                )
+                shared_event_information_weight = (
+                    event_weights * event_hessian
+                )
+        else:
+            shared_event_gradient_weight = np.zeros(0, dtype=np.float64)
+            shared_event_information_weight = np.zeros(0, dtype=np.float64)
+        def price_one(
+            item: tuple[
+                RuleIdentity,
+                SparseKernelResponse,
+                np.ndarray,
+                np.ndarray,
+            ],
+        ) -> tuple[RuleIdentity, tuple[float, float]]:
+            rule, response, rows, grid_block = item
+            if len(rows):
+                positions = np.searchsorted(union_rows, rows)
+                if (
+                    np.any(positions >= len(union_rows))
+                    or not np.array_equal(union_rows[positions], rows)
+                ):
+                    raise AssertionError(
+                        "pricing rows are missing from the shared union"
+                    )
+                row_mu = union_mu[positions]
+            else:
+                row_mu = np.zeros(0, dtype=np.float64)
+            block = grid_block.astype(np.float64, copy=False)
+            gradient = block.T @ row_mu
+            information = block.T @ (row_mu[:, None] * block)
+            if ctx.n_events:
+                event_block = response.event_values.astype(
+                    np.float64, copy=False
+                )
+                gradient += (
+                    event_block.T @ shared_event_gradient_weight
+                )
+                if self.occurrence_likelihood == "first_event_cloglog":
+                    information += event_block.T @ (
+                        shared_event_information_weight[:, None]
+                        * event_block
+                    )
+            information = 0.5 * (
+                information + information.T
+            )
+            signed_gradient = float(rule.sign) * gradient
+            gain = self._cone_quadratic_gain(signed_gradient, information)
+            diagonal = np.diag(information)
+            kkt = float(
+                np.max(
+                    np.maximum(-signed_gradient, 0.0)
+                    / np.sqrt(
+                        np.maximum(diagonal, np.finfo(np.float64).tiny)
+                    ),
+                    initial=0.0,
+                )
+            )
+            return rule, (float(gain), kkt)
+
+        items = tuple(
+            zip(
+                candidates,
+                responses,
+                effective_rows,
+                effective_values,
+                strict=True,
+            )
+        )
+        worker_count = min(
+            len(items),
+            max(
+                1,
+                int(self.config.response_workers)
+                if worker_limit is None
+                else int(worker_limit),
+            ),
+            max(1, int(os.cpu_count() or 1)),
+        )
+        if worker_count <= 1:
+            priced = [price_one(item) for item in items]
+        else:
+            # Candidate blocks are independent read-only reductions over the
+            # shared fitted intensity. NumPy releases the GIL in the matrix
+            # products, so threads occupy otherwise idle cores without
+            # changing accumulation order inside any individual rule.
+            with ThreadPoolExecutor(max_workers=worker_count) as executor:
+                priced = list(executor.map(price_one, items))
+        return dict(priced)
+
+    def _support_rule_gradient_prices_batch(
+        self,
+        items: Sequence[
+            tuple[FitResult, Sequence[RuleIdentity]]
+        ],
+    ) -> list[dict[RuleIdentity, tuple[float, float]]]:
+        """Price several support states in one exact response traversal.
+
+        All states use the same frozen D_fit rows and rule dictionary.  The
+        scalar implementation rebuilt the union row set and reread every rule
+        block once per atom start.  Here predictors form columns of one small
+        matrix and each sparse rule block multiplies all state residuals at
+        once.  Each state's gradient and Fisher matrix are algebraically the
+        same reductions as :meth:`_support_rule_gradient_prices`; only their
+        scheduling is fused.  Callers bound the state batch, so peak memory is
+        no larger than the former concurrent scalar tasks.
+        """
+        normalized = [
+            (fit, tuple(sorted(set(rules)))) for fit, rules in items
+        ]
+        if not normalized:
+            return []
+        if len(normalized) == 1:
+            fit, rules = normalized[0]
+            return [
+                self._support_rule_gradient_prices(
+                    fit, rules, worker_limit=1
+                )
+            ]
+        all_rules = tuple(
+            sorted(
+                {
+                    rule
+                    for _fit, rules in normalized
+                    for rule in rules
+                }
+            )
+        )
+        if not all_rules:
+            return [{} for _fit, _rules in normalized]
+        response_by_rule = {
+            rule: self.sparse_features(self.splits.fit, (rule,))[0]
+            for rule in all_rules
+        }
+        ctx = self.splits.fit
+        event_rows = (
+            np.asarray(ctx.event_grid_rows, dtype=np.int64)
+            if self.occurrence_likelihood == "first_event_cloglog"
+            and ctx.n_events
+            else np.zeros(0, dtype=np.int64)
+        )
+        effective: dict[RuleIdentity, tuple[np.ndarray, np.ndarray]] = {}
+        row_parts: list[np.ndarray] = []
+        for rule in all_rules:
+            response = response_by_rule[rule]
+            rows = response.grid_indices
+            values = response.grid_values
+            if len(rows) and len(event_rows):
+                positions = np.searchsorted(event_rows, rows)
+                safe = np.minimum(positions, len(event_rows) - 1)
+                keep = (positions >= len(event_rows)) | (
+                    event_rows[safe] != rows
+                )
+                rows = rows[keep]
+                values = values[keep]
+            effective[rule] = (rows, values)
+            if len(rows):
+                row_parts.append(rows)
+        cached_union = self._support_pricing_union_cache
+        if cached_union is not None and cached_union[0] == all_rules:
+            union_rows = cached_union[1]
+        else:
+            if not row_parts:
+                union_rows = np.zeros(0, dtype=np.int64)
+            elif len(row_parts) == 1:
+                union_rows = row_parts[0].copy()
+            else:
+                union_rows = sorted_unique_int64_union(
+                    row_parts, allow_wide=True
+                )
+                if union_rows is None:
+                    union_rows = np.unique(np.concatenate(row_parts)).astype(
+                        np.int64, copy=False
+                    )
+            self._support_pricing_union_cache = (
+                all_rules,
+                np.ascontiguousarray(union_rows, dtype=np.int64),
+            )
+            union_rows = self._support_pricing_union_cache[1]
+        state_count = len(normalized)
+        union_mu = np.empty(
+            (state_count, len(union_rows)), dtype=np.float64
+        )
+        sequence_weights = self.fit_cluster_weights
+        exposure = ctx.grid_weights_at(union_rows, assume_valid=True)
+        exposure = exposure * sequence_weights[
+            ctx.grid_sequences_at(
+                union_rows,
+                assume_valid=True,
+                assume_sorted=True,
+            )
+        ]
+        def populate_union_mu(
+            item: tuple[int, tuple[FitResult, tuple[RuleIdentity, ...]]],
+        ) -> None:
+            state, (fit, _rules) = item
+            eta = self._eta_on_sparse_grid(fit, ctx, union_rows)
+            with np.errstate(over="ignore", invalid="ignore"):
+                # Reuse the state-local eta buffer.  ``np.exp(eta)`` followed by
+                # multiplication formerly allocated two additional union-sized
+                # float64 arrays per pricing thread.  The operation order and
+                # dtype are unchanged; only temporary ownership differs.
+                np.exp(eta, out=eta)
+                np.multiply(eta, exposure, out=eta)
+            union_mu[state] = eta
+
+        eta_workers = min(
+            state_count,
+            max(1, int(self.config.response_workers)),
+            max(1, int(os.cpu_count() or 1)),
+        )
+        indexed_states = tuple(enumerate(normalized))
+        if eta_workers <= 1:
+            for item in indexed_states:
+                populate_union_mu(item)
+        else:
+            # Every column is a frozen, independent fitted state. Threads write
+            # disjoint rows of the state-major output and each predictor keeps
+            # its original sparse-row accumulation order.
+            with ThreadPoolExecutor(max_workers=eta_workers) as executor:
+                list(executor.map(populate_union_mu, indexed_states))
+        if np.any(~np.isfinite(union_mu)):
+            raise FloatingPointError(
+                "nonfinite fitted intensity during batched support pricing"
+            )
+
+        event_weights = sequence_weights[ctx.event_sequence_local]
+        event_first = np.zeros(
+            (state_count, ctx.n_events), dtype=np.float64
+        )
+        event_second = np.zeros_like(event_first)
+        if ctx.n_events:
+            if self.occurrence_likelihood == "poisson":
+                event_first[:] = -event_weights[None, :]
+            else:
+                def populate_event_terms(
+                    item: tuple[
+                        int,
+                        tuple[FitResult, tuple[RuleIdentity, ...]],
+                    ],
+                ) -> None:
+                    state, (fit, _rules) = item
+                    eta = self._eta_on_events(fit, ctx)
+                    _loss, first, second = cloglog_event_terms(eta)
+                    event_first[state] = event_weights * first
+                    event_second[state] = event_weights * second
+
+                if eta_workers <= 1:
+                    for item in indexed_states:
+                        populate_event_terms(item)
+                else:
+                    with ThreadPoolExecutor(
+                        max_workers=eta_workers
+                    ) as executor:
+                        list(
+                            executor.map(
+                                populate_event_terms, indexed_states
+                            )
+                        )
+
+        requested = [set(rules) for _fit, rules in normalized]
+        output: list[dict[RuleIdentity, tuple[float, float]]] = [
+            {} for _ in normalized
+        ]
+        for rule in all_rules:
+            response = response_by_rule[rule]
+            rows, raw_block = effective[rule]
+            if len(rows):
+                positions = np.searchsorted(union_rows, rows)
+                if (
+                    np.any(positions >= len(union_rows))
+                    or not np.array_equal(union_rows[positions], rows)
+                ):
+                    raise AssertionError(
+                        "batched pricing rows are missing from their union"
+                    )
+            else:
+                positions = np.zeros(0, dtype=np.int64)
+            width = int(response.shape[1])
+            native_moments = batched_sparse_rule_moments(
+                raw_block,
+                union_mu,
+                response.event_values,
+                event_first,
+                event_second,
+                include_event_second=(
+                    ctx.n_events > 0
+                    and self.occurrence_likelihood
+                    == "first_event_cloglog"
+                ),
+                worker_count=min(
+                    state_count,
+                    max(1, int(self.config.response_workers)),
+                ),
+                grid_weight_positions=(
+                    positions if len(rows) else np.zeros(0, dtype=np.int64)
+                ),
+            )
+            if native_moments is not None:
+                gradient, information_by_state = native_moments
+            else:
+                row_mu = np.take(union_mu, positions, axis=1).T
+                block = raw_block.astype(np.float64, copy=False)
+                if len(rows):
+                    gradient = block.T @ row_mu
+                else:
+                    gradient = np.zeros(
+                        (width, state_count), dtype=np.float64
+                    )
+                event_block = response.event_values.astype(
+                    np.float64, copy=False
+                )
+                if ctx.n_events:
+                    gradient += event_block.T @ event_first.T
+                information_by_state = np.zeros(
+                    (state_count, width, width), dtype=np.float64
+                )
+                for left in range(width):
+                    for right in range(left + 1):
+                        values = (
+                            (block[:, left] * block[:, right]) @ row_mu
+                            if len(rows)
+                            else np.zeros(state_count, dtype=np.float64)
+                        )
+                        if (
+                            ctx.n_events
+                            and self.occurrence_likelihood
+                            == "first_event_cloglog"
+                        ):
+                            values = values + (
+                                event_block[:, left]
+                                * event_block[:, right]
+                            ) @ event_second.T
+                        information_by_state[:, left, right] = values
+                        information_by_state[:, right, left] = values
+            for state in range(state_count):
+                if rule not in requested[state]:
+                    continue
+                information = information_by_state[state]
+                signed_gradient = float(rule.sign) * gradient[:, state]
+                gain = self._cone_quadratic_gain(
+                    signed_gradient, information
+                )
+                diagonal = np.diag(information)
+                kkt = float(
+                    np.max(
+                        np.maximum(-signed_gradient, 0.0)
+                        / np.sqrt(
+                            np.maximum(
+                                diagonal,
+                                np.finfo(np.float64).tiny,
+                            )
+                        ),
+                        initial=0.0,
+                    )
+                )
+                output[state][rule] = (float(gain), kkt)
+        return output
+
     def _search_supports_active_set(self) -> list[SupportRecord]:
-        profile = "multi-start-exact-one-exchange-active-set"
+        score_working_set = (
+            self.config.active_neighbor_strategy == "mdl_score_working_set"
+        )
+        gradient_strategy = self.config.active_neighbor_strategy in {
+            "gradient_first_exact_audit",
+            "mdl_score_working_set",
+        }
+        if score_working_set:
+            profile = "multi-start-mdl-block-score-working-set"
+        elif gradient_strategy:
+            profile = (
+                "multi-start-gradient-first-exact-one-exchange-column-generation"
+            )
+        else:
+            profile = "multi-start-exact-one-exchange-active-set"
         record_cache: dict[tuple[RuleIdentity, ...], SupportRecord] = {}
 
         def record(rules: Sequence[RuleIdentity]) -> SupportRecord:
@@ -3960,6 +6217,18 @@ class CertSCRPipeline:
             for item in singleton_records
             if self._support_search_score(item) > 0.0
         ]
+        search_fitted_dimensions = {
+            int(item.fit.theta.shape[1]) for item in singleton_records
+        }
+        if len(search_fitted_dimensions) > 1:
+            raise ValueError(
+                "active support library mixes fitted kernel dimensions"
+            )
+        search_fitted_dimension = (
+            search_fitted_dimensions.pop()
+            if search_fitted_dimensions
+            else int(self.config.knot_count)
+        )
         starts: list[tuple[RuleIdentity, ...]] = [()]
         if self.config.active_start_policy == "all_atoms":
             # Every admitted atom is a deterministic basin witness.  This has
@@ -3989,43 +6258,1047 @@ class CertSCRPipeline:
         visited: set[tuple[RuleIdentity, ...]] = set()
         terminals: set[tuple[RuleIdentity, ...]] = set()
         runs: list[dict] = []
-        transition_cache: dict[
+        transition_cache: dict[tuple[RuleIdentity, ...], dict] = {}
+        gradient_price_cache: dict[
             tuple[RuleIdentity, ...],
-            tuple[tuple[float, tuple[RuleIdentity, ...]], ...],
+            dict[RuleIdentity, tuple[float, float]],
         ] = {}
         transition_cache_hits = 0
+        priced_state_count = 0
+        priced_rule_count = 0
+        pricing_seconds = 0.0
+        exact_neighbor_requests = 0
+        full_terminal_audits = 0
+        score_terminal_certificates = 0
+        score_screened_add_requests = 0
+        score_admitted_add_requests = 0
+        maximum_terminal_score_surplus = 0.0
+        conditional_bound_evaluations = 0
+        conditional_bound_screens = 0
+        conditional_bound_seconds = 0.0
+        skipped_after_first_improvement = 0
+        speculative_exact_requests_after_first_improvement = 0
+        ordered_lazy_refit_rounds = 0
         tolerance = float(self.config.search_improvement_tolerance)
-        for start in starts:
+        execution_wave_size = max(1, len(self._active_support_workers))
+        # Under all-atom starts, every singleton state receives a complete
+        # exact one-exchange audit.  Consequently the union below (all
+        # singleton and pair supports) is not speculative work: the serial
+        # traversal must fit exactly the same model keys before it can certify
+        # those starts.  Fit the union once as a large closure-aware batch so
+        # the process/thread pool stays occupied and repeated small-batch
+        # startup is removed.  Only scheduling changes; the finite family,
+        # objective, optimizer and subsequent transition decisions are
+        # identical.  Gradient-first deliberately keeps its ordered waves.
+        initial_frontier_fit_count = 0
+        initial_frontier_seconds = 0.0
+        if (
+            not gradient_strategy
+            and self.config.active_start_policy == "all_atoms"
+            and starts
+        ):
+            initial_frontier = sorted(
+                {
+                    trial
+                    for start in starts
+                    for trial in self._one_exchange_neighbors(start)
+                    if trial
+                }
+            )
+            uncached_frontier = [
+                trial for trial in initial_frontier if trial not in record_cache
+            ]
+            frontier_started = time.perf_counter()
+            records(uncached_frontier)
+            initial_frontier_seconds = time.perf_counter() - frontier_started
+            initial_frontier_fit_count = len(uncached_frontier)
+
+        # Traverse all exact best-improvement starts breadth-synchronously.
+        # At a fixed depth, every current state has already been determined by
+        # earlier exact scores, hence its complete neighborhood is mandatory
+        # work.  Taking the union only coalesces those mandatory model keys
+        # into a larger solver batch.  Per-state ranking below is unchanged,
+        # so every path, terminal and one-exchange certificate is the same as
+        # the serial multi-start traversal (up to solver floating tolerance).
+        exact_frontier_rounds = 0
+        exact_frontier_requested_keys = 0
+        exact_frontier_unique_new_keys = 0
+        exact_frontier_fit_seconds = 0.0
+        if not gradient_strategy:
+            run_states: list[dict] = []
+            for start in starts:
+                current = tuple(start)
+                run_states.append(
+                    {
+                        "start": current,
+                        "current": current,
+                        "score": (
+                            0.0
+                            if not current
+                            else self._support_search_score(record(current))
+                        ),
+                        "path": [],
+                        "done": False,
+                    }
+                )
+            run_results: list[dict | None] = [None] * len(run_states)
+            while any(not state["done"] for state in run_states):
+                exact_frontier_rounds += 1
+                current_keys = sorted(
+                    {
+                        tuple(state["current"])
+                        for state in run_states
+                        if not state["done"]
+                        and tuple(state["current"]) not in transition_cache
+                    }
+                )
+                neighborhoods = {
+                    current: self._one_exchange_neighbors(current)
+                    for current in current_keys
+                }
+                requested = [
+                    trial
+                    for current in current_keys
+                    for trial in neighborhoods[current]
+                    if trial
+                ]
+                exact_neighbor_requests += len(requested)
+                exact_frontier_requested_keys += len(requested)
+                new_keys = sorted(
+                    {
+                        trial
+                        for trial in requested
+                        if trial not in record_cache
+                    }
+                )
+                exact_frontier_unique_new_keys += len(new_keys)
+                frontier_fit_started = time.perf_counter()
+                records(new_keys)
+                exact_frontier_fit_seconds += (
+                    time.perf_counter() - frontier_fit_started
+                )
+                for current in current_keys:
+                    current_score = next(
+                        float(state["score"])
+                        for state in run_states
+                        if not state["done"]
+                        and tuple(state["current"]) == current
+                    )
+                    evaluated: list[
+                        tuple[float, tuple[RuleIdentity, ...]]
+                    ] = []
+                    for trial in neighborhoods[current]:
+                        trial_score = (
+                            0.0
+                            if not trial
+                            else self._support_search_score(record_cache[trial])
+                        )
+                        evaluated.append((trial_score, trial))
+                        if trial:
+                            visited.add(trial)
+                    evaluated.sort(key=lambda item: (-item[0], item[1]))
+                    best_score, best_rules = (
+                        evaluated[0]
+                        if evaluated
+                        else (-math.inf, current)
+                    )
+                    finite_gains = [
+                        score - current_score
+                        for score, _trial in evaluated
+                        if math.isfinite(score)
+                        and math.isfinite(current_score)
+                    ]
+                    stationarity_gap = (
+                        max(0.0, max(finite_gains, default=-math.inf))
+                        if math.isfinite(current_score)
+                        else math.inf
+                    )
+                    transition_cache[current] = {
+                        "evaluated": tuple(evaluated),
+                        "best_score": float(best_score),
+                        "best_rules": best_rules,
+                        "stationarity_gap": stationarity_gap,
+                        "full_audit": True,
+                        "neighborhood_count": len(neighborhoods[current]),
+                    }
+
+                claimed_this_round: set[tuple[RuleIdentity, ...]] = set()
+                for run_index, state in enumerate(run_states):
+                    if state["done"]:
+                        continue
+                    current = tuple(state["current"])
+                    current_score = float(state["score"])
+                    if current in claimed_this_round or current not in current_keys:
+                        transition_cache_hits += 1
+                    claimed_this_round.add(current)
+                    transition = transition_cache[current]
+                    best_score = float(transition["best_score"])
+                    best_rules = tuple(transition["best_rules"])
+                    gain = float(best_score - current_score)
+                    improving = bool(
+                        math.isfinite(best_score)
+                        and (
+                            not math.isfinite(current_score)
+                            or gain > tolerance
+                        )
+                    )
+                    if improving:
+                        state["path"].append(
+                            {
+                                "from": [
+                                    self._rule_dict(rule) for rule in current
+                                ],
+                                "to": [
+                                    self._rule_dict(rule) for rule in best_rules
+                                ],
+                                "score_gain": gain,
+                            }
+                        )
+                        state["current"] = best_rules
+                        state["score"] = best_score
+                        continue
+                    if current:
+                        visited.add(current)
+                        terminals.add(current)
+                    stationarity_gap = float(
+                        transition["stationarity_gap"]
+                    )
+                    if not bool(transition["full_audit"]):
+                        raise RuntimeError(
+                            "terminal support is missing its complete exact neighborhood audit"
+                        )
+                    run_results[run_index] = {
+                        "start": [
+                            self._rule_dict(rule) for rule in state["start"]
+                        ],
+                        "terminal": [
+                            self._rule_dict(rule) for rule in current
+                        ],
+                        "terminal_score": (
+                            current_score
+                            if math.isfinite(current_score)
+                            else None
+                        ),
+                        "one_exchange_stationarity_gap": stationarity_gap,
+                        "stationary_within_tolerance": bool(
+                            stationarity_gap <= tolerance
+                        ),
+                        "moves": state["path"],
+                    }
+                    state["done"] = True
+            runs.extend(
+                result for result in run_results if result is not None
+            )
+
+        if gradient_strategy:
+            # Advance every deterministic start concurrently, but expose only
+            # the next gradient-ordered coordinate(s) of each current state.
+            # The previous implementation completed one start at a time and
+            # fitted a full hardware-sized wave for it; with 100 atom starts
+            # that eagerly materialized much of the 4,950-pair frontier even
+            # when the first candidate in each wave was already improving.
+            # Fair inter-start batching keeps all workers occupied while each
+            # path still takes the same first exact improvement in its fixed
+            # pricing order.  A state with no improvement necessarily reaches
+            # the end of both lists and therefore retains the complete exact
+            # one-exchange terminal audit.
+            run_states = [
+                {
+                    "start": tuple(start),
+                    "current": tuple(start),
+                    "score": (
+                        0.0
+                        if not start
+                        else self._support_search_score(record(start))
+                    ),
+                    "path": [],
+                    "done": False,
+                }
+                for start in starts
+            ]
+            run_results: list[dict | None] = [None] * len(run_states)
+
+            def apply_gradient_transition(
+                run_index: int,
+                transition: dict,
+            ) -> None:
+                state = run_states[run_index]
+                current = tuple(state["current"])
+                current_score = float(state["score"])
+                best_score = float(transition["best_score"])
+                best_rules = tuple(transition["best_rules"])
+                gain = float(best_score - current_score)
+                improving = bool(
+                    math.isfinite(best_score)
+                    and (
+                        not math.isfinite(current_score)
+                        or gain > tolerance
+                    )
+                )
+                if improving:
+                    state["path"].append(
+                        {
+                            "from": [
+                                self._rule_dict(rule) for rule in current
+                            ],
+                            "to": [
+                                self._rule_dict(rule) for rule in best_rules
+                            ],
+                            "score_gain": gain,
+                        }
+                    )
+                    state["current"] = best_rules
+                    state["score"] = best_score
+                    return
+                if not bool(transition["full_audit"]):
+                    raise RuntimeError("gradient terminal certificate is incomplete")
+                if current:
+                    visited.add(current)
+                    terminals.add(current)
+                stationarity_gap = float(transition["stationarity_gap"])
+                gap_name = (
+                    "block_score_stationarity_gap"
+                    if score_working_set
+                    else "one_exchange_stationarity_gap"
+                )
+                omitted_score_surplus = float(
+                    transition.get("omitted_score_surplus", -math.inf)
+                )
+                stationary = bool(
+                    stationarity_gap <= tolerance
+                    and (
+                        not score_working_set
+                        or omitted_score_surplus <= tolerance
+                    )
+                )
+                run_results[run_index] = {
+                    "start": [
+                        self._rule_dict(rule) for rule in state["start"]
+                    ],
+                    "terminal": [
+                        self._rule_dict(rule) for rule in current
+                    ],
+                    "terminal_score": (
+                        current_score if math.isfinite(current_score) else None
+                    ),
+                    gap_name: stationarity_gap,
+                    "maximum_screened_add_score_surplus": (
+                        omitted_score_surplus
+                        if score_working_set
+                        and math.isfinite(omitted_score_surplus)
+                        else None
+                    ),
+                    "stationary_within_tolerance": stationary,
+                    "moves": state["path"],
+                }
+                state["done"] = True
+
+            while any(not state["done"] for state in run_states):
+                waiting: dict[
+                    tuple[RuleIdentity, ...], list[int]
+                ] = {}
+                for run_index, state in enumerate(run_states):
+                    if state["done"]:
+                        continue
+                    current = tuple(state["current"])
+                    cached_transition = transition_cache.get(current)
+                    if cached_transition is not None:
+                        transition_cache_hits += 1
+                        apply_gradient_transition(
+                            run_index, cached_transition
+                        )
+                        continue
+                    waiting.setdefault(current, []).append(run_index)
+                if not waiting:
+                    continue
+
+                # Pricing one state evaluates its fitted predictor on the
+                # union of all absent-rule rows.  On Freddie this is tens of
+                # millions of rows, while the former loop priced up to 100
+                # atom starts serially and left eleven physical cores idle.
+                # States are independent and each rule reduction retains its
+                # original row order, so state-level threads alter only
+                # scheduling, not a score, KKT value or candidate order.
+                pricing_work: list[
+                    tuple[
+                        tuple[RuleIdentity, ...],
+                        FitResult,
+                        tuple[RuleIdentity, ...],
+                    ]
+                ] = []
+                for current in sorted(waiting):
+                    if current in gradient_price_cache:
+                        continue
+                    full_neighborhood = self._one_exchange_neighbors(current)
+                    added_rules = tuple(
+                        sorted(
+                            {
+                                rule
+                                for trial in full_neighborhood
+                                for rule in set(trial) - set(current)
+                            }
+                        )
+                    )
+                    pricing_fit = (
+                        self.fit_baseline()
+                        if not current
+                        else record(current).fit
+                    )
+                    pricing_work.append(
+                        (current, pricing_fit, added_rules)
+                    )
+                if pricing_work:
+                    pricing_started = time.perf_counter()
+
+                    def price_state(
+                        item: tuple[
+                            tuple[RuleIdentity, ...],
+                            FitResult,
+                            tuple[RuleIdentity, ...],
+                        ],
+                    ) -> tuple[
+                        tuple[RuleIdentity, ...],
+                        dict[RuleIdentity, tuple[float, float]],
+                        int,
+                    ]:
+                        current, pricing_fit, added_rules = item
+                        with _single_threaded_local_blas():
+                            prices = self._support_rule_gradient_prices(
+                                pricing_fit,
+                                added_rules,
+                                worker_limit=1,
+                            )
+                        return current, prices, len(added_rules)
+
+                    price_workers = min(len(pricing_work), execution_wave_size)
+                    if score_working_set and price_workers > 1:
+                        # Fuse at most one former concurrency wave.  Thus the
+                        # residual matrix replaces, rather than adds to, the
+                        # memory that independent scalar workers allocated.
+                        priced_states = []
+                        for left in range(
+                            0, len(pricing_work), price_workers
+                        ):
+                            wave = pricing_work[left : left + price_workers]
+                            fused = self._support_rule_gradient_prices_batch(
+                                [(fit, rules) for _current, fit, rules in wave]
+                            )
+                            priced_states.extend(
+                                (current, prices, len(rules))
+                                for (current, _fit, rules), prices in zip(
+                                    wave, fused, strict=True
+                                )
+                            )
+                    elif price_workers <= 1:
+                        priced_states = [price_state(item) for item in pricing_work]
+                    else:
+                        with ThreadPoolExecutor(
+                            max_workers=price_workers
+                        ) as executor:
+                            priced_states = list(
+                                executor.map(price_state, pricing_work)
+                            )
+                    pricing_seconds += (
+                        time.perf_counter() - pricing_started
+                    )
+                    for current, prices, rule_count in priced_states:
+                        gradient_price_cache[current] = prices
+                        priced_state_count += 1
+                        priced_rule_count += rule_count
+
+                explorations: dict[tuple[RuleIdentity, ...], dict] = {}
+                for current in sorted(waiting):
+                    current_score = float(
+                        run_states[waiting[current][0]]["score"]
+                    )
+                    full_neighborhood = self._one_exchange_neighbors(current)
+                    coordinate_neighborhood = self._add_drop_neighbors(current)
+                    prices = gradient_price_cache.get(current)
+                    if prices is None:
+                        added_rules = sorted(
+                            {
+                                rule
+                                for trial in full_neighborhood
+                                for rule in set(trial) - set(current)
+                            }
+                        )
+                        pricing_started = time.perf_counter()
+                        pricing_fit = (
+                            self.fit_baseline()
+                            if not current
+                            else record(current).fit
+                        )
+                        prices = self._support_rule_gradient_prices(
+                            pricing_fit,
+                            added_rules,
+                        )
+                        pricing_seconds += (
+                            time.perf_counter() - pricing_started
+                        )
+                        priced_state_count += 1
+                        priced_rule_count += len(added_rules)
+                        gradient_price_cache[current] = prices
+
+                    def order_key(
+                        trial: tuple[RuleIdentity, ...],
+                        *,
+                        current_rules: tuple[RuleIdentity, ...] = current,
+                        current_prices: dict[
+                            RuleIdentity, tuple[float, float]
+                        ] = prices,
+                    ) -> tuple:
+                        added = tuple(
+                            sorted(set(trial) - set(current_rules))
+                        )
+                        removed = tuple(
+                            sorted(set(current_rules) - set(trial))
+                        )
+                        if not added:
+                            amplitude = (
+                                min(
+                                    float(
+                                        record(current_rules).fit.amplitudes[
+                                            current_rules.index(rule)
+                                        ]
+                                    )
+                                    for rule in removed
+                                )
+                                if current_rules and removed
+                                else 0.0
+                            )
+                            return (0, amplitude, trial)
+                        gain_value, kkt_value = current_prices[added[0]]
+                        return (
+                            1,
+                            -float(gain_value),
+                            -float(kkt_value),
+                            trial,
+                        )
+
+                    score_surpluses: dict[
+                        tuple[RuleIdentity, ...], float
+                    ] = {}
+                    omitted_score_surplus = -math.inf
+                    if score_working_set:
+                        # This is the block hard-thresholding rule obtained by
+                        # minimizing the local Fisher score surrogate plus the
+                        # exact incremental MDL code.  Every absent block is priced;
+                        # only its exact nonlinear refit is conditional.  A
+                        # strict comparison, with the same roundoff margin used
+                        # by support acceptance, avoids promoting a numerical
+                        # zero to the working set.
+                        fitted_dimension = int(search_fitted_dimension)
+                        current_penalty = self._support_complexity_penalty(
+                            current, fitted_dimension
+                        )
+                        admitted_coordinates: list[
+                            tuple[RuleIdentity, ...]
+                        ] = []
+                        for trial in coordinate_neighborhood:
+                            added = tuple(sorted(set(trial) - set(current)))
+                            if not added:
+                                admitted_coordinates.append(trial)
+                                continue
+                            if len(added) != 1:
+                                raise AssertionError(
+                                    "a score-working-set coordinate must add one block"
+                                )
+                            gain_value, _kkt_value = prices[added[0]]
+                            incremental_code = (
+                                self._support_complexity_penalty(
+                                    trial, fitted_dimension
+                                )
+                                - current_penalty
+                            )
+                            surplus = float(
+                                2.0
+                                * float(gain_value)
+                                * self.fit_objective_population_scale
+                                - incremental_code
+                            )
+                            score_surpluses[trial] = surplus
+                            score_admissible = surplus > tolerance
+                            safely_nonimproving = False
+                            if (
+                                score_admissible
+                                and self.config.conditional_safe_mdl_screen
+                            ):
+                                bound_started = time.perf_counter()
+                                bound = self._support_score_upper_bound(trial)
+                                conditional_bound_seconds += (
+                                    time.perf_counter() - bound_started
+                                )
+                                conditional_bound_evaluations += 1
+                                certified_upper = float(
+                                    bound.get("score_upper_bound", math.inf)
+                                ) + float(bound.get("numeric_margin", 0.0))
+                                safely_nonimproving = bool(
+                                    bound.get("finite", False)
+                                    and certified_upper
+                                    <= current_score + tolerance
+                                )
+                            if score_admissible and not safely_nonimproving:
+                                admitted_coordinates.append(trial)
+                                score_admitted_add_requests += 1
+                            else:
+                                score_screened_add_requests += 1
+                                if safely_nonimproving:
+                                    conditional_bound_screens += 1
+                                else:
+                                    omitted_score_surplus = max(
+                                        omitted_score_surplus, surplus
+                                    )
+                        coordinate_neighborhood = admitted_coordinates
+                        # A swap changes two rule blocks and therefore is not a
+                        # one-block stationary move.  The exact legacy mode is
+                        # retained when a one-exchange certificate is needed.
+                        full_neighborhood = sorted(coordinate_neighborhood)
+                    coordinate_set = set(coordinate_neighborhood)
+                    explorations[current] = {
+                        "current_score": current_score,
+                        "full": full_neighborhood,
+                        "coordinate": sorted(
+                            coordinate_neighborhood, key=order_key
+                        ),
+                        "swaps": (
+                            []
+                            if score_working_set
+                            else sorted(
+                                (
+                                    trial
+                                    for trial in full_neighborhood
+                                    if trial not in coordinate_set
+                                ),
+                                key=order_key,
+                            )
+                        ),
+                        "phase": "coordinate",
+                        "cursor": 0,
+                        "evaluated": [],
+                        "score_surpluses": score_surpluses,
+                        "omitted_score_surplus": omitted_score_surplus,
+                    }
+
+                while explorations:
+                    # Keep the exact ordered first-improvement rule while
+                    # filling the physical workers.  Results are committed in
+                    # candidate order below, so speculative evaluation can
+                    # neither skip an earlier improvement nor change a
+                    # terminal audit.  At most one hardware wave is in flight.
+                    fair_capacity = max(
+                        1,
+                        execution_wave_size // max(1, len(explorations)),
+                    )
+                    requests: list[
+                        tuple[
+                            tuple[RuleIdentity, ...],
+                            tuple[RuleIdentity, ...],
+                        ]
+                    ] = []
+                    finished_without_request: list[
+                        tuple[RuleIdentity, ...]
+                    ] = []
+                    for current, exploration in list(explorations.items()):
+                        phase = str(exploration["phase"])
+                        candidates = exploration[
+                            "coordinate" if phase == "coordinate" else "swaps"
+                        ]
+                        cursor = int(exploration["cursor"])
+                        if cursor >= len(candidates):
+                            if phase == "coordinate":
+                                exploration["phase"] = "swaps"
+                                exploration["cursor"] = 0
+                                candidates = exploration["swaps"]
+                                cursor = 0
+                            if cursor >= len(candidates):
+                                finished_without_request.append(current)
+                                continue
+                        quota = fair_capacity
+                        right = min(cursor + quota, len(candidates))
+                        requests.extend(
+                            (current, candidates[index])
+                            for index in range(cursor, right)
+                        )
+                        exploration["cursor"] = right
+
+                    for current in finished_without_request:
+                        exploration = explorations.pop(current)
+                        evaluated = exploration["evaluated"]
+                        full_neighborhood = exploration["full"]
+                        if len(evaluated) != len(full_neighborhood):
+                            raise RuntimeError(
+                                "gradient terminal audit did not cover its "
+                                "complete one-exchange neighborhood"
+                            )
+                        if score_working_set:
+                            score_terminal_certificates += 1
+                            omitted_surplus = float(
+                                exploration["omitted_score_surplus"]
+                            )
+                            if math.isfinite(omitted_surplus):
+                                maximum_terminal_score_surplus = max(
+                                    maximum_terminal_score_surplus,
+                                    max(0.0, omitted_surplus),
+                                )
+                        else:
+                            full_terminal_audits += 1
+                        finite_gains = [
+                            score - float(exploration["current_score"])
+                            for score, _trial in evaluated
+                            if math.isfinite(score)
+                            and math.isfinite(
+                                float(exploration["current_score"])
+                            )
+                        ]
+                        transition_cache[current] = {
+                            "evaluated": tuple(evaluated),
+                            "best_score": float(exploration["current_score"]),
+                            "best_rules": current,
+                            "stationarity_gap": (
+                                max(
+                                    0.0,
+                                    max(finite_gains, default=-math.inf),
+                                )
+                                if math.isfinite(
+                                    float(exploration["current_score"])
+                                )
+                                else math.inf
+                            ),
+                            "full_audit": True,
+                            "neighborhood_count": len(full_neighborhood),
+                            "omitted_score_surplus": float(
+                                exploration["omitted_score_surplus"]
+                            ),
+                        }
+                    if not requests:
+                        continue
+
+                    nonempty = [trial for _current, trial in requests if trial]
+                    request_records = {
+                        item.rules: item for item in records(nonempty)
+                    }
+                    exact_neighbor_requests += len(nonempty)
+                    by_current: dict[
+                        tuple[RuleIdentity, ...],
+                        list[tuple[RuleIdentity, ...]],
+                    ] = {}
+                    for current, trial in requests:
+                        by_current.setdefault(current, []).append(trial)
+                    for current, trials in by_current.items():
+                        exploration = explorations.get(current)
+                        if exploration is None:
+                            continue
+                        chosen: tuple[
+                            float, tuple[RuleIdentity, ...]
+                        ] | None = None
+                        for trial in trials:
+                            trial_score = (
+                                0.0
+                                if not trial
+                                else self._support_search_score(
+                                    request_records[trial]
+                                )
+                            )
+                            exploration["evaluated"].append(
+                                (trial_score, trial)
+                            )
+                            if trial:
+                                visited.add(trial)
+                            if (
+                                chosen is None
+                                and math.isfinite(trial_score)
+                                and (
+                                    not math.isfinite(
+                                        float(exploration["current_score"])
+                                    )
+                                    or trial_score
+                                    - float(exploration["current_score"])
+                                    > tolerance
+                                )
+                            ):
+                                chosen = (trial_score, trial)
+                        if chosen is None:
+                            ordered_lazy_refit_rounds += 1
+                            continue
+                        chosen_index = next(
+                            index
+                            for index, trial in enumerate(trials)
+                            if trial == chosen[1]
+                        )
+                        speculative_exact_requests_after_first_improvement += max(
+                            0, len(trials) - chosen_index - 1
+                        )
+                        evaluated = exploration["evaluated"]
+                        skipped_after_first_improvement += (
+                            len(exploration["full"]) - len(evaluated)
+                        )
+                        transition_cache[current] = {
+                            "evaluated": tuple(evaluated),
+                            "best_score": float(chosen[0]),
+                            "best_rules": chosen[1],
+                            "stationarity_gap": None,
+                            "full_audit": bool(
+                                len(evaluated) == len(exploration["full"])
+                            ),
+                            "neighborhood_count": len(exploration["full"]),
+                        }
+                        del explorations[current]
+
+                for current, run_indices in waiting.items():
+                    transition = transition_cache.get(current)
+                    if transition is None:
+                        raise RuntimeError(
+                            "gradient exploration did not publish a transition"
+                        )
+                    for run_index in run_indices:
+                        apply_gradient_transition(run_index, transition)
+            runs.extend(
+                result for result in run_results if result is not None
+            )
+
+        # Retained as an unreachable reference implementation while the
+        # breadth-synchronous scheduler above is regression-tested.
+        for start in ():
             current = tuple(start)
             current_score = 0.0 if not current else self._support_search_score(record(current))
             path: list[dict] = []
             while True:
                 cached_transition = transition_cache.get(current)
                 if cached_transition is None:
-                    neighborhood = self._one_exchange_neighbors(current)
-                    evaluated = []
-                    nonempty = [trial for trial in neighborhood if trial]
-                    neighborhood_records = {
-                        item.rules: item for item in records(nonempty)
-                    }
-                    for trial in neighborhood:
-                        trial_score = (
-                            0.0
-                            if not trial
-                            else self._support_search_score(
-                                neighborhood_records[trial]
+                    full_neighborhood = self._one_exchange_neighbors(current)
+                    neighborhood = (
+                        self._add_drop_neighbors(current)
+                        if gradient_strategy
+                        else full_neighborhood
+                    )
+                    if gradient_strategy:
+                        prices = gradient_price_cache.get(current)
+                        if prices is None:
+                            added_rules = sorted(
+                                {
+                                    rule
+                                    for trial in full_neighborhood
+                                    for rule in set(trial) - set(current)
+                                }
                             )
+                            pricing_started = time.perf_counter()
+                            pricing_fit = (
+                                self.fit_baseline()
+                                if not current
+                                else record(current).fit
+                            )
+                            prices = self._support_rule_gradient_prices(
+                                pricing_fit,
+                                added_rules,
+                            )
+                            pricing_seconds += (
+                                time.perf_counter() - pricing_started
+                            )
+                            priced_state_count += 1
+                            priced_rule_count += len(added_rules)
+                            gradient_price_cache[current] = prices
+
+                        def pricing_order(
+                            trial: tuple[RuleIdentity, ...],
+                        ) -> tuple:
+                            added = tuple(sorted(set(trial) - set(current)))
+                            removed = tuple(sorted(set(current) - set(trial)))
+                            # Exact drops are few and can expose a cheaper
+                            # support before any new column is considered.
+                            # Adds then follow decreasing local quadratic
+                            # gain. These values only order exact fits.
+                            if not added:
+                                amplitude = (
+                                    min(
+                                        float(record(current).fit.amplitudes[
+                                            current.index(rule)
+                                        ])
+                                        for rule in removed
+                                    )
+                                    if current and removed
+                                    else 0.0
+                                )
+                                return (0, amplitude, trial)
+                            gain, kkt = prices[added[0]]
+                            return (1, -float(gain), -float(kkt), trial)
+
+                        ordered_neighborhood = sorted(
+                            neighborhood,
+                            key=pricing_order,
                         )
-                        evaluated.append((trial_score, trial))
-                    evaluated.sort(key=lambda item: (-item[0], item[1]))
-                    transition_cache[current] = tuple(evaluated)
+                        evaluated: list[
+                            tuple[float, tuple[RuleIdentity, ...]]
+                        ] = []
+                        chosen: tuple[
+                            float, tuple[RuleIdentity, ...]
+                        ] | None = None
+                        for left in range(
+                            0, len(ordered_neighborhood), execution_wave_size
+                        ):
+                            wave = ordered_neighborhood[
+                                left : left + execution_wave_size
+                            ]
+                            nonempty = [trial for trial in wave if trial]
+                            wave_records = {
+                                item.rules: item for item in records(nonempty)
+                            }
+                            exact_neighbor_requests += len(nonempty)
+                            for trial in wave:
+                                trial_score = (
+                                    0.0
+                                    if not trial
+                                    else self._support_search_score(
+                                        wave_records[trial]
+                                    )
+                                )
+                                evaluated.append((trial_score, trial))
+                                if trial:
+                                    visited.add(trial)
+                                if (
+                                    chosen is None
+                                    and math.isfinite(trial_score)
+                                    and (
+                                        not math.isfinite(current_score)
+                                        or trial_score - current_score
+                                        > tolerance
+                                    )
+                                ):
+                                    chosen = (trial_score, trial)
+                            if chosen is not None:
+                                skipped_after_first_improvement += (
+                                    len(full_neighborhood) - len(evaluated)
+                                )
+                                break
+                        # A direct swap is a two-coordinate move, but auditing
+                        # it only after no add/drop improves preserves exact
+                        # one-exchange terminal stationarity without paying
+                        # for every swap at every intermediate state.
+                        if chosen is None:
+                            coordinate_set = set(neighborhood)
+                            ordered_swaps = sorted(
+                                (
+                                    trial
+                                    for trial in full_neighborhood
+                                    if trial not in coordinate_set
+                                ),
+                                key=pricing_order,
+                            )
+                            for left in range(
+                                0, len(ordered_swaps), execution_wave_size
+                            ):
+                                wave = ordered_swaps[
+                                    left : left + execution_wave_size
+                                ]
+                                wave_records = {
+                                    item.rules: item
+                                    for item in records(wave)
+                                }
+                                exact_neighbor_requests += len(wave)
+                                for trial in wave:
+                                    trial_score = self._support_search_score(
+                                        wave_records[trial]
+                                    )
+                                    evaluated.append((trial_score, trial))
+                                    visited.add(trial)
+                                    if (
+                                        chosen is None
+                                        and math.isfinite(trial_score)
+                                        and (
+                                            not math.isfinite(current_score)
+                                            or trial_score - current_score
+                                            > tolerance
+                                        )
+                                    ):
+                                        chosen = (trial_score, trial)
+                                if chosen is not None:
+                                    skipped_after_first_improvement += (
+                                        len(full_neighborhood)
+                                        - len(evaluated)
+                                    )
+                                    break
+                        full_audit = len(evaluated) == len(full_neighborhood)
+                        if chosen is None:
+                            full_terminal_audits += 1
+                            best_score, _best_trial = max(
+                                evaluated,
+                                key=lambda item: item[0],
+                                default=(-math.inf, current),
+                            )
+                            best_rules = current
+                            finite_gains = [
+                                score - current_score
+                                for score, _trial in evaluated
+                                if math.isfinite(score)
+                                and math.isfinite(current_score)
+                            ]
+                            stationarity_gap = (
+                                max(
+                                    0.0,
+                                    max(finite_gains, default=-math.inf),
+                                )
+                                if math.isfinite(current_score)
+                                else math.inf
+                            )
+                        else:
+                            best_score, best_rules = chosen
+                            stationarity_gap = None
+                        transition = {
+                            "evaluated": tuple(evaluated),
+                            "best_score": float(best_score),
+                            "best_rules": best_rules,
+                            "stationarity_gap": stationarity_gap,
+                            "full_audit": bool(full_audit),
+                            "neighborhood_count": len(full_neighborhood),
+                        }
+                    else:
+                        evaluated = []
+                        nonempty = [trial for trial in neighborhood if trial]
+                        neighborhood_records = {
+                            item.rules: item for item in records(nonempty)
+                        }
+                        exact_neighbor_requests += len(nonempty)
+                        for trial in neighborhood:
+                            trial_score = (
+                                0.0
+                                if not trial
+                                else self._support_search_score(
+                                    neighborhood_records[trial]
+                                )
+                            )
+                            evaluated.append((trial_score, trial))
+                            if trial:
+                                visited.add(trial)
+                        evaluated.sort(key=lambda item: (-item[0], item[1]))
+                        best_score, best_rules = (
+                            evaluated[0]
+                            if evaluated
+                            else (-math.inf, current)
+                        )
+                        finite_gains = [
+                            score - current_score
+                            for score, _trial in evaluated
+                            if math.isfinite(score)
+                            and math.isfinite(current_score)
+                        ]
+                        stationarity_gap = (
+                            max(0.0, max(finite_gains, default=-math.inf))
+                            if math.isfinite(current_score)
+                            else math.inf
+                        )
+                        transition = {
+                            "evaluated": tuple(evaluated),
+                            "best_score": float(best_score),
+                            "best_rules": best_rules,
+                            "stationarity_gap": stationarity_gap,
+                            "full_audit": True,
+                            "neighborhood_count": len(neighborhood),
+                        }
+                    transition_cache[current] = transition
                 else:
-                    evaluated = list(cached_transition)
+                    transition = cached_transition
                     transition_cache_hits += 1
-                for _trial_score, trial in evaluated:
-                    if trial:
-                        visited.add(trial)
-                best_score, best_rules = evaluated[0] if evaluated else (-math.inf, current)
+                best_score = float(transition["best_score"])
+                best_rules = tuple(transition["best_rules"])
                 gain = float(best_score - current_score)
                 improving = bool(
                     math.isfinite(best_score)
@@ -4048,22 +7321,18 @@ class CertSCRPipeline:
                 if current:
                     visited.add(current)
                     terminals.add(current)
-                finite_gains = [
-                    score - current_score
-                    for score, _rules in evaluated
-                    if math.isfinite(score) and math.isfinite(current_score)
-                ]
-                stationarity_gap = (
-                    max(0.0, max(finite_gains, default=-math.inf))
-                    if math.isfinite(current_score)
-                    else math.inf
-                )
+                stationarity_gap = float(transition["stationarity_gap"])
+                if not bool(transition["full_audit"]):
+                    raise RuntimeError(
+                        "terminal support is missing its complete exact neighborhood audit"
+                    )
+                gap_name = "one_exchange_stationarity_gap"
                 runs.append(
                     {
                         "start": [self._rule_dict(rule) for rule in start],
                         "terminal": [self._rule_dict(rule) for rule in current],
                         "terminal_score": current_score if math.isfinite(current_score) else None,
-                        "one_exchange_stationarity_gap": stationarity_gap,
+                        gap_name: stationarity_gap,
                         "stationary_within_tolerance": bool(stationarity_gap <= tolerance),
                         "moves": path,
                     }
@@ -4082,30 +7351,13 @@ class CertSCRPipeline:
         terminal_records.sort(
             key=lambda item: (-self._support_search_score(item), len(item.rules), item.rules)
         )
-        # A high-order interaction and an admitted strict lower-order rule
-        # define one pre-specified hierarchy-link hypothesis.  This preserves
-        # structures such as A excitation + AB inhibition without restoring
-        # every arbitrary intermediate search state.  The relation uses only
-        # antecedent set inclusion in the frozen D_fit atom library.
-        hierarchy_link_keys = sorted(
-            {
-                tuple(sorted((lower, higher)))
-                for higher in self.profiled_rules
-                for lower in self.profiled_rules
-                if set(lower.antecedent) < set(higher.antecedent)
-                and self._eligible_support((lower, higher))
-            }
-        )
-        hierarchy_link_records = [
-            item
-            for item in records(hierarchy_link_keys)
-            if self._support_search_score(item) > 0.0
-        ]
-        hierarchy_link_records.sort(
-            key=lambda item: (
-                -self._support_search_score(item), len(item.rules), item.rules
-            )
-        )
+        # Antecedent inclusion alone does not make a two-rule support a local
+        # optimum.  Earlier code unconditionally fitted every A+AB-style link,
+        # which added hundreds of arbitrary intermediate hypotheses after the
+        # stationary search. Multi-rule supports are now reportable only when
+        # reached as exact atom-start local terminals; standalone high-order
+        # atoms remain anchors, so pair/triplet rules are never hidden.
+        hierarchy_link_records: list[SupportRecord] = []
         # Preserve the best visited support in every size/order/sign stratum
         # before filling the remaining pool by Q. This is deterministic and
         # prevents one dominant singleton basin from erasing high-order or
@@ -4141,13 +7393,11 @@ class CertSCRPipeline:
             required_support_keys.update(
                 record.rules for record in stratified_records
             )
-        # Multi-rule local terminals and hierarchy-link hypotheses receive
-        # support-conditioned W/sign coordinate refinement.  Standalone atoms
+        # Multi-rule local terminals receive support-conditioned W/sign
+        # coordinate refinement. Standalone atoms
         # already received their exact identity profile in their one-rule
         # context.
-        self._identity_refinement_keys = set(terminals) | {
-            record.rules for record in hierarchy_link_records
-        }
+        self._identity_refinement_keys = set(terminals)
 
         family_candidates = (
             [*terminal_records, *hierarchy_link_records, *anchor_records]
@@ -4177,36 +7427,165 @@ class CertSCRPipeline:
             selected_keys.add(item.rules)
         selected.sort(key=lambda item: (-self._support_search_score(item), len(item.rules), item.rules))
         self.search_diagnostics = {
+            "estimator_name": (
+                "MDL-triggered fused Rashomon support search"
+                if score_working_set
+                else None
+            ),
             "method": profile,
             "objective": (
                 "2*(closure_null_nll-support_nll)-rule_parameter_BIC-"
                 "finite_W_sign_identity_code-and_dictionary_shape_code_when_scalar"
             ),
-            "neighborhood": "all feasible add/drop/swap moves",
+            "neighbor_strategy": self.config.active_neighbor_strategy,
+            "neighborhood": (
+                "all exact drops plus every add whose conditional cone score pays its incremental MDL code; swaps are two-block moves"
+                if score_working_set
+                else "gradient-ordered add/drop moves followed by exact terminal swap audit"
+                if gradient_strategy
+                else "all feasible add/drop/swap moves"
+            ),
+            "move_selection": (
+                "MDL-score working set followed by first exact objective improvement"
+                if score_working_set
+                else "gradient-ordered first exact improvement with complete exact terminal audit"
+                if gradient_strategy
+                else "maximum exact one-exchange improvement"
+            ),
             "finite_convergence_argument": (
                 "each accepted move strictly increases the scalar objective over a finite support space"
             ),
             "stationarity_bound": (
-                "reported gap is the maximum exact objective gain over the complete one-exchange neighborhood"
+                "all drops and every MDL-admissible score block were exact-fitted; every omitted add has nonpositive conditional Fisher-gain minus incremental MDL code"
+                if score_working_set
+                else "reported gap is the maximum exact objective gain over the complete one-exchange neighborhood; swaps are deferred until add/drop stationarity"
+                if gradient_strategy
+                else "reported gap is the maximum exact objective gain over the complete one-exchange neighborhood"
+            ),
+            "stationarity_claim": (
+                "block_score_stationary_not_exact_one_exchange_stationary"
+                if score_working_set
+                else "exact_one_exchange_stationary"
+            ),
+            "candidate_budget": None,
+            "candidate_coverage": (
+                "every feasible absent rule block is scored at every attained state; "
+                "there is no top-k, beam width, or triplet budget"
+                if score_working_set
+                else "complete configured finite neighborhood"
             ),
             "stationarity_objective_scope": (
                 "the frozen discovery dictionary objective; terminal full-M refinement is a subsequent "
-                "acceptance/refinement stage and is not claimed to be one-exchange stationary"
+                "acceptance/refinement stage and is not claimed to preserve the dictionary-stage stationarity certificate"
             ),
             "restart_count": len(starts),
             "active_start_policy": self.config.active_start_policy,
             "start_atom_count": len(starts) - 1,
+            "initial_exact_frontier_batch": {
+                "enabled": bool(
+                    not gradient_strategy
+                    and self.config.active_start_policy == "all_atoms"
+                ),
+                "new_model_key_count": int(initial_frontier_fit_count),
+                "seconds": float(initial_frontier_seconds),
+                "changes_candidate_family_or_objective": False,
+            },
+            "exact_multi_start_frontier_batching": {
+                "enabled": bool(not gradient_strategy),
+                "round_count": int(exact_frontier_rounds),
+                "neighborhood_key_requests": int(
+                    exact_frontier_requested_keys
+                ),
+                "unique_new_model_keys": int(
+                    exact_frontier_unique_new_keys
+                ),
+                "fit_seconds": float(exact_frontier_fit_seconds),
+                "changes_candidate_family_or_objective": False,
+            },
             "evaluated_support_count": len(record_cache),
             "memoized_neighborhood_count": len(transition_cache),
             "memoized_neighborhood_hits": transition_cache_hits,
+            "gradient_pricing": {
+                "enabled": bool(gradient_strategy),
+                "role": (
+                    "MDL_calibrated_full_dictionary_working_set_no_top_k_or_budget"
+                    if score_working_set
+                    else "deterministic_ordering_only_no_candidate_removal"
+                ),
+                "priced_state_count": int(priced_state_count),
+                "priced_rule_count": int(priced_rule_count),
+                "pricing_seconds": float(pricing_seconds),
+                "exact_neighbor_requests": int(exact_neighbor_requests),
+                "complete_terminal_audits": int(full_terminal_audits),
+                "block_score_terminal_certificates": int(
+                    score_terminal_certificates
+                ),
+                "score_admitted_add_requests": int(
+                    score_admitted_add_requests
+                ),
+                "score_screened_add_requests": int(
+                    score_screened_add_requests
+                ),
+                "conditional_safe_mdl_bound": {
+                    "enabled": bool(
+                        score_working_set
+                        and self.config.conditional_safe_mdl_screen
+                    ),
+                    "evaluations": int(conditional_bound_evaluations),
+                    "screened_exact_fits": int(
+                        conditional_bound_screens
+                    ),
+                    "seconds": float(conditional_bound_seconds),
+                    "criterion": (
+                        "candidate_absolute_MDL_upper_bound <= "
+                        "current_exact_objective + acceptance_tolerance"
+                    ),
+                    "changes_accepted_move": False,
+                },
+                "maximum_terminal_screened_score_surplus": float(
+                    maximum_terminal_score_surplus
+                ),
+                "neighbors_not_fitted_after_first_improvement": int(
+                    skipped_after_first_improvement
+                ),
+                "ordered_work_conserving_exact_refits": {
+                    "enabled": bool(gradient_strategy),
+                    "dispatch": (
+                        "one_ordered_candidate_per_active_state_then_fill_"
+                        "idle_workers_with_the_next_contiguous_prefix"
+                    ),
+                    "maximum_exact_batch_size": int(execution_wave_size),
+                    "exactly_nonimproving_wave_count": int(
+                        ordered_lazy_refit_rounds
+                    ),
+                    "speculative_exact_requests_after_first_improvement": int(
+                        speculative_exact_requests_after_first_improvement
+                    ),
+                    "preserves_candidate_order": True,
+                    "preserves_accepted_moves_and_terminal": True,
+                    "changes_objective_or_candidate_family": False,
+                },
+                "execution_wave_size": int(execution_wave_size),
+                "inter_start_batching": (
+                    "fair_one-next-coordinate-per-active-state_then_fill_"
+                    "workers_near_terminal"
+                    if gradient_strategy
+                    else None
+                ),
+                "hardware_wave_changes_move": False,
+            },
             "visited_positive_support_count": len(ranked),
             "hierarchy_link_support_count": len(hierarchy_link_records),
             "hierarchy_link_definition": (
-                "every_positive_two-rule_support whose lower antecedent is a strict subset of the higher antecedent"
+                "none: antecedent inclusion alone is not a reportable support; any A+AB structure must be an atom-start local terminal"
             ),
             "returned_pool_count": len(selected),
             "returned_family_definition": (
-                "all_positive_standalone_atoms_hierarchy_links_and_unique_atom_start_local_terminals"
+                (
+                    "all_positive_standalone_atoms_and_unique_atom_start_block_score_terminals"
+                    if score_working_set
+                    else "all_positive_standalone_atoms_and_unique_atom_start_local_terminals"
+                )
                 if self.config.support_family == "terminal_atoms"
                 else "legacy_positive_visited_pool_plus_required_anchors_and_terminals"
             ),
@@ -4232,6 +7611,7 @@ class CertSCRPipeline:
             },
             "runs": runs,
         }
+        self._support_pricing_union_cache = None
         return selected
 
     def _refine_support_identities(
@@ -4291,30 +7671,136 @@ class CertSCRPipeline:
 
         refined: list[SupportRecord] = []
         runs: list[dict] = []
+        gradient_ordering = (
+            self.config.active_neighbor_strategy
+            == "gradient_first_exact_audit"
+        )
+        transition_cache: dict[tuple[RuleIdentity, ...], dict] = {}
+        pricing_seconds = 0.0
+        priced_rule_count = 0
+        exact_fit_requests = 0
+        skipped_after_first_improvement = 0
+        terminal_audits = 0
+        execution_wave_size = max(1, len(self._active_support_workers))
         for start_record in records:
             current = get(start_record.rules)
             current_score = self._support_search_score(current)
             moves: list[dict] = []
             while True:
-                alternatives: list[tuple[float, tuple[RuleIdentity, ...], SupportRecord]] = []
-                trial_keys: list[tuple[RuleIdentity, ...]] = []
-                for position, old_rule in enumerate(current.rules):
-                    candidates = local_identity_neighbors(old_rule)
-                    for candidate in candidates:
-                        if candidate == old_rule:
-                            continue
-                        trial_rules = list(current.rules)
-                        trial_rules[position] = candidate
-                        trial_key = tuple(sorted(trial_rules))
-                        trial_keys.append(trial_key)
-                trial_records = {item.rules: item for item in get_many(trial_keys)}
-                for trial_key in dict.fromkeys(trial_keys):
-                    trial = trial_records[trial_key]
-                    alternatives.append((self._support_search_score(trial), trial_key, trial))
-                alternatives.sort(key=lambda item: (-item[0], item[1]))
-                best_score, _best_key, best = (
-                    alternatives[0] if alternatives else (-math.inf, current.rules, current)
-                )
+                transition = transition_cache.get(current.rules)
+                if transition is None:
+                    trial_candidate: dict[
+                        tuple[RuleIdentity, ...], RuleIdentity
+                    ] = {}
+                    for position, old_rule in enumerate(current.rules):
+                        for candidate in local_identity_neighbors(old_rule):
+                            if candidate == old_rule:
+                                continue
+                            trial_rules = list(current.rules)
+                            trial_rules[position] = candidate
+                            trial_candidate[
+                                tuple(sorted(trial_rules))
+                            ] = candidate
+                    trial_keys = list(trial_candidate)
+                    if gradient_ordering and trial_keys:
+                        pricing_started = time.perf_counter()
+                        candidate_prices = self._support_rule_gradient_prices(
+                            current.fit,
+                            tuple(trial_candidate.values()),
+                        )
+                        pricing_seconds += time.perf_counter() - pricing_started
+                        priced_rule_count += len(candidate_prices)
+                        ordered_keys = sorted(
+                            trial_keys,
+                            key=lambda key: (
+                                -candidate_prices[trial_candidate[key]][0],
+                                -candidate_prices[trial_candidate[key]][1],
+                                key,
+                            ),
+                        )
+                    else:
+                        ordered_keys = sorted(trial_keys)
+                    alternatives: list[
+                        tuple[float, tuple[RuleIdentity, ...], SupportRecord]
+                    ] = []
+                    chosen: tuple[
+                        float, tuple[RuleIdentity, ...], SupportRecord
+                    ] | None = None
+                    if gradient_ordering:
+                        for left in range(
+                            0, len(ordered_keys), execution_wave_size
+                        ):
+                            wave = ordered_keys[
+                                left : left + execution_wave_size
+                            ]
+                            wave_records = {
+                                item.rules: item for item in get_many(wave)
+                            }
+                            exact_fit_requests += len(wave)
+                            for key in wave:
+                                item = wave_records[key]
+                                score = self._support_search_score(item)
+                                alternatives.append((score, key, item))
+                                if (
+                                    chosen is None
+                                    and math.isfinite(score)
+                                    and (
+                                        not math.isfinite(current_score)
+                                        or score - current_score > tolerance
+                                    )
+                                ):
+                                    chosen = (score, key, item)
+                            if chosen is not None:
+                                skipped_after_first_improvement += (
+                                    len(ordered_keys) - len(alternatives)
+                                )
+                                break
+                    else:
+                        all_records = {
+                            item.rules: item for item in get_many(ordered_keys)
+                        }
+                        exact_fit_requests += len(ordered_keys)
+                        alternatives = [
+                            (
+                                self._support_search_score(all_records[key]),
+                                key,
+                                all_records[key],
+                            )
+                            for key in ordered_keys
+                        ]
+                        alternatives.sort(key=lambda item: (-item[0], item[1]))
+                        chosen = alternatives[0] if alternatives else None
+                    full_audit = len(alternatives) == len(ordered_keys)
+                    if gradient_ordering and chosen is None:
+                        terminal_audits += 1
+                    if chosen is None:
+                        best_score, best_key, best = (
+                            -math.inf,
+                            current.rules,
+                            current,
+                        )
+                    else:
+                        best_score, best_key, best = chosen
+                    finite_gains = [
+                        score - current_score
+                        for score, _key, _record in alternatives
+                        if math.isfinite(score) and math.isfinite(current_score)
+                    ]
+                    gap = (
+                        max(0.0, max(finite_gains, default=-math.inf))
+                        if full_audit and math.isfinite(current_score)
+                        else None
+                    )
+                    transition = {
+                        "best_score": float(best_score),
+                        "best_key": best_key,
+                        "best": best,
+                        "full_audit": bool(full_audit),
+                        "gap": gap,
+                    }
+                    transition_cache[current.rules] = transition
+                best_score = float(transition["best_score"])
+                best = transition["best"]
                 gain = float(best_score - current_score)
                 improving = bool(
                     math.isfinite(best_score)
@@ -4331,16 +7817,11 @@ class CertSCRPipeline:
                     current = best
                     current_score = best_score
                     continue
-                finite_gains = [
-                    score - current_score
-                    for score, _key, _record in alternatives
-                    if math.isfinite(score) and math.isfinite(current_score)
-                ]
-                gap = (
-                    max(0.0, max(finite_gains, default=-math.inf))
-                    if math.isfinite(current_score)
-                    else math.inf
-                )
+                if not bool(transition["full_audit"]):
+                    raise RuntimeError(
+                        "identity terminal is missing its complete exact coordinate audit"
+                    )
+                gap = float(transition["gap"])
                 refined.append(current)
                 runs.append(
                     {
@@ -4373,6 +7854,18 @@ class CertSCRPipeline:
             "stationarity_bound": (
                 "reported gap is the maximum exact Q gain over every adjacent-W or sign-flip move of one rule"
             ),
+            "gradient_ordering": {
+                "enabled": bool(gradient_ordering),
+                "role": "deterministic_ordering_only_no_identity_removal",
+                "pricing_seconds": float(pricing_seconds),
+                "priced_rule_count": int(priced_rule_count),
+                "exact_fit_requests": int(exact_fit_requests),
+                "neighbors_not_fitted_after_first_improvement": int(
+                    skipped_after_first_improvement
+                ),
+                "complete_terminal_audits": int(terminal_audits),
+                "execution_wave_size": int(execution_wave_size),
+            },
             "runs": runs,
         }
         return output, diagnostics
@@ -4435,16 +7928,12 @@ class CertSCRPipeline:
             ]
             prepared = prepared_design
             if prepared is None:
-                prepared = prepare_fixed_support_design(
+                prepared = pipeline.prepare_partitioned_support_design(
                     pipeline.splits.fit,
-                    nuisance,
+                    closure_terms,
                     raw_features,
                     rules,
                     cluster_weights=pipeline.fit_cluster_weights,
-                    sequence_exposures=pipeline.sequence_exposures(
-                        pipeline.splits.fit
-                    ),
-                    occurrence_likelihood=pipeline.occurrence_likelihood,
                 )
             if (
                 str(pipeline.config.solver_device).startswith("cpu")
@@ -4560,9 +8049,6 @@ class CertSCRPipeline:
         ) -> list[SupportRecord]:
             parent_rules = parent.rules
             parent_closure = pipeline.hierarchy_closure(parent_rules)
-            parent_nuisance = pipeline.sparse_nuisance_blocks(
-                pipeline.splits.fit, parent_closure
-            )
             parent_features = [
                 pipeline.engine.sparse_response(
                     pipeline.splits.fit,
@@ -4571,16 +8057,12 @@ class CertSCRPipeline:
                 )
                 for rule in parent_rules
             ]
-            parent_prepared = prepare_fixed_support_design(
+            parent_prepared = pipeline.prepare_partitioned_support_design(
                 pipeline.splits.fit,
-                parent_nuisance,
+                parent_closure,
                 parent_features,
                 parent_rules,
                 cluster_weights=pipeline.fit_cluster_weights,
-                sequence_exposures=pipeline.sequence_exposures(
-                    pipeline.splits.fit
-                ),
-                occurrence_likelihood=pipeline.occurrence_likelihood,
             )
             output_group: list[SupportRecord] = []
             for child in sorted(
@@ -4608,7 +8090,14 @@ class CertSCRPipeline:
                 )
             return output_group
 
-        worker_pool = workers if len(workers) > 1 else [self]
+        fit_worker_count = self._exact_fit_worker_limit(
+            len(workers) if workers else 1
+        )
+        worker_pool = (
+            workers[:fit_worker_count]
+            if len(workers) > 1
+            else [self]
+        )
         # Greedy structural load balance changes scheduling only.  The weight is
         # the number of fitted rule columns in each parent group and uses no
         # outcome, score, p-value, or convergence result.
@@ -4654,7 +8143,8 @@ class CertSCRPipeline:
 
         output: list[SupportRecord] = []
         use_fork_refit = bool(
-            os.name == "posix"
+            os.environ.get("CERTSCR_PROCESS_REFIT", "0") == "1"
+            and os.name == "posix"
             and not self.config.support_devices
             and str(self.config.solver_device).startswith("cpu")
             and int(self.config.solver_workers) > 1
@@ -4958,13 +8448,18 @@ class CertSCRPipeline:
             ) -> list[SupportRecord]:
                 return [fit_one(worker, rules) for rules in chunk]
 
-            with ThreadPoolExecutor(max_workers=len(workers)) as executor:
+            fit_worker_count = self._exact_fit_worker_limit(len(workers))
+            fit_workers = workers[:fit_worker_count]
+            with ThreadPoolExecutor(max_workers=fit_worker_count) as executor:
                 for size in range(1, max_size + 1):
                     universe = eligible_supports(size)
-                    chunks = [universe[index::len(workers)] for index in range(len(workers))]
+                    chunks = [
+                        universe[index::fit_worker_count]
+                        for index in range(fit_worker_count)
+                    ]
                     futures = [
                         executor.submit(fit_chunk, worker, chunk)
-                        for worker, chunk in zip(workers, chunks, strict=True)
+                        for worker, chunk in zip(fit_workers, chunks, strict=True)
                         if chunk
                     ]
                     for future in futures:
@@ -6927,7 +10422,13 @@ class CertSCRPipeline:
             self._prepare_fit_summary_reuse(records, ctx)
         devices = self._support_worker_devices()
         if _parallel and len(records) > 1 and len(devices) > 1:
-            worker_count = min(len(records), len(devices))
+            # Support evaluation may have to solve hierarchy-preserving drop
+            # models.  Those exact designs have the same resident-memory scale
+            # as discovery fits, so apply the execution-only admission limit
+            # here as well.  Every record, drop and test is still evaluated.
+            worker_count = self._exact_fit_worker_limit(
+                min(len(records), len(devices))
+            )
             indexed_records = list(enumerate(records))
             nested_chunks: list[
                 list[tuple[SupportRecord, list[tuple[int, SupportRecord]]]]
@@ -8193,7 +11694,12 @@ class CertSCRPipeline:
         ]
         devices = self._support_worker_devices()
         if len(refit_jobs) > 1 and len(devices) > 1:
-            worker_count = min(len(refit_jobs), len(devices))
+            # Fit+cert component refits use the complete population and can be
+            # larger than discovery designs.  Limit only simultaneous ownership;
+            # the frozen component family, objective and KKT target are unchanged.
+            worker_count = self._exact_fit_worker_limit(
+                min(len(refit_jobs), len(devices))
+            )
             workers: list[CertSCRPipeline] = []
             for device in devices[:worker_count]:
                 worker = copy.copy(self)
@@ -8634,8 +12140,387 @@ class CertSCRPipeline:
             "text": self.engine.rule_name(rule),
         }
 
+    @staticmethod
+    def _rule_state(rule: RuleIdentity) -> dict:
+        return {
+            "antecedent": list(rule.antecedent),
+            "window": int(rule.window),
+            "sign": int(rule.sign),
+        }
+
+    @staticmethod
+    def _rule_from_state(payload: dict) -> RuleIdentity:
+        return RuleIdentity(
+            tuple(int(value) for value in payload["antecedent"]),
+            int(payload["window"]),
+            int(payload["sign"]),
+        )
+
+    def export_profile_state(self) -> dict:
+        """Serialize the frozen dictionary independently of Python caches."""
+        state_rules = set(self.profiled_rules)
+        for candidates in self.identity_candidates.values():
+            state_rules.update(candidates)
+        return {
+            "schema": 1,
+            "checkpoint_signature": self.checkpoint_signature(),
+            "profiled_rules": [
+                self._rule_state(rule) for rule in self.profiled_rules
+            ],
+            "dictionary_shapes": [
+                {
+                    "rule": self._rule_state(rule),
+                    "shape": np.asarray(shape, dtype=np.float64).tolist(),
+                }
+                for rule, shape in sorted(
+                    self.rule_dictionary_shapes.items()
+                )
+                if rule in state_rules
+            ],
+            "identity_candidates": [
+                {
+                    "antecedent": list(antecedent),
+                    "rules": [self._rule_state(rule) for rule in rules],
+                }
+                for antecedent, rules in sorted(
+                    self.identity_candidates.items()
+                )
+            ],
+            "profile_logs": self.profile_logs,
+        }
+
+    def restore_profile_state(self, payload: dict) -> None:
+        if int(payload.get("schema", -1)) != 1:
+            raise ValueError("unsupported profile checkpoint schema")
+        if payload.get("checkpoint_signature") != self.checkpoint_signature():
+            raise ValueError("profile checkpoint data/config signature differs")
+        rules = sorted(
+            {
+                self._rule_from_state(item)
+                for item in payload.get("profiled_rules", [])
+            }
+        )
+        if any(
+            any(source not in self.rule_source_ids for source in rule.antecedent)
+            for rule in rules
+        ):
+            raise ValueError("profile checkpoint contains an ineligible predicate")
+        identities: dict[
+            tuple[int, ...], tuple[RuleIdentity, ...]
+        ] = {}
+        for item in payload.get("identity_candidates", []):
+            antecedent = tuple(int(value) for value in item["antecedent"])
+            values = tuple(
+                sorted(
+                    self._rule_from_state(rule)
+                    for rule in item.get("rules", [])
+                )
+            )
+            if values:
+                identities[antecedent] = values
+        allowed_shape_rules = set(rules)
+        for values in identities.values():
+            allowed_shape_rules.update(values)
+        # Re-read shapes after the identity graph is known.  Alternative W/sign
+        # atoms are required by support-conditioned identity refinement even
+        # though only one canonical atom per skeleton is in profiled_rules.
+        shapes = {}
+        for item in payload.get("dictionary_shapes", []):
+            rule = self._rule_from_state(item["rule"])
+            shape = np.asarray(item["shape"], dtype=np.float64)
+            if shape.shape != (self.config.knot_count,) or np.any(
+                ~np.isfinite(shape)
+            ):
+                raise ValueError("profile checkpoint contains an invalid shape")
+            if rule in allowed_shape_rules:
+                shapes[rule] = shape.copy()
+        if self.config.identity_profile == "dictionary_mdl" and any(
+            rule not in shapes for rule in rules
+        ):
+            raise ValueError("profile checkpoint is missing a dictionary shape")
+        self.profiled_rules = rules
+        self.rule_dictionary_shapes = shapes
+        self.identity_candidates = identities
+        self.profile_logs = list(payload.get("profile_logs", []))
+        self._profile_completed = True
+        canonical_terms = {
+            (rule.antecedent, int(rule.window)) for rule in rules
+        }
+        for rule in rules:
+            canonical_terms.update(self.hierarchy_closure((rule,)))
+        self.engine.retain_context_terms(
+            self.splits.fit.name, tuple(canonical_terms)
+        )
+
+    def export_fit_cache_state(self) -> dict:
+        """Serialize converged unmarked occurrence fits for exact resume."""
+        entries: list[dict] = []
+        seen: set[tuple[tuple[RuleIdentity, ...], tuple[ClosureTerm, ...]]] = set()
+        with self._fit_key_locks_guard:
+            items = tuple(self._fit_cache.items())
+        for (_cache_rules, _cache_closure), fit in items:
+            key = (tuple(fit.rules), tuple(fit.closure_terms))
+            if (
+                key in seen
+                or not fit.converged
+                or fit.mark_fit is not None
+                or not math.isfinite(float(fit.nll))
+            ):
+                continue
+            seen.add(key)
+            entries.append(
+                {
+                    "rules": [self._rule_state(rule) for rule in fit.rules],
+                    "closure": [
+                        {
+                            "antecedent": list(antecedent),
+                            "window": int(window),
+                        }
+                        for antecedent, window in fit.closure_terms
+                    ],
+                    "alpha": float(fit.alpha),
+                    "gamma": np.asarray(fit.gamma, dtype=np.float64).tolist(),
+                    "theta": np.asarray(fit.theta, dtype=np.float64).tolist(),
+                    "nll": float(fit.nll),
+                    "kkt_residual": float(fit.kkt_residual),
+                    "iterations": int(fit.iterations),
+                    "device": str(fit.device),
+                    "intensity_nll": (
+                        None
+                        if fit.intensity_nll is None
+                        else float(fit.intensity_nll)
+                    ),
+                }
+            )
+        entries.sort(
+            key=lambda item: (
+                len(item["rules"]),
+                json.dumps(item["rules"], sort_keys=True),
+                json.dumps(item["closure"], sort_keys=True),
+            )
+        )
+        return {
+            "schema": 1,
+            "checkpoint_signature": self.checkpoint_signature(),
+            "fits": entries,
+        }
+
+    def restore_fit_cache_state(self, payload: dict) -> int:
+        if int(payload.get("schema", -1)) != 1:
+            raise ValueError("unsupported fit-cache checkpoint schema")
+        if payload.get("checkpoint_signature") != self.checkpoint_signature():
+            raise ValueError("fit-cache checkpoint data/config signature differs")
+        restored = 0
+        for item in payload.get("fits", []):
+            rules = tuple(
+                sorted(self._rule_from_state(rule) for rule in item["rules"])
+            )
+            closure = tuple(
+                sorted(
+                    (
+                        tuple(int(value) for value in term["antecedent"]),
+                        int(term["window"]),
+                    )
+                    for term in item["closure"]
+                )
+            )
+            gamma = np.asarray(item["gamma"], dtype=np.float64)
+            theta = np.asarray(item["theta"], dtype=np.float64)
+            if theta.ndim == 1 and not rules and theta.size == 0:
+                theta = np.zeros((0, 0), dtype=np.float64)
+            if theta.ndim != 2 or theta.shape[0] != len(rules):
+                raise ValueError("fit checkpoint rule dimension mismatch")
+            if any(
+                any(source not in self.rule_source_ids for source in rule.antecedent)
+                for rule in rules
+            ) or any(
+                any(source not in self.rule_source_ids for source in antecedent)
+                or not 0 <= int(window) <= self.config.max_formation_window
+                for antecedent, window in closure
+            ):
+                raise ValueError("fit checkpoint contains an ineligible rule term")
+            expected_gamma = self.config.knot_count * (
+                int(self.target_history_source_id is not None)
+                + len(self.control_source_ids)
+                + len(self.loan_age_baseline_source_ids)
+                + len(closure)
+            )
+            if gamma.shape != (expected_gamma,):
+                raise ValueError("fit checkpoint nuisance dimension mismatch")
+            if rules:
+                widths = {
+                    1 if rule in self.rule_dictionary_shapes else self.config.knot_count
+                    for rule in rules
+                }
+                if len(widths) != 1 or theta.shape[1] != widths.pop():
+                    raise ValueError("fit checkpoint kernel dimension mismatch")
+            elif theta.size:
+                raise ValueError("null fit checkpoint contains rule coefficients")
+            if (
+                np.any(~np.isfinite(gamma))
+                or np.any(~np.isfinite(theta))
+                or np.any(theta < 0.0)
+                or not math.isfinite(float(item["alpha"]))
+                or not math.isfinite(float(item["nll"]))
+                or not math.isfinite(float(item["kkt_residual"]))
+            ):
+                raise ValueError("fit checkpoint contains invalid coefficients")
+            fit = FitResult(
+                rules=rules,
+                closure_terms=closure,
+                alpha=float(item["alpha"]),
+                gamma=gamma,
+                theta=theta,
+                nll=float(item["nll"]),
+                kkt_residual=float(item["kkt_residual"]),
+                converged=True,
+                iterations=int(item["iterations"]),
+                device=f"resume:{item['device']}",
+                intensity_nll=(
+                    None
+                    if item.get("intensity_nll") is None
+                    else float(item["intensity_nll"])
+                ),
+                mark_fit=None,
+                solver_hessian=None,
+            )
+            self._fit_cache[(rules, closure)] = fit
+            if not rules:
+                self._null_fit_cache[closure] = fit
+            restored += 1
+        return restored
+
+    def checkpoint_signature(self) -> str:
+        cached = self._checkpoint_signature_cache
+        if cached is not None:
+            return cached
+        digest = hashlib.blake2b(digest_size=24)
+        execution_only = {
+            "solver_device",
+            "solver_workers",
+            "support_devices",
+            "support_workers_per_device",
+            "feature_cache_bytes",
+            "persistent_response_dir",
+            "persistent_response_bytes",
+            "loss_summary_cache_bytes",
+            "fit_summary_cache_bytes",
+            "response_workers",
+        }
+        statistical_config = {
+            key: value
+            for key, value in asdict(self.config).items()
+            if key not in execution_only
+        }
+        digest.update(
+            json.dumps(
+                {
+                    "schema": 1,
+                    "predicate_names": self.data.predicate_names,
+                    "rule_source_ids": self.rule_source_ids,
+                    "control_source_ids": self.control_source_ids,
+                    "predicate_policy_name": self.predicate_policy_name,
+                    "target_process_mode": self.target_process_mode,
+                    "occurrence_likelihood": self.occurrence_likelihood,
+                    "mark_name": self.data.mark_name,
+                    "financial_weight_name": self.data.financial_weight_name,
+                    "certification_loss": {
+                        "name": self.certification_loss.name,
+                        "financially_grounded": bool(
+                            self.certification_loss.financially_grounded
+                        ),
+                    },
+                    "config": statistical_config,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        )
+
+        def update_array(array: np.ndarray | None) -> None:
+            if array is None:
+                digest.update(b"<none>")
+                return
+            value = np.asarray(array)
+            digest.update(np.asarray(value.shape, dtype=np.int64).tobytes())
+            digest.update(str(value.dtype).encode("ascii"))
+            if value.dtype.hasobject or value.dtype.kind in {"U", "S"}:
+                digest.update(
+                    json.dumps(
+                        value.tolist(),
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+                )
+                return
+            contiguous = np.ascontiguousarray(value)
+            view = memoryview(contiguous).cast("B")
+            chunk = 8 * 1024**2
+            for left in range(0, len(view), chunk):
+                digest.update(view[left : left + chunk])
+
+        for array in (
+            self.data.sequence_ids,
+            self.data.sequence_codes,
+            self.data.positions,
+            self.data.times,
+            self.data.predicates,
+            self.data.targets,
+            self.data.start_times,
+            self.data.end_times,
+            self.data.sequence_split_groups,
+            self.data.sequence_start_ages,
+            self.data.sequence_financial_weights,
+            self.certification_loss.global_sequence_weights,
+        ):
+            update_array(array)
+        if self.data.target_marks is None:
+            update_array(None)
+            update_array(None)
+        else:
+            update_array(self.data.target_marks.offsets)
+            update_array(self.data.target_marks.values)
+        value = digest.hexdigest()
+        self._checkpoint_signature_cache = value
+        return value
+
+    def _maybe_checkpoint_support_fits(self, *, force: bool = False) -> None:
+        path = self._runtime_checkpoint_path
+        if path is None:
+            return
+        now = time.monotonic()
+        if (
+            not force
+            and now - self._runtime_checkpoint_last_write
+            < self._runtime_checkpoint_interval
+        ):
+            return
+        self._runtime_checkpoint_last_write = now
+        preserved: dict = {}
+        if path.exists():
+            try:
+                preserved = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError, TypeError):
+                preserved = {}
+        preserved.update(
+            {
+                "algorithm": self.algorithm_name,
+                "checkpoint_stage": "support_search_in_progress",
+                "elapsed_seconds": time.perf_counter()
+                - self._runtime_checkpoint_started,
+                "profile_state": self.export_profile_state(),
+                "support_fit_cache": self.export_fit_cache_state(),
+            }
+        )
+        save_result(preserved, path)
+
     def run(self, *, checkpoint_path: str | Path | None = None) -> dict:
         started = time.perf_counter()
+        self._runtime_checkpoint_path = (
+            None if checkpoint_path is None else Path(checkpoint_path)
+        )
+        self._runtime_checkpoint_started = started
+        self._runtime_checkpoint_last_write = -math.inf
         def checkpoint(stage: str, **payload: object) -> None:
             if checkpoint_path is None:
                 return
@@ -8649,6 +12534,10 @@ class CertSCRPipeline:
                         for key in (
                             "hybrid_pricing",
                             "hybrid_full_d_fit_acceptance",
+                            "multifidelity_skeleton_screen",
+                            "full_survivor_reprofiling",
+                            "profile_state",
+                            "support_fit_cache",
                         )
                         if key in previous
                     }
@@ -8674,6 +12563,7 @@ class CertSCRPipeline:
         )
         profile_done = time.perf_counter()
         checkpoint("profile_complete", profiled_rule_count=len(profiled))
+        self._maybe_checkpoint_support_fits(force=True)
         supports = self.search_supports()
         search_done = time.perf_counter()
         checkpoint(
@@ -8713,9 +12603,9 @@ class CertSCRPipeline:
         elapsed = ensemble_done - started
         return {
             "algorithm": self.algorithm_name,
-            "schema_version": 13,
+            "schema_version": 14,
             "support_model": (
-                "three_way_standalone_atoms_hierarchy_links_and_atom_start_terminals_with_independent_certification_and_test"
+                "three_way_standalone_atoms_and_atom_start_local_terminals_with_independent_certification_and_test"
             ),
             "profile": (
                 "oracle-exact-window-sign-and-support-enumeration"
@@ -8745,13 +12635,13 @@ class CertSCRPipeline:
                     "identity not eliminated by a rigorous global MDL upper bound is exact-fitted. Occurrence "
                     "and conditional-mark gains share one shape in marked mode; block dimension, dictionary "
                     "shape code, and W/sign identity code define discovery MDL. Every positive standalone "
-                    "atom of order 1..q_max, every strict hierarchy link, and every unique atom-start "
+                    "atom of order 1..q_max and every unique atom-start local terminal "
                     "local terminal are offered "
                     "a full nonnegative M-knot occurrence refinement; only full-cone KKT-converged, positive "
                     "full-M block-MDL supports proceed to the D_fit reliability screen. The scalar-dictionary "
-                    "active-set certificate and the terminal full-M acceptance are both exact for their stated "
+                    "configured-neighborhood certificate and the terminal full-M acceptance are both exact for their stated "
                     "objectives. The per-identity scalar dictionary shape is the exhaustively best null-score "
-                    "shape, not an exact likelihood-profiled shape; full-M one-exchange stationarity over "
+                    "shape, not an exact likelihood-profiled shape; full-M discrete-neighborhood stationarity over "
                     "unreturned supports is not claimed."
                 ) if self.config.identity_profile == "dictionary_mdl" else (
                     "Each antecedent skeleton defines one stable canonical rule atom; W/sign are exactly profiled "
@@ -8826,6 +12716,13 @@ class CertSCRPipeline:
                     ),
                     "same_bin_target_predicts_itself": False,
                 },
+                "loan_age_baseline": {
+                    "enabled": bool(self.loan_age_baseline_source_ids),
+                    "milestones": list(self.loan_age_baseline_milestones),
+                    "epoch_width_months": int(self.config.impact_lag),
+                    "knot_count_per_epoch": int(self.config.knot_count),
+                    "candidate_rule_eligible": False,
+                },
                 "predicate_policy": self.predicate_policy_name,
                 "F0_contract": (
                     self._f0_contract()
@@ -8837,6 +12734,16 @@ class CertSCRPipeline:
                     "cert": self.splits.cert.n_sequences,
                     "test": self.splits.test.n_sequences,
                 },
+                "split_strategy": self.splits.split_strategy,
+                "split_groups": (
+                    {
+                        "fit": list(self.splits.split_groups[0]),
+                        "cert": list(self.splits.split_groups[1]),
+                        "test": list(self.splits.split_groups[2]),
+                    }
+                    if self.splits.split_groups is not None
+                    else None
+                ),
                 "fit_sampling": {
                     "population_sequences": self.splits.fit_population_sequence_count,
                     "population_negative_sequences": self.splits.fit_population_negative_count,
@@ -8864,6 +12771,21 @@ class CertSCRPipeline:
                     if self.target_history_source_id is not None
                     else None
                 ),
+                "loan_age_baseline_gamma": (
+                    baseline.gamma[
+                        (
+                            self.config.knot_count
+                            if self.target_history_source_id is not None
+                            else 0
+                        )
+                        + len(self.control_source_ids) * self.config.knot_count :
+                    ].reshape(
+                        len(self.loan_age_baseline_source_ids),
+                        self.config.knot_count,
+                    ).tolist()
+                    if self.loan_age_baseline_source_ids
+                    else None
+                ),
                 "kkt_residual": baseline.kkt_residual,
                 "converged": baseline.converged,
             },
@@ -8877,6 +12799,38 @@ class CertSCRPipeline:
                 "equivalent_sparse_response_hits": int(
                     self.engine.equivalent_response_hits
                 ),
+                "persistent_response_store": {
+                    "enabled": bool(
+                        self.config.persistent_response_bytes > 0
+                    ),
+                    "directory": self.config.persistent_response_dir,
+                    "byte_limit": int(
+                        self.config.persistent_response_bytes
+                    ),
+                    "mapped_bytes": int(
+                        self.engine._persistent_response_bytes
+                    ),
+                    "resident_mmap_entries": int(
+                        len(self.engine._persistent_sparse_cache)
+                    ),
+                    "resident_mmap_bytes": int(
+                        self.engine._persistent_sparse_cache_bytes
+                    ),
+                    "resident_heap_feature_bytes": int(
+                        self.engine._feature_cache_bytes
+                    ),
+                    "combined_resident_byte_limit": int(
+                        self.engine._feature_cache_limit
+                    ),
+                    "resident_mmap_evictions": int(
+                        self.engine.persistent_response_evictions
+                    ),
+                    "hits": int(self.engine.persistent_response_hits),
+                    "writes": int(self.engine.persistent_response_writes),
+                    "skipped_bytes": int(
+                        self.engine.persistent_response_skipped_bytes
+                    ),
+                },
                 "child_support_kkt_shortcuts": int(
                     self._safe_screen_stats["child_kkt_shortcuts"]
                 ),
@@ -8901,13 +12855,26 @@ class CertSCRPipeline:
                 "parallel_support_evaluation_workers": len(
                     self._support_worker_devices()
                 ),
+                "maximum_concurrent_exact_fits": int(
+                    self._exact_fit_worker_limit(
+                        len(self._support_worker_devices())
+                    )
+                ),
                 "support_local_summary_scope": "current_support_only",
                 "cross_support_summary_reuse": (
                     "frozen_graph_keys_only_with_byte_bounded_LRU"
                 ),
                 "active_fit_execution": {
                     "closure_local_batches": True,
-                    "nested_support_order": "ascending_size_exact_warm_start",
+                    "default_backend": (
+                        "shared_long_lived_threads_with_compiled_MKL_kernels"
+                    ),
+                    "process_backend_opt_in_environment": (
+                        "CERTSCR_PROCESS_FITS=1"
+                    ),
+                    "nested_support_order": (
+                        "ascending_size_semantic_feasible_warm_start"
+                    ),
                     "thread_batches": int(
                         self._safe_screen_stats["active_fit_thread_batches"]
                     ),
@@ -8916,6 +12883,52 @@ class CertSCRPipeline:
                     ),
                     "scheduled_closure_groups": int(
                         self._safe_screen_stats["active_fit_closure_groups"]
+                    ),
+                    "shared_closure_null_prefits": int(
+                        self._safe_screen_stats[
+                            "active_fit_shared_closure_null_prefits"
+                        ]
+                    ),
+                    "closure_child_shards": int(
+                        self._safe_screen_stats[
+                            "active_fit_closure_shards"
+                        ]
+                    ),
+                    "rolling_microjobs": int(
+                        self._safe_screen_stats["active_fit_dynamic_jobs"]
+                    ),
+                    "rolling_worker_launches": int(
+                        self._safe_screen_stats[
+                            "active_fit_dynamic_worker_launches"
+                        ]
+                    ),
+                    "support_closure_partitions": int(
+                        self._safe_screen_stats["support_closure_partitions"]
+                    ),
+                    "support_closure_child_reuses": int(
+                        self._safe_screen_stats[
+                            "support_closure_partition_child_reuses"
+                        ]
+                    ),
+                    "support_delta_factorized_fits": int(
+                        self._safe_screen_stats[
+                            "support_delta_factorized_fits"
+                        ]
+                    ),
+                    "support_semantic_warm_starts": int(
+                        self._safe_screen_stats[
+                            "support_semantic_warm_starts"
+                        ]
+                    ),
+                    "support_delta_factorization_fallbacks": int(
+                        self._safe_screen_stats[
+                            "support_closure_partition_fallbacks"
+                        ]
+                    ),
+                    "joint_null_kkt_screens": int(
+                        self._safe_screen_stats[
+                            "support_joint_null_kkt_screens"
+                        ]
                     ),
                     "profile_fit_results_reused": int(
                         self._safe_screen_stats["profile_fit_results_reused"]
@@ -8942,6 +12955,16 @@ class CertSCRPipeline:
                     "identity_sign_pair_child_reuses": int(
                         self._safe_screen_stats[
                             "identity_sign_pair_child_reuses"
+                        ]
+                    ),
+                    "identity_fused_profile_exact_fits": int(
+                        self._safe_screen_stats[
+                            "identity_fused_profile_exact_fits"
+                        ]
+                    ),
+                    "identity_incremental_partition_rebuilds": int(
+                        self._safe_screen_stats[
+                            "identity_incremental_partition_rebuilds"
                         ]
                     ),
                     "nested_prepared_parent_designs": int(
