@@ -142,6 +142,38 @@ class NumericalParityTests(unittest.TestCase):
             self.assertGreater(block.nbytes, 1)
             self.assertLessEqual(engine._cache_size, engine.cache_bytes)
 
+    def test_support_matrix_cache_is_bounded_without_refitting(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            data = synthetic_dataset(Path(directory) / "data", 60)
+            fit_codes, _, _ = data.split((0.6, 0.2, 0.2), 111)
+            config = RunConfig(
+                dataset=str(data.root),
+                q_max=2,
+                impact_lag=3,
+                knot_count=2,
+                formation_windows=(0, 1),
+                solver_tolerance=1e-8,
+                solver_max_iter=120,
+                cache_bytes=4096,
+                early_warning_horizon=3,
+                pricing_devices=(),
+            )
+            optimizer = SupportOptimizer(Context.make(data, fit_codes), config)
+            empty = optimizer.records[Support(())]
+            fitted = []
+            for rule in optimizer.dictionary:
+                fitted.append(optimizer.fit(Support.of((rule,)), empty))
+            exact_before = optimizer.diagnostics.exact_fits
+            for record in fitted:
+                recovered = optimizer.fit(record.support, empty)
+                self.assertEqual(recovered.fit.nll, record.fit.nll)
+            self.assertEqual(optimizer.diagnostics.exact_fits, exact_before)
+            baseline_bytes = optimizer.records[Support(())].matrix.nbytes
+            self.assertLessEqual(
+                optimizer._record_cache_bytes,
+                max(optimizer._record_cache_limit, baseline_bytes),
+            )
+
     def test_every_primal_dual_sandwich_contains_exact_support_score(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             data = synthetic_dataset(Path(directory) / "data", 60)

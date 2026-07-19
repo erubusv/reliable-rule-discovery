@@ -111,6 +111,18 @@ class ModelMatrix:
     def dimension(self) -> int:
         return int(self.x.shape[1])
 
+    @property
+    def nbytes(self) -> int:
+        return int(
+            self.x.nbytes
+            + self.exposure_weight.nbytes
+            + self.noevent_weight.nbytes
+            + self.event_weight.nbytes
+            + self.active_rows.nbytes
+            + self.active_age_bins.nbytes
+            + self.aggregate_bins.nbytes
+        )
+
 
 class ResponseEngine:
     def __init__(
@@ -148,6 +160,16 @@ class ResponseEngine:
         self._baseline_cache: dict[int, np.ndarray] = {}
         self._entity_age_cache: dict[int, np.ndarray] = {}
         self._lock = threading.RLock()
+
+    def clear_caches(self) -> None:
+        with self._lock:
+            self._cache.clear()
+            self._cache_size = 0
+            self._completion_cache.clear()
+            self._completion_cache_size = 0
+            self._source_cache.clear()
+            self._baseline_cache.clear()
+            self._entity_age_cache.clear()
 
     def _source(
         self, predicate: int, context: Context

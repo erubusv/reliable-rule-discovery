@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 
@@ -20,7 +21,7 @@ from .rules import (
     hierarchy_closure,
     skeletons,
 )
-from .solver import fit_model_matrix
+from .solver import FitResult, fit_model_matrix
 
 
 @dataclass(frozen=True)
@@ -61,6 +62,13 @@ class SearchResult:
     positive_atoms: tuple[SupportRecord, ...]
     paths: tuple[dict[str, object], ...]
     diagnostics: SearchDiagnostics
+
+
+@dataclass(frozen=True)
+class _StoredRecord:
+    fit: FitResult
+    penalty: float
+    score: float
 
 
 def _nonnegative_quadratic_gain(gradient: np.ndarray, hessian: np.ndarray) -> float:
@@ -108,7 +116,7 @@ class SupportOptimizer:
             context.dataset,
             lag=config.impact_lag,
             knot_count=config.knot_count,
-            cache_bytes=config.cache_bytes,
+            cache_bytes=5 * config.cache_bytes // 8,
         )
         all_skeletons = skeletons(context.dataset.n_predicates, config.q_max)
         self.diagnostics = SearchDiagnostics(total_skeletons=len(all_skeletons))
@@ -125,13 +133,18 @@ class SupportOptimizer:
                 len(config.formation_windows),
             ),
         )
-        self.records: dict[Support, SupportRecord] = {}
-        self._addition_cache: dict[Support, SupportRecord | None] = {}
-        self._feature_rows_cache: dict[Support, np.ndarray] = {}
-        self._relaxed_upper_cache: dict[Support, float] = {}
-        self._pricing_state: dict[
-            Support, tuple[np.ndarray, np.ndarray, np.ndarray]
-        ] = {}
+        self.records: OrderedDict[Support, SupportRecord] = OrderedDict()
+        self._stored_records: dict[Support, _StoredRecord] = {}
+        self._record_cache_bytes = 0
+        self._record_cache_limit = max(1, 2 * config.cache_bytes // 8)
+        self._addition_cache: dict[Support, Support | None] = {}
+        self._relaxed_upper_cache: OrderedDict[Support, float] = OrderedDict()
+        self._relaxed_upper_limit = max(1, min(200_000, config.cache_bytes // 256))
+        self._pricing_state: OrderedDict[Support, tuple[np.ndarray, np.ndarray]] = (
+            OrderedDict()
+        )
+        self._pricing_cache_bytes = 0
+        self._pricing_cache_limit = max(1, config.cache_bytes // 8)
         baseline_matrix = self.engine.model_matrix(context, EMPTY_SUPPORT)
         baseline_fit = fit_model_matrix(
             baseline_matrix,
@@ -144,10 +157,45 @@ class SupportOptimizer:
         self.baseline_dimension = baseline_matrix.dimension
         self.baseline_nll = baseline_fit.nll
         self.saturated_nll_lower_bound = self._saturated_nll_lower_bound()
-        self.records[EMPTY_SUPPORT] = SupportRecord(
+        baseline_record = SupportRecord(
             EMPTY_SUPPORT, baseline_matrix, baseline_fit, 0.0, 0.0
         )
+        self._stored_records[EMPTY_SUPPORT] = _StoredRecord(baseline_fit, 0.0, 0.0)
+        self._retain_record(baseline_record)
         self.diagnostics.exact_fits += 1
+
+    @staticmethod
+    def _record_nbytes(record: SupportRecord) -> int:
+        return int(record.matrix.nbytes + record.fit.coefficients.nbytes)
+
+    def _retain_record(self, record: SupportRecord) -> SupportRecord:
+        previous = self.records.pop(record.support, None)
+        if previous is not None:
+            self._record_cache_bytes -= self._record_nbytes(previous)
+        self.records[record.support] = record
+        self._record_cache_bytes += self._record_nbytes(record)
+        while self._record_cache_bytes > self._record_cache_limit:
+            removable = next(
+                (support for support in self.records if support != EMPTY_SUPPORT),
+                None,
+            )
+            if removable is None:
+                break
+            removed = self.records.pop(removable)
+            self._record_cache_bytes -= self._record_nbytes(removed)
+        return record
+
+    def release_search_caches(self) -> None:
+        self.engine.clear_caches()
+        self._addition_cache.clear()
+        self._pricing_state.clear()
+        self._pricing_cache_bytes = 0
+        self._relaxed_upper_cache.clear()
+        baseline = self.records.get(EMPTY_SUPPORT)
+        self.records.clear()
+        self._record_cache_bytes = 0
+        if baseline is not None:
+            self._retain_record(baseline)
 
     def _structurally_admissible_dictionary(
         self, all_skeletons: tuple[Antecedent, ...]
@@ -247,8 +295,17 @@ class SupportOptimizer:
     ) -> SupportRecord:
         cached = self.records.get(support)
         if cached is not None:
+            self.records.move_to_end(support)
             self.diagnostics.fit_cache_hits += 1
             return cached
+        stored = self._stored_records.get(support)
+        if stored is not None:
+            matrix = self.engine.model_matrix(self.context, support)
+            record = SupportRecord(
+                support, matrix, stored.fit, stored.penalty, stored.score
+            )
+            self.diagnostics.fit_cache_hits += 1
+            return self._retain_record(record)
         matrix = self.engine.model_matrix(self.context, support)
         warm = None if source is None else self.warm_start(source, matrix)
         fit = fit_model_matrix(
@@ -267,7 +324,8 @@ class SupportOptimizer:
             else -math.inf
         )
         record = SupportRecord(support, matrix, fit, penalty, score)
-        self.records[support] = record
+        self._stored_records[support] = _StoredRecord(fit, penalty, score)
+        self._retain_record(record)
         self.diagnostics.exact_fits += 1
         return record
 
@@ -279,9 +337,6 @@ class SupportOptimizer:
         )
 
     def _feature_rows(self, support: Support) -> np.ndarray:
-        cached = self._feature_rows_cache.get(support)
-        if cached is not None:
-            return cached
         parts = [
             self.engine.block(self.context, term.antecedent, term.window).rows
             for term in hierarchy_closure(support)
@@ -296,7 +351,6 @@ class SupportOptimizer:
             if nonempty
             else np.zeros(0, dtype=np.int64)
         )
-        self._feature_rows_cache[support] = result
         return result
 
     def localized_upper_score(self, support: Support) -> float:
@@ -307,8 +361,9 @@ class SupportOptimizer:
         This relaxed model contains the exact support model, so its minimum
         NLL is a rigorous lower bound on the exact minimum NLL.
         """
-        cached = self._relaxed_upper_cache.get(support)
-        if cached is not None:
+        if support in self._relaxed_upper_cache:
+            cached = self._relaxed_upper_cache[support]
+            self._relaxed_upper_cache.move_to_end(support)
             return cached
         affected = self._feature_rows(support)
         positions = np.searchsorted(self.context.target_rows, affected)
@@ -359,6 +414,8 @@ class SupportOptimizer:
         )
         score = min(score, self.saturated_upper_score(support))
         self._relaxed_upper_cache[support] = score
+        while len(self._relaxed_upper_cache) > self._relaxed_upper_limit:
+            self._relaxed_upper_cache.popitem(last=False)
         return score
 
     def bounds(self, current: SupportRecord, trial: Support) -> ProposalBounds:
@@ -451,9 +508,10 @@ class SupportOptimizer:
 
     def _pricing_components(
         self, current: SupportRecord
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    ) -> tuple[np.ndarray, np.ndarray]:
         cached = self._pricing_state.get(current.support)
         if cached is not None:
+            self._pricing_state.move_to_end(current.support)
             return cached
         eta = current.matrix.x @ current.fit.coefficients
         _, _, second = loss_rows(
@@ -473,8 +531,12 @@ class SupportOptimizer:
             hessian[np.ix_(indices, indices)],
             rcond=max(1.0e-12, self.config.solver_tolerance),
         )
-        result = indices, inverse, eta
+        result = indices, inverse
         self._pricing_state[current.support] = result
+        self._pricing_cache_bytes += indices.nbytes + inverse.nbytes
+        while self._pricing_cache_bytes > self._pricing_cache_limit:
+            _, removed = self._pricing_state.popitem(last=False)
+            self._pricing_cache_bytes -= removed[0].nbytes + removed[1].nbytes
         return result
 
     def block_price(
@@ -484,37 +546,51 @@ class SupportOptimizer:
         block = self.engine.block(self.context, rule.antecedent, rule.window)
         if not len(block.rows):
             return 0.0
-        indices, inverse, _ = self._pricing_components(current)
-        design = self.engine.design_at_rows_with_context(
-            self.context, current.matrix, block.rows
+        indices, inverse = self._pricing_components(current)
+        gradient = np.zeros(self.config.knot_count, dtype=np.float64)
+        hessian = np.zeros(
+            (self.config.knot_count, self.config.knot_count), dtype=np.float64
         )
-        eta = design @ current.fit.coefficients
-        positions = np.searchsorted(self.context.target_rows, block.rows)
-        matched = positions < len(self.context.target_rows)
-        if len(self.context.target_rows):
-            safe = np.minimum(positions, len(self.context.target_rows) - 1)
-            matched &= self.context.target_rows[safe] == block.rows
-        event = np.zeros(len(block.rows), dtype=np.float64)
-        if np.any(matched):
-            event[matched] = self.context.target_counts[positions[matched]]
-        exposure = np.full(len(block.rows), self.engine.tick_exposure, dtype=np.float64)
-        noevent = (
-            exposure - event
-            if self.context.dataset.likelihood == "first_event_cloglog"
-            else exposure
-        )
-        _, first, second = loss_rows(
-            eta,
-            likelihood=self.context.dataset.likelihood,
-            exposure_weight=exposure,
-            noevent_weight=noevent,
-            event_weight=event,
-        )
-        candidate = float(rule.sign) * block.values
-        gradient, hessian = moments(candidate, first, second, device=device)
+        cross = np.zeros((len(indices), self.config.knot_count), dtype=np.float64)
+        # Bound host/device working memory independently of the footprint size.
+        for start in range(0, len(block.rows), 131_072):
+            end = min(len(block.rows), start + 131_072)
+            rows = block.rows[start:end]
+            design = self.engine.design_at_rows_with_context(
+                self.context, current.matrix, rows
+            )
+            eta = design @ current.fit.coefficients
+            positions = np.searchsorted(self.context.target_rows, rows)
+            matched = positions < len(self.context.target_rows)
+            if len(self.context.target_rows):
+                safe = np.minimum(positions, len(self.context.target_rows) - 1)
+                matched &= self.context.target_rows[safe] == rows
+            event = np.zeros(len(rows), dtype=np.float64)
+            if np.any(matched):
+                event[matched] = self.context.target_counts[positions[matched]]
+            exposure = np.full(len(rows), self.engine.tick_exposure, dtype=np.float64)
+            noevent = (
+                exposure - event
+                if self.context.dataset.likelihood == "first_event_cloglog"
+                else exposure
+            )
+            _, first, second = loss_rows(
+                eta,
+                likelihood=self.context.dataset.likelihood,
+                exposure_weight=exposure,
+                noevent_weight=noevent,
+                event_weight=event,
+            )
+            candidate = float(rule.sign) * block.values[start:end]
+            tile_gradient, tile_hessian = moments(
+                candidate, first, second, device=device
+            )
+            gradient += tile_gradient
+            hessian += tile_hessian
+            if len(indices):
+                cross += design[:, indices].T @ (second[:, None] * candidate)
         if len(indices):
-            cross = design[:, indices].T @ (second[:, None] * candidate)
-            hessian = hessian - cross.T @ inverse @ cross
+            hessian -= cross.T @ inverse @ cross
         eigenvalues, eigenvectors = np.linalg.eigh(0.5 * (hessian + hessian.T))
         scale = max(1.0, float(np.max(np.abs(eigenvalues))))
         eigenvalues = np.maximum(eigenvalues, scale * 1.0e-12)
@@ -565,7 +641,8 @@ class SupportOptimizer:
         antecedents: set[Antecedent] | None = None,
     ) -> SupportRecord | None:
         if antecedents is None and current.support in self._addition_cache:
-            return self._addition_cache[current.support]
+            cached_support = self._addition_cache[current.support]
+            return None if cached_support is None else self.fit(cached_support, current)
         identities = self._inactive_identities(current.support, antecedents)
         if not identities:
             if antecedents is None:
@@ -595,7 +672,9 @@ class SupportOptimizer:
             if record.score > incumbent_score + self.config.search_tolerance:
                 incumbent, incumbent_score = record, record.score
         if antecedents is None:
-            self._addition_cache[current.support] = incumbent
+            self._addition_cache[current.support] = (
+                None if incumbent is None else incumbent.support
+            )
         return incumbent
 
     def _standalone_skeleton(

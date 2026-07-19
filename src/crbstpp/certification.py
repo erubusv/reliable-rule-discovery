@@ -193,7 +193,7 @@ def certify_family(
         certification_context.dataset,
         lag=config.impact_lag,
         knot_count=config.knot_count,
-        cache_bytes=config.cache_bytes,
+        cache_bytes=config.cache_bytes // 4,
     )
     interim: list[tuple[SupportRecord, float, dict[str, object], tuple[str, ...]]] = []
     for record in family:

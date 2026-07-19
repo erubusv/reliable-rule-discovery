@@ -230,6 +230,7 @@ def run(
     certified_supports = tuple(
         model.record.support for model in certification.certified
     )
+    optimizer.release_search_caches()
     ensemble = fit_ensemble(combined_context, test_context, certified_supports, config)
     search_payload: dict[str, object]
     if search_result is None:
