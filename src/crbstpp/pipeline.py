@@ -3,6 +3,7 @@ from __future__ import annotations
 import datetime as dt
 import json
 import logging
+import time
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
@@ -102,6 +103,7 @@ def _default_run_id() -> str:
 def run(
     config: RunConfig, *, run_dir: str | Path | None = None, resume: bool = False
 ) -> RunReport:
+    run_started = time.perf_counter()
     config.validate()
     dataset = Dataset.load(config.dataset)
     if run_dir is None:
@@ -190,14 +192,19 @@ def run(
         "search_complete",
         "certification_complete",
     }:
+        resumed_supports = [
+            _support_from_payload(payload) for payload in checkpoint["family"]
+        ]
         family = tuple(
-            optimizer.fit(_support_from_payload(payload))
-            for payload in checkpoint["family"]
+            optimizer.fit_many(resumed_supports, optimizer.records[Support(())])
         )
         search_result = None
+        search_seconds = 0.0
     else:
         logger.info("starting support search")
+        search_started = time.perf_counter()
         search_result = optimizer.search()
+        search_seconds = time.perf_counter() - search_started
         family = search_result.family
         atomic_json(
             checkpoint_path,
@@ -211,7 +218,9 @@ def run(
             },
         )
     logger.info("certifying family_size=%d", len(family))
+    certification_started = time.perf_counter()
     certification = certify_family(optimizer, cert_context, family, config)
+    certification_seconds = time.perf_counter() - certification_started
     atomic_json(
         checkpoint_path,
         {
@@ -231,7 +240,9 @@ def run(
         model.record.support for model in certification.certified
     )
     optimizer.release_search_caches()
+    ensemble_started = time.perf_counter()
     ensemble = fit_ensemble(combined_context, test_context, certified_supports, config)
+    ensemble_seconds = time.perf_counter() - ensemble_started
     search_payload: dict[str, object]
     if search_result is None:
         search_payload = {
@@ -276,6 +287,15 @@ def run(
         },
         "ensemble": ensemble.to_dict(),
     }
+    atomic_json(
+        run_dir / "timing.json",
+        {
+            "search": search_seconds,
+            "certification": certification_seconds,
+            "ensemble": ensemble_seconds,
+            "total": time.perf_counter() - run_started,
+        },
+    )
     atomic_json(run_dir / "result.json", result_payload)
     checkpoint_path.unlink(missing_ok=True)
     logger.info("completed certified=%d", len(certification.certified))

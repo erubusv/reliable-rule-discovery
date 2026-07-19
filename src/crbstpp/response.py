@@ -7,7 +7,12 @@ from dataclasses import dataclass
 import numpy as np
 
 from .data import Dataset
-from .native import completion_events, kernel_contributions
+from .native import (
+    accumulate_kernel,
+    completion_events,
+    future_rows,
+    kernel_contributions,
+)
 from .rules import Antecedent, ClosureTerm, RuleIdentity, Support, hierarchy_closure
 
 
@@ -148,7 +153,8 @@ class ResponseEngine:
         # data-dependent bin merge.
         self.baseline_dimension = 1
         self.cache_bytes = max(0, int(cache_bytes))
-        self._block_cache_limit = 3 * self.cache_bytes // 4
+        # The four numeric LRUs together stay within ``cache_bytes``.
+        self._block_cache_limit = 5 * self.cache_bytes // 8
         self._cache: OrderedDict[tuple, SparseBlock] = OrderedDict()
         self._cache_size = 0
         self._completion_cache: OrderedDict[
@@ -159,7 +165,30 @@ class ResponseEngine:
         self._source_cache: dict[tuple[int, int], tuple[np.ndarray, np.ndarray]] = {}
         self._baseline_cache: dict[int, np.ndarray] = {}
         self._entity_age_cache: dict[int, np.ndarray] = {}
+        self._footprint_cache: OrderedDict[tuple, np.ndarray] = OrderedDict()
+        self._footprint_cache_size = 0
+        self._footprint_cache_limit = min(self.cache_bytes // 16, 512 * 1024**2)
+        self._row_threshold_cache: OrderedDict[tuple, tuple[np.ndarray, np.ndarray]] = (
+            OrderedDict()
+        )
+        self._row_threshold_cache_size = 0
+        self._row_threshold_cache_limit = min(self.cache_bytes // 16, 512 * 1024**2)
         self._lock = threading.RLock()
+        # Different exact-fit workers frequently request the same hierarchy
+        # blocks.  The LRU itself is thread-safe, but without key-scoped locks
+        # every worker can still perform the same expensive miss concurrently.
+        # Keep these locks for the engine lifetime: the number of structural
+        # keys is finite and tiny compared with the cached numeric arrays.
+        self._compute_locks: dict[tuple, threading.Lock] = {}
+
+    def _compute_lock(self, namespace: str, key: tuple) -> threading.Lock:
+        namespaced = (namespace, *key)
+        with self._lock:
+            lock = self._compute_locks.get(namespaced)
+            if lock is None:
+                lock = threading.Lock()
+                self._compute_locks[namespaced] = lock
+            return lock
 
     def clear_caches(self) -> None:
         with self._lock:
@@ -170,6 +199,11 @@ class ResponseEngine:
             self._source_cache.clear()
             self._baseline_cache.clear()
             self._entity_age_cache.clear()
+            self._footprint_cache.clear()
+            self._footprint_cache_size = 0
+            self._row_threshold_cache.clear()
+            self._row_threshold_cache_size = 0
+            self._compute_locks.clear()
 
     def _source(
         self, predicate: int, context: Context
@@ -179,13 +213,18 @@ class ResponseEngine:
             cached = self._source_cache.get(key)
             if cached is not None:
                 return cached
-        entities, times = self.dataset.predicate_stream(predicate)
-        local = context.entity_lookup[entities]
-        keep = local >= 0
-        result = local[keep].astype(np.int32), times[keep].astype(np.int64)
-        with self._lock:
-            self._source_cache[key] = result
-        return result
+        with self._compute_lock("source", key):
+            with self._lock:
+                cached = self._source_cache.get(key)
+                if cached is not None:
+                    return cached
+            entities, times = self.dataset.predicate_stream(predicate)
+            local = context.entity_lookup[entities]
+            keep = local >= 0
+            result = local[keep].astype(np.int32), times[keep].astype(np.int64)
+            with self._lock:
+                self._source_cache[key] = result
+            return result
 
     def completions(
         self, context: Context, antecedent: Antecedent
@@ -196,6 +235,20 @@ class ResponseEngine:
             if cached is not None:
                 self._completion_cache.move_to_end(key)
                 return cached
+        with self._compute_lock("completion", key):
+            with self._lock:
+                cached = self._completion_cache.get(key)
+                if cached is not None:
+                    self._completion_cache.move_to_end(key)
+                    return cached
+            return self._compute_completions(context, antecedent, key)
+
+    def _compute_completions(
+        self,
+        context: Context,
+        antecedent: Antecedent,
+        key: tuple[int, Antecedent],
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         sources = [self._source(predicate, context) for predicate in antecedent]
         compiled = completion_events(sources)
         if compiled is not None:
@@ -251,6 +304,44 @@ class ResponseEngine:
             np.asarray(completion_spans, dtype=np.int64),
         )
         return self._retain_completions(key, result)
+
+    def effective_windows(
+        self,
+        context: Context,
+        antecedent: Antecedent,
+        windows: tuple[int, ...],
+    ) -> tuple[int, ...]:
+        """Return exactly the windows with distinct nonzero response blocks.
+
+        Response blocks are nested in ``W``.  A newly admitted completion
+        changes the block iff it has at least one strictly-future observed
+        row.  Kernel bases are nonnegative and every productive completion
+        contributes a positive basis entry, so counting productive spans is
+        an exact response-equivalence test rather than a screening heuristic.
+        """
+        if not windows:
+            return ()
+        entities, times, spans = self.completions(context, antecedent)
+        if not len(entities):
+            return ()
+        productive = times < context.ends[entities]
+        productive_spans = np.sort(spans[productive])
+        if not len(productive_spans):
+            return ()
+        previous = 0
+        effective: list[int] = []
+        for window in windows:
+            admitted = int(
+                np.searchsorted(
+                    productive_spans,
+                    int(window) * self.dataset.ticks_per_unit,
+                    side="right",
+                )
+            )
+            if admitted > previous:
+                effective.append(int(window))
+                previous = admitted
+        return tuple(effective)
 
     def _retain_completions(
         self,
@@ -350,6 +441,21 @@ class ResponseEngine:
             if cached is not None:
                 self._cache.move_to_end(key)
                 return cached
+        with self._compute_lock("block", key):
+            with self._lock:
+                cached = self._cache.get(key)
+                if cached is not None:
+                    self._cache.move_to_end(key)
+                    return cached
+            return self._compute_block(context, antecedent, int(window), key)
+
+    def _compute_block(
+        self,
+        context: Context,
+        antecedent: Antecedent,
+        window: int,
+        key: tuple,
+    ) -> SparseBlock:
         entities, times, spans = self.completions(context, antecedent)
         window_ticks = int(window) * self.dataset.ticks_per_unit
         keep = spans <= window_ticks
@@ -395,6 +501,9 @@ class ResponseEngine:
             rows = np.zeros(0, dtype=np.int64)
             matrix = np.zeros((0, self.knot_count), dtype=np.float64)
         result = SparseBlock(rows, matrix)
+        return self._retain_block(key, result)
+
+    def _retain_block(self, key: tuple, result: SparseBlock) -> SparseBlock:
         if result.nbytes > self._block_cache_limit:
             return result
         with self._lock:
@@ -408,6 +517,130 @@ class ResponseEngine:
                 _, removed = self._cache.popitem(last=False)
                 self._cache_size -= removed.nbytes
         return result
+
+    def blocks_many(
+        self,
+        context: Context,
+        antecedent: Antecedent,
+        windows: tuple[int, ...],
+    ) -> dict[int, SparseBlock]:
+        """Build every nested W block after one pass over completions.
+
+        Newly admitted completions are accumulated exactly once.  A compact
+        global-row lookup maps them into the maximum-W footprint, after which
+        each requested block is a deterministic snapshot of the accumulator.
+        """
+        requested = tuple(sorted(set(map(int, windows))))
+        if not requested:
+            return {}
+        keys = {window: (id(context), antecedent, window) for window in requested}
+        with self._lock:
+            cached = {
+                window: self._cache[key]
+                for window, key in keys.items()
+                if key in self._cache
+            }
+            for window in cached:
+                self._cache.move_to_end(keys[window])
+        if len(cached) == len(requested):
+            return cached
+        group_key = (id(context), antecedent, *requested)
+        with self._compute_lock("blocks-many", group_key):
+            with self._lock:
+                cached = {
+                    window: self._cache[key]
+                    for window, key in keys.items()
+                    if key in self._cache
+                }
+                for window in cached:
+                    self._cache.move_to_end(keys[window])
+            if len(cached) == len(requested):
+                return cached
+            maximum_window = max(requested)
+            threshold_rows, minimum_spans = self.response_row_thresholds(
+                context, antecedent, maximum_window
+            )
+            if not len(threshold_rows):
+                empty = SparseBlock(
+                    np.zeros(0, dtype=np.int64),
+                    np.zeros((0, self.knot_count), dtype=np.float64),
+                )
+                return {
+                    window: self._retain_block(keys[window], empty)
+                    for window in requested
+                }
+            lookup = np.full(context.n_grid, -1, dtype=np.int64)
+            lookup[threshold_rows] = np.arange(len(threshold_rows), dtype=np.int64)
+            accumulator = np.zeros(
+                (len(threshold_rows), self.knot_count), dtype=np.float64
+            )
+            entities, times, spans = self.completions(context, antecedent)
+            maximum_ticks = maximum_window * self.dataset.ticks_per_unit
+            admitted = spans <= maximum_ticks
+            entities, times, spans = (
+                entities[admitted],
+                times[admitted],
+                spans[admitted],
+            )
+            order = np.argsort(spans, kind="stable")
+            entities, times, spans = entities[order], times[order], spans[order]
+            output: dict[int, SparseBlock] = {}
+            left = 0
+            for window in requested:
+                window_ticks = window * self.dataset.ticks_per_unit
+                right = int(np.searchsorted(spans, window_ticks, side="right"))
+                if right > left:
+                    compiled = accumulate_kernel(
+                        entities[left:right],
+                        times[left:right],
+                        context.starts,
+                        context.ends,
+                        context.offsets,
+                        self.basis,
+                        lookup,
+                        accumulator,
+                    )
+                    if not compiled:
+                        contributions = kernel_contributions(
+                            entities[left:right],
+                            times[left:right],
+                            spans[left:right],
+                            context.starts,
+                            context.ends,
+                            context.offsets,
+                            self.basis,
+                            window_ticks,
+                        )
+                        if contributions is None:
+                            for entity, completion in zip(
+                                entities[left:right].tolist(),
+                                times[left:right].tolist(),
+                                strict=True,
+                            ):
+                                base = int(
+                                    context.offsets[entity]
+                                    + completion
+                                    - context.starts[entity]
+                                )
+                                remaining = min(
+                                    self.lag,
+                                    int(context.ends[entity] - completion),
+                                )
+                                for lag in range(1, remaining + 1):
+                                    accumulator[lookup[base + lag]] += self.basis[
+                                        :, lag - 1
+                                    ]
+                        else:
+                            raw_rows, raw_values = contributions
+                            np.add.at(accumulator, lookup[raw_rows], raw_values)
+                left = right
+                footprint = minimum_spans <= window_ticks
+                rows = threshold_rows[footprint]
+                values = accumulator[footprint].copy()
+                output[window] = self._retain_block(
+                    keys[window], SparseBlock(rows, values)
+                )
+            return output
 
     def model_matrix(
         self,
@@ -610,18 +843,214 @@ class ResponseEngine:
     def footprint_rows(
         self, context: Context, rule: RuleIdentity, horizon: int
     ) -> np.ndarray:
-        entities, times, spans = self.completions(context, rule.antecedent)
-        keep = spans <= rule.window * self.dataset.ticks_per_unit
-        entities, times = entities[keep], times[keep]
-        rows: list[np.ndarray] = []
-        for entity, completion in zip(entities.tolist(), times.tolist(), strict=True):
-            length = min(
-                int(horizon) * self.dataset.ticks_per_unit,
-                int(context.ends[entity] - completion),
+        return self.response_rows_many(
+            context, rule.antecedent, (rule.window,), horizon=horizon
+        )[rule.window]
+
+    def response_rows_many(
+        self,
+        context: Context,
+        antecedent: Antecedent,
+        windows: tuple[int, ...],
+        *,
+        horizon: int | None = None,
+    ) -> dict[int, np.ndarray]:
+        """Return nested exact footprints after one bounded expansion pass."""
+        unique_windows = tuple(sorted(set(map(int, windows))))
+        if not unique_windows:
+            return {}
+        horizon_units = self.lag_units if horizon is None else int(horizon)
+        rows, minimum_spans = self.response_row_thresholds(
+            context,
+            antecedent,
+            max(unique_windows),
+            horizon=horizon_units,
+        )
+        output: dict[int, np.ndarray] = {}
+        for window in unique_windows:
+            key = (id(context), antecedent, window, horizon_units)
+            with self._lock:
+                cached = self._footprint_cache.get(key)
+                if cached is not None:
+                    self._footprint_cache.move_to_end(key)
+                    output[window] = cached
+                    continue
+            result = rows[minimum_spans <= window * self.dataset.ticks_per_unit]
+            if result.nbytes <= self._footprint_cache_limit:
+                with self._lock:
+                    existing = self._footprint_cache.get(key)
+                    if existing is not None:
+                        self._footprint_cache.move_to_end(key)
+                        output[window] = existing
+                        continue
+                    self._footprint_cache[key] = result
+                    self._footprint_cache_size += result.nbytes
+                    while (
+                        self._footprint_cache_size > self._footprint_cache_limit
+                        and len(self._footprint_cache) > 1
+                    ):
+                        _, removed = self._footprint_cache.popitem(last=False)
+                        self._footprint_cache_size -= removed.nbytes
+            output[window] = result
+        return output
+
+    def response_row_thresholds(
+        self,
+        context: Context,
+        antecedent: Antecedent,
+        maximum_window: int,
+        *,
+        horizon: int | None = None,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Compact exact representation shared by every nested W footprint."""
+        horizon_units = self.lag_units if horizon is None else int(horizon)
+        return self._response_row_thresholds(
+            context,
+            antecedent,
+            horizon_units * self.dataset.ticks_per_unit,
+            int(maximum_window) * self.dataset.ticks_per_unit,
+        )
+
+    def _legacy_footprint_rows(
+        self, context: Context, rule: RuleIdentity, horizon: int
+    ) -> np.ndarray:
+        """Unbatched reference retained for numerical regression tests."""
+        key = (id(context), rule.antecedent, rule.window, int(horizon))
+        with self._lock:
+            cached = self._footprint_cache.get(key)
+            if cached is not None:
+                self._footprint_cache.move_to_end(key)
+                return cached
+        horizon_ticks = int(horizon) * self.dataset.ticks_per_unit
+        rows, minimum_spans = self._response_row_thresholds(
+            context,
+            rule.antecedent,
+            horizon_ticks,
+            rule.window * self.dataset.ticks_per_unit,
+        )
+        result = rows[minimum_spans <= rule.window * self.dataset.ticks_per_unit]
+        if result.nbytes <= self._footprint_cache_limit:
+            with self._lock:
+                self._footprint_cache[key] = result
+                self._footprint_cache_size += result.nbytes
+                while (
+                    self._footprint_cache_size > self._footprint_cache_limit
+                    and len(self._footprint_cache) > 1
+                ):
+                    _, removed = self._footprint_cache.popitem(last=False)
+                    self._footprint_cache_size -= removed.nbytes
+        return result
+
+    def _response_row_thresholds(
+        self,
+        context: Context,
+        antecedent: Antecedent,
+        horizon_ticks: int,
+        maximum_window_ticks: int,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Return every future row and its minimum admitting witness span."""
+        key = (
+            id(context),
+            antecedent,
+            int(horizon_ticks),
+            int(maximum_window_ticks),
+        )
+        with self._lock:
+            cached = self._row_threshold_cache.get(key)
+            if cached is not None:
+                self._row_threshold_cache.move_to_end(key)
+                return cached
+        with self._compute_lock("row-threshold", key):
+            with self._lock:
+                cached = self._row_threshold_cache.get(key)
+                if cached is not None:
+                    self._row_threshold_cache.move_to_end(key)
+                    return cached
+            return self._compute_response_row_thresholds(
+                context,
+                antecedent,
+                int(horizon_ticks),
+                int(maximum_window_ticks),
+                key,
             )
-            if length > 0:
-                base = int(
-                    context.offsets[entity] + completion - context.starts[entity]
-                )
-                rows.append(base + np.arange(1, length + 1, dtype=np.int64))
-        return np.unique(np.concatenate(rows)) if rows else np.zeros(0, dtype=np.int64)
+
+    def _compute_response_row_thresholds(
+        self,
+        context: Context,
+        antecedent: Antecedent,
+        horizon_ticks: int,
+        maximum_window_ticks: int,
+        key: tuple,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        entities, times, spans = self.completions(context, antecedent)
+        admitted = spans <= int(maximum_window_ticks)
+        entities, times, spans = (
+            entities[admitted],
+            times[admitted],
+            spans[admitted],
+        )
+        compiled = future_rows(
+            entities,
+            times,
+            spans,
+            context.starts,
+            context.ends,
+            context.offsets,
+            window=int(maximum_window_ticks),
+            horizon=int(horizon_ticks),
+        )
+        if compiled is None:
+            raw_rows: list[np.ndarray] = []
+            raw_spans: list[np.ndarray] = []
+            for entity, completion, span in zip(
+                entities.tolist(), times.tolist(), spans.tolist(), strict=True
+            ):
+                length = min(int(horizon_ticks), int(context.ends[entity] - completion))
+                if length > 0:
+                    base = int(
+                        context.offsets[entity] + completion - context.starts[entity]
+                    )
+                    raw_rows.append(base + np.arange(1, length + 1, dtype=np.int64))
+                    raw_spans.append(np.full(length, span, dtype=np.int64))
+            generated_rows = (
+                np.concatenate(raw_rows) if raw_rows else np.zeros(0, dtype=np.int64)
+            )
+            generated_spans = (
+                np.concatenate(raw_spans) if raw_spans else np.zeros(0, dtype=np.int64)
+            )
+        else:
+            generated_rows, generated_spans = compiled
+        if len(generated_rows):
+            order = np.argsort(generated_rows, kind="stable")
+            ordered_rows = generated_rows[order]
+            ordered_spans = generated_spans[order]
+            rows, first = np.unique(ordered_rows, return_index=True)
+            minimum_spans = np.minimum.reduceat(ordered_spans, first)
+        else:
+            rows = np.zeros(0, dtype=np.int64)
+            minimum_spans = np.zeros(0, dtype=np.int64)
+        result = (rows, minimum_spans)
+        size = rows.nbytes + minimum_spans.nbytes
+        if size <= self._row_threshold_cache_limit:
+            with self._lock:
+                self._row_threshold_cache[key] = result
+                self._row_threshold_cache_size += size
+                while (
+                    self._row_threshold_cache_size > self._row_threshold_cache_limit
+                    and len(self._row_threshold_cache) > 1
+                ):
+                    _, removed = self._row_threshold_cache.popitem(last=False)
+                    self._row_threshold_cache_size -= (
+                        removed[0].nbytes + removed[1].nbytes
+                    )
+        return result
+
+    def response_rows(
+        self, context: Context, antecedent: Antecedent, window: int
+    ) -> np.ndarray:
+        """Exact nonzero footprint without materializing M-knot values."""
+        return self.footprint_rows(
+            context,
+            RuleIdentity(antecedent, int(window), 1),
+            self.lag_units,
+        )

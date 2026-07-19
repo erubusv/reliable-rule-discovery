@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import re
 import shutil
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
@@ -98,7 +99,9 @@ def _read(path: Path) -> pd.DataFrame:
     frame = frame.sort_values(["loan_id", "time"], kind="stable").reset_index(drop=True)
     if bool(frame.duplicated(["loan_id", "time"]).any()):
         raise ValueError(f"duplicated loan-month in {path}")
-    return frame
+    return frame[
+        ["loan_id", "time", "upb", "loan_age_num", "eltv_num", "target"]
+    ].copy()
 
 
 def _contiguous(frame: pd.DataFrame, lag: int) -> pd.Series:
@@ -187,6 +190,22 @@ def _predicate_matrix(frame: pd.DataFrame) -> pd.DataFrame:
     return out.fillna(False).astype(np.uint8)
 
 
+def _load_vintage(
+    item: tuple[str, Path],
+) -> tuple[str, pd.DataFrame, pd.DataFrame, str]:
+    """Read, hash and derive one independent vintage deterministically."""
+    vintage, path = item
+    raw = _read(path)
+    frame = _prefix(raw)
+    del raw
+    matrix = _predicate_matrix(frame)
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return vintage, frame, matrix, digest.hexdigest()
+
+
 def preprocess_freddie(
     input_root: str | Path,
     output_root: str | Path,
@@ -218,72 +237,72 @@ def preprocess_freddie(
     entity_parts, event_parts, target_parts = [], [], []
     entity_offset = 0
     source_digests: dict[str, str] = {}
-    for vintage, path in paths:
-        raw = _read(path)
-        frame = _prefix(raw)
-        matrix = _predicate_matrix(frame)
-        groups = frame.groupby("loan_id", sort=False)
-        entities = (
-            groups.agg(
-                start_time=("time", "first"),
-                end_time=("time", "last"),
-                start_age=("loan_age_num", "first"),
+    # Vintages are independent preprocessing units.  executor.map preserves
+    # the sorted vintage order, so parallel I/O and predicate construction do
+    # not alter entity codes, file digests or output bytes.
+    with ThreadPoolExecutor(
+        max_workers=min(3, len(paths)), thread_name_prefix="crbstpp-freddie"
+    ) as executor:
+        derived = executor.map(_load_vintage, paths)
+        for vintage, frame, matrix, source_digest in derived:
+            groups = frame.groupby("loan_id", sort=False)
+            entities = (
+                groups.agg(
+                    start_time=("time", "first"),
+                    end_time=("time", "last"),
+                    start_age=("loan_age_num", "first"),
+                )
+                .reset_index()
+                .rename(columns={"loan_id": "entity_id"})
             )
-            .reset_index()
-            .rename(columns={"loan_id": "entity_id"})
-        )
-        if bool(
-            entities["start_age"].isna().any() or (entities["start_age"] < 0).any()
-        ):
-            raise ValueError("invalid Freddie start loan age")
-        entities["split_group"] = entities["start_time"].astype(np.int64) - entities[
-            "start_age"
-        ].astype(np.int64)
-        entities["baseline_origin"] = entities["start_age"].astype(np.int64)
-        entity_codes = pd.Series(
-            np.arange(len(entities), dtype=np.int32) + entity_offset,
-            index=entities["entity_id"],
-        )
-        active = matrix.to_numpy(dtype=bool)
-        row_index, predicate_code = np.nonzero(active)
-        events = pd.DataFrame(
-            {
-                "entity_code": frame.iloc[row_index]["loan_id"]
-                .map(entity_codes)
-                .to_numpy(dtype=np.int32),
-                "time": frame.iloc[row_index]["time"].to_numpy(dtype=np.int64),
-                "predicate_code": predicate_code.astype(np.int16),
-            }
-        )
-        target_rows = frame.loc[frame["target"]]
-        targets = pd.DataFrame(
-            {
-                "entity_code": target_rows["loan_id"]
-                .map(entity_codes)
-                .to_numpy(dtype=np.int32),
-                "time": target_rows["time"].to_numpy(dtype=np.int64),
-                "multiplicity": np.ones(len(target_rows), dtype=np.int32),
-            }
-        )
-        entity_parts.append(
-            entities[
-                [
-                    "entity_id",
-                    "start_time",
-                    "end_time",
-                    "baseline_origin",
-                    "split_group",
+            if bool(
+                entities["start_age"].isna().any() or (entities["start_age"] < 0).any()
+            ):
+                raise ValueError("invalid Freddie start loan age")
+            entities["split_group"] = entities["start_time"].astype(
+                np.int64
+            ) - entities["start_age"].astype(np.int64)
+            entities["baseline_origin"] = entities["start_age"].astype(np.int64)
+            entity_codes = pd.Series(
+                np.arange(len(entities), dtype=np.int32) + entity_offset,
+                index=entities["entity_id"],
+            )
+            active = matrix.to_numpy(dtype=bool)
+            row_index, predicate_code = np.nonzero(active)
+            events = pd.DataFrame(
+                {
+                    "entity_code": frame.iloc[row_index]["loan_id"]
+                    .map(entity_codes)
+                    .to_numpy(dtype=np.int32),
+                    "time": frame.iloc[row_index]["time"].to_numpy(dtype=np.int64),
+                    "predicate_code": predicate_code.astype(np.int16),
+                }
+            )
+            target_rows = frame.loc[frame["target"]]
+            targets = pd.DataFrame(
+                {
+                    "entity_code": target_rows["loan_id"]
+                    .map(entity_codes)
+                    .to_numpy(dtype=np.int32),
+                    "time": target_rows["time"].to_numpy(dtype=np.int64),
+                    "multiplicity": np.ones(len(target_rows), dtype=np.int32),
+                }
+            )
+            entity_parts.append(
+                entities[
+                    [
+                        "entity_id",
+                        "start_time",
+                        "end_time",
+                        "baseline_origin",
+                        "split_group",
+                    ]
                 ]
-            ]
-        )
-        event_parts.append(events)
-        target_parts.append(targets)
-        entity_offset += len(entities)
-        digest = hashlib.sha256()
-        with path.open("rb") as handle:
-            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-                digest.update(chunk)
-        source_digests[vintage] = digest.hexdigest()
+            )
+            event_parts.append(events)
+            target_parts.append(targets)
+            entity_offset += len(entities)
+            source_digests[vintage] = source_digest
     entities = pd.concat(entity_parts, ignore_index=True)
     events = (
         pd.concat(event_parts, ignore_index=True)

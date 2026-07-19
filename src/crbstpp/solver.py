@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import math
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 
 import numpy as np
 
 from .likelihood import loss_rows
-from .native import moments
+from .native import configure_cpu_threads, moments
 from .response import ModelMatrix
 
 
@@ -49,6 +50,19 @@ def _objective(
     )
     gradient, hessian = moments(matrix.x, first, second, device="cpu")
     return float(np.sum(rows)), gradient, hessian, eta
+
+
+def _value(matrix: ModelMatrix, likelihood: str, beta: np.ndarray) -> float:
+    """Objective-only path for line search; derivatives are not consumed."""
+    eta = matrix.x @ beta
+    rows, _, _ = loss_rows(
+        eta,
+        likelihood=likelihood,
+        exposure_weight=matrix.exposure_weight,
+        noevent_weight=matrix.noevent_weight,
+        event_weight=matrix.event_weight,
+    )
+    return float(np.sum(rows))
 
 
 def projected_kkt(beta: np.ndarray, gradient: np.ndarray, free_dimension: int) -> float:
@@ -191,7 +205,7 @@ def fit_model_matrix(
             trial[matrix.free_dimension :] = np.maximum(
                 trial[matrix.free_dimension :], 0.0
             )
-            trial_nll, _, _, _ = _objective(matrix, likelihood, trial)
+            trial_nll = _value(matrix, likelihood, trial)
             displacement = trial - beta
             if math.isfinite(trial_nll) and trial_nll <= nll + 1.0e-4 * float(
                 gradient @ displacement
@@ -244,3 +258,40 @@ def fit_model_matrix(
         False,
         "maximum iterations reached",
     )
+
+
+def fit_model_matrices(
+    matrices: list[ModelMatrix] | tuple[ModelMatrix, ...],
+    *,
+    likelihood: str,
+    tolerance: float,
+    max_iter: int,
+    workers: int,
+    cpu_threads_per_worker: int,
+    warm_starts: list[np.ndarray | None] | tuple[np.ndarray | None, ...] | None = None,
+) -> list[FitResult]:
+    """Deterministic concurrent wrapper around the exact fixed-model solver."""
+    ordered = list(matrices)
+    starts = [None] * len(ordered) if warm_starts is None else list(warm_starts)
+    if len(starts) != len(ordered):
+        raise ValueError("warm-start batch length mismatch")
+
+    def solve(item: tuple[ModelMatrix, np.ndarray | None]) -> FitResult:
+        configure_cpu_threads(max(1, int(cpu_threads_per_worker)))
+        matrix, warm = item
+        return fit_model_matrix(
+            matrix,
+            likelihood=likelihood,
+            tolerance=tolerance,
+            max_iter=max_iter,
+            warm_start=warm,
+        )
+
+    jobs = list(zip(ordered, starts, strict=True))
+    if len(jobs) <= 1 or workers <= 1:
+        return [solve(job) for job in jobs]
+    with ThreadPoolExecutor(
+        max_workers=min(int(workers), len(jobs)),
+        thread_name_prefix="crbstpp-newton",
+    ) as executor:
+        return list(executor.map(solve, jobs))

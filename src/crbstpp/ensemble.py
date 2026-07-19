@@ -9,7 +9,7 @@ from .config import RunConfig
 from .likelihood import cloglog_event_terms
 from .response import Context, ModelMatrix, ResponseEngine
 from .rules import EMPTY_SUPPORT, Support
-from .solver import FitResult, fit_model_matrix
+from .solver import FitResult, fit_model_matrices, fit_model_matrix
 
 
 @dataclass(frozen=True)
@@ -185,17 +185,25 @@ def fit_ensemble(
     )
     fits: list[FitResult] = []
     matrices: list[ModelMatrix] = []
-    for support in supports:
-        matrix = engine.model_matrix(dataset_context, support)
-        fit = fit_model_matrix(
-            matrix,
+    for start in range(0, len(supports), config.exact_workers):
+        support_wave = supports[start : start + config.exact_workers]
+        matrix_wave = [
+            engine.model_matrix(dataset_context, support) for support in support_wave
+        ]
+        fit_wave = fit_model_matrices(
+            matrix_wave,
             likelihood=dataset_context.dataset.likelihood,
             tolerance=config.solver_tolerance,
             max_iter=config.solver_max_iter,
+            workers=config.exact_workers,
+            cpu_threads_per_worker=max(
+                1, config.pricing_workers // config.exact_workers
+            ),
         )
-        if fit.converged:
-            fits.append(fit)
-            matrices.append(matrix)
+        for matrix, fit in zip(matrix_wave, fit_wave, strict=True):
+            if fit.converged:
+                fits.append(fit)
+                matrices.append(matrix)
     if not fits:
         return EnsembleResult((), (), np.zeros(0), math.inf, None, None, False)
     components = _sparse_components(engine, dataset_context, matrices, fits)

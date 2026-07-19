@@ -175,6 +175,42 @@ class LikelihoodSolverTests(unittest.TestCase):
                         record.score, terminal.score + config.search_tolerance + 1e-7
                     )
 
+    def test_parallel_search_matches_serial_family(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            data = synthetic_dataset(Path(directory) / "data", 180)
+            fit_codes, _, _ = data.split((0.6, 0.2, 0.2), 111)
+            common = dict(
+                dataset=str(data.root),
+                q_max=2,
+                impact_lag=3,
+                knot_count=2,
+                formation_windows=(0, 1, 2),
+                solver_tolerance=1e-7,
+                solver_max_iter=120,
+                cache_bytes=32 * 1024**2,
+                early_warning_horizon=3,
+                pricing_devices=(),
+            )
+            families = []
+            for workers in (1, 3):
+                result = SupportOptimizer(
+                    Context.make(data, fit_codes),
+                    RunConfig(**common, exact_workers=workers),
+                ).search()
+                families.append(
+                    [(record.support, record.score) for record in result.family]
+                )
+            self.assertEqual(
+                [item[0] for item in families[0]],
+                [item[0] for item in families[1]],
+            )
+            np.testing.assert_allclose(
+                [item[1] for item in families[0]],
+                [item[1] for item in families[1]],
+                rtol=0,
+                atol=1e-10,
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -12,7 +12,7 @@ from .report import Certificate
 from .response import Context, ModelMatrix, ResponseEngine
 from .rules import ClosureTerm, EMPTY_SUPPORT, RuleIdentity, Support, hierarchy_closure
 from .search import SupportOptimizer, support_key
-from .solver import FitResult, fit_model_matrix
+from .solver import FitResult
 
 
 @dataclass(frozen=True)
@@ -158,18 +158,10 @@ def _fit_on_discovery(
     optimizer: SupportOptimizer,
     support: Support,
     *,
-    closure: tuple | None = None,
+    closure: tuple[ClosureTerm, ...] | None = None,
 ) -> tuple[ModelMatrix, FitResult]:
-    matrix = optimizer.engine.model_matrix(
-        optimizer.context, support, forced_closure=closure
-    )
-    fit = fit_model_matrix(
-        matrix,
-        likelihood=optimizer.context.dataset.likelihood,
-        tolerance=optimizer.config.solver_tolerance,
-        max_iter=optimizer.config.solver_max_iter,
-    )
-    return matrix, fit
+    resolved = hierarchy_closure(support) if closure is None else closure
+    return optimizer.fit_fixed(support, resolved)
 
 
 def _holm_adjust(pvalues: list[float]) -> list[float]:
@@ -217,16 +209,19 @@ def certify_family(
         diagnostics["f1"] = f1.__dict__
         if not f1.testable:
             reasons.append("f1_not_testable")
-        rule_pvalues: list[float] = []
-        rule_diagnostics: list[dict[str, object]] = []
+        branch_specifications = []
         for root in record.support.rules:
             drop_support = _branch_drop(record.support, root)
             drop_closure = _branch_null_closure(
                 record.matrix.closure, drop_support, root
             )
-            drop_matrix, drop_fit = _fit_on_discovery(
-                optimizer, drop_support, closure=drop_closure
-            )
+            branch_specifications.append((drop_support, drop_closure))
+        branch_models = optimizer.fit_fixed_many(branch_specifications)
+        rule_pvalues: list[float] = []
+        rule_diagnostics: list[dict[str, object]] = []
+        for root, (drop_matrix, drop_fit) in zip(
+            record.support.rules, branch_models, strict=True
+        ):
             if not drop_fit.converged:
                 rule_pvalues.append(1.0)
                 reasons.append(f"branch_nonconvergence:{root}")

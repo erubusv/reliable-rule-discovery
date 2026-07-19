@@ -11,12 +11,26 @@ try:
 except ImportError:  # Source-tree and unsupported-platform reference path.
     _cpu_native = None
 
+try:  # Conda NumPy uses MKL on the target workstation.
+    import mkl as _mkl
+except ImportError:  # Wheels using OpenBLAS remain fully supported.
+    _mkl = None
+
 _CUDA = None
 _CUDA_LOCK = threading.Lock()
 
 
 def cpu_available() -> bool:
     return _cpu_native is not None
+
+
+def configure_cpu_threads(count: int) -> None:
+    if int(count) < 1:
+        raise ValueError("CPU thread count must be positive")
+    if _cpu_native is not None:
+        _cpu_native.set_num_threads(int(count))
+    if _mkl is not None:
+        _mkl.set_num_threads_local(int(count))
 
 
 def _cuda_library():
@@ -44,6 +58,19 @@ def _cuda_library():
                     pointer,
                 ]
                 function.restype = ctypes.c_int
+                batch_function = library.crbstpp_cuda_moments_batch
+                batch_function.argtypes = [
+                    ctypes.c_int,
+                    pointer,
+                    pointer,
+                    pointer,
+                    ctypes.c_int64,
+                    ctypes.c_int64,
+                    ctypes.c_int64,
+                    pointer,
+                    pointer,
+                ]
+                batch_function.restype = ctypes.c_int
                 _CUDA = library
     return _CUDA
 
@@ -96,6 +123,38 @@ def moments(
     return x.T @ first, x.T @ (second[:, None] * x)
 
 
+def moments_batch(
+    x: np.ndarray, first: np.ndarray, second: np.ndarray, *, device: str = "cpu"
+) -> tuple[np.ndarray, np.ndarray]:
+    """Moments for B candidate blocks sharing row derivatives."""
+    x = np.ascontiguousarray(x, dtype=np.float64)
+    first = np.ascontiguousarray(first, dtype=np.float64)
+    second = np.ascontiguousarray(second, dtype=np.float64)
+    if x.ndim != 3 or first.shape != (x.shape[1],) or second.shape != (x.shape[1],):
+        raise ValueError("batched moment buffer shape mismatch")
+    gradient = np.empty((x.shape[0], x.shape[2]), dtype=np.float64)
+    hessian = np.empty((x.shape[0], x.shape[2], x.shape[2]), dtype=np.float64)
+    if device.startswith("cuda") and _cuda_library() is not None:
+        index = int(device.split(":", 1)[1]) if ":" in device else 0
+        pointer = ctypes.POINTER(ctypes.c_double)
+        status = _CUDA.crbstpp_cuda_moments_batch(
+            index,
+            x.ctypes.data_as(pointer),
+            first.ctypes.data_as(pointer),
+            second.ctypes.data_as(pointer),
+            x.shape[0],
+            x.shape[1],
+            x.shape[2],
+            gradient.ctypes.data_as(pointer),
+            hessian.ctypes.data_as(pointer),
+        )
+        if status == 0:
+            return gradient, hessian
+    for index in range(x.shape[0]):
+        gradient[index], hessian[index] = moments(x[index], first, second, device="cpu")
+    return gradient, hessian
+
+
 def kernel_contributions(
     entities: np.ndarray,
     times: np.ndarray,
@@ -133,6 +192,41 @@ def kernel_contributions(
         )
     )
     return rows[:count], values[:count]
+
+
+def accumulate_kernel(
+    entities: np.ndarray,
+    times: np.ndarray,
+    starts: np.ndarray,
+    ends: np.ndarray,
+    offsets: np.ndarray,
+    basis: np.ndarray,
+    lookup: np.ndarray,
+    accumulator: np.ndarray,
+) -> bool:
+    """Accumulate one disjoint completion-span slice in place."""
+    if _cpu_native is None or not hasattr(_cpu_native, "accumulate_kernel"):
+        return False
+    entities = np.ascontiguousarray(entities, dtype=np.int64)
+    times = np.ascontiguousarray(times, dtype=np.int64)
+    starts = np.ascontiguousarray(starts, dtype=np.int64)
+    ends = np.ascontiguousarray(ends, dtype=np.int64)
+    offsets = np.ascontiguousarray(offsets, dtype=np.int64)
+    basis = np.ascontiguousarray(basis, dtype=np.float64)
+    lookup = np.ascontiguousarray(lookup, dtype=np.int64)
+    if accumulator.dtype != np.float64 or not accumulator.flags.c_contiguous:
+        raise ValueError("kernel accumulator must be C-contiguous float64")
+    _cpu_native.accumulate_kernel(
+        entities,
+        times,
+        starts,
+        ends,
+        offsets,
+        basis,
+        lookup,
+        accumulator,
+    )
+    return True
 
 
 def completion_events(
@@ -173,3 +267,41 @@ def completion_events(
         output_times[:count],
         output_spans[:count],
     )
+
+
+def future_rows(
+    entities: np.ndarray,
+    times: np.ndarray,
+    spans: np.ndarray,
+    starts: np.ndarray,
+    ends: np.ndarray,
+    offsets: np.ndarray,
+    *,
+    window: int,
+    horizon: int,
+) -> tuple[np.ndarray, np.ndarray] | None:
+    if _cpu_native is None:
+        return None
+    entities = np.ascontiguousarray(entities, dtype=np.int64)
+    times = np.ascontiguousarray(times, dtype=np.int64)
+    spans = np.ascontiguousarray(spans, dtype=np.int64)
+    starts = np.ascontiguousarray(starts, dtype=np.int64)
+    ends = np.ascontiguousarray(ends, dtype=np.int64)
+    offsets = np.ascontiguousarray(offsets, dtype=np.int64)
+    output = np.empty(len(entities) * int(horizon), dtype=np.int64)
+    output_spans = np.empty_like(output)
+    count = int(
+        _cpu_native.future_rows(
+            entities,
+            times,
+            spans,
+            starts,
+            ends,
+            offsets,
+            int(window),
+            int(horizon),
+            output,
+            output_spans,
+        )
+    )
+    return output[:count], output_spans[:count]

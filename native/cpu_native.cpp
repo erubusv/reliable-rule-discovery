@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <omp.h>
 #include <vector>
 
 namespace {
@@ -64,22 +65,207 @@ PyObject* moments(PyObject*, PyObject* args) {
     Py_BEGIN_ALLOW_THREADS
     #pragma omp parallel for schedule(static)
     for (std::int64_t j = 0; j < columns; ++j) {
-        double sum = 0.0;
-        for (std::int64_t i = 0; i < rows; ++i) sum += xp[i * columns + j] * fp[i];
-        gp[j] = sum;
+        long double sum = 0.0L;
+        for (std::int64_t i = 0; i < rows; ++i) {
+            sum += static_cast<long double>(xp[i * columns + j]) * fp[i];
+        }
+        gp[j] = static_cast<double>(sum);
     }
     #pragma omp parallel for schedule(static)
     for (std::int64_t flat = 0; flat < columns * columns; ++flat) {
         const std::int64_t j = flat / columns, k = flat % columns;
-        double sum = 0.0;
+        long double sum = 0.0L;
         for (std::int64_t i = 0; i < rows; ++i) {
-            sum += xp[i * columns + j] * sp[i] * xp[i * columns + k];
+            sum += static_cast<long double>(xp[i * columns + j]) * sp[i] *
+                   xp[i * columns + k];
         }
-        hp[flat] = sum;
+        hp[flat] = static_cast<double>(sum);
     }
     Py_END_ALLOW_THREADS
     PyBuffer_Release(&x); PyBuffer_Release(&first); PyBuffer_Release(&second);
     PyBuffer_Release(&gradient); PyBuffer_Release(&hessian);
+    Py_RETURN_NONE;
+}
+
+PyObject* set_num_threads(PyObject*, PyObject* args) {
+    int count;
+    if (!PyArg_ParseTuple(args, "i", &count)) return nullptr;
+    if (count < 1) {
+        PyErr_SetString(PyExc_ValueError, "OpenMP thread count must be positive");
+        return nullptr;
+    }
+    omp_set_dynamic(0);
+    omp_set_num_threads(count);
+    Py_RETURN_NONE;
+}
+
+PyObject* future_rows(PyObject*, PyObject* args) {
+    PyObject *entities_obj, *times_obj, *spans_obj, *starts_obj, *ends_obj,
+             *offsets_obj, *rows_obj, *row_spans_obj;
+    int window, horizon;
+    if (!PyArg_ParseTuple(args, "OOOOOOiiOO", &entities_obj, &times_obj, &spans_obj,
+                          &starts_obj, &ends_obj, &offsets_obj, &window, &horizon,
+                          &rows_obj, &row_spans_obj)) return nullptr;
+    Py_buffer entities{}, times{}, spans{}, starts{}, ends{}, offsets{}, rows{}, row_spans{};
+    if (!int64_buffer(entities_obj, &entities, 1, false)) return nullptr;
+    if (!int64_buffer(times_obj, &times, 1, false)) { PyBuffer_Release(&entities); return nullptr; }
+    if (!int64_buffer(spans_obj, &spans, 1, false)) {
+        PyBuffer_Release(&entities); PyBuffer_Release(&times); return nullptr;
+    }
+    if (!int64_buffer(starts_obj, &starts, 1, false)) {
+        PyBuffer_Release(&entities); PyBuffer_Release(&times); PyBuffer_Release(&spans); return nullptr;
+    }
+    if (!int64_buffer(ends_obj, &ends, 1, false)) {
+        PyBuffer_Release(&entities); PyBuffer_Release(&times); PyBuffer_Release(&spans);
+        PyBuffer_Release(&starts); return nullptr;
+    }
+    if (!int64_buffer(offsets_obj, &offsets, 1, false)) {
+        PyBuffer_Release(&entities); PyBuffer_Release(&times); PyBuffer_Release(&spans);
+        PyBuffer_Release(&starts); PyBuffer_Release(&ends); return nullptr;
+    }
+    if (!int64_buffer(rows_obj, &rows, 1, true)) {
+        PyBuffer_Release(&entities); PyBuffer_Release(&times); PyBuffer_Release(&spans);
+        PyBuffer_Release(&starts); PyBuffer_Release(&ends); PyBuffer_Release(&offsets); return nullptr;
+    }
+    if (!int64_buffer(row_spans_obj, &row_spans, 1, true)) {
+        PyBuffer_Release(&entities); PyBuffer_Release(&times); PyBuffer_Release(&spans);
+        PyBuffer_Release(&starts); PyBuffer_Release(&ends); PyBuffer_Release(&offsets);
+        PyBuffer_Release(&rows); return nullptr;
+    }
+    const auto count = entities.shape[0], entity_count = starts.shape[0];
+    bool valid = horizon >= 1 && times.shape[0] == count && spans.shape[0] == count &&
+                 ends.shape[0] == entity_count && offsets.shape[0] == entity_count + 1 &&
+                 rows.shape[0] >= count * static_cast<std::int64_t>(horizon) &&
+                 row_spans.shape[0] >= count * static_cast<std::int64_t>(horizon);
+    if (!valid) {
+        PyErr_SetString(PyExc_ValueError, "future-row buffer shape mismatch");
+        goto future_fail;
+    }
+    {
+        const auto* ep = static_cast<const std::int64_t*>(entities.buf);
+        const auto* tp = static_cast<const std::int64_t*>(times.buf);
+        const auto* sp = static_cast<const std::int64_t*>(spans.buf);
+        const auto* startp = static_cast<const std::int64_t*>(starts.buf);
+        const auto* endp = static_cast<const std::int64_t*>(ends.buf);
+        const auto* offsetp = static_cast<const std::int64_t*>(offsets.buf);
+        auto* output_rows = static_cast<std::int64_t*>(rows.buf);
+        auto* output_spans = static_cast<std::int64_t*>(row_spans.buf);
+        std::int64_t output = 0;
+        Py_BEGIN_ALLOW_THREADS
+        for (std::int64_t i = 0; i < count; ++i) {
+            if (sp[i] > window) continue;
+            const auto entity = ep[i];
+            if (entity < 0 || entity >= entity_count) continue;
+            const auto maximum = std::min<std::int64_t>(horizon, endp[entity] - tp[i]);
+            const auto base = offsetp[entity] + tp[i] - startp[entity];
+            for (std::int64_t lag = 1; lag <= maximum; ++lag) {
+                output_rows[output] = base + lag;
+                output_spans[output] = sp[i];
+                ++output;
+            }
+        }
+        Py_END_ALLOW_THREADS
+        PyBuffer_Release(&entities); PyBuffer_Release(&times); PyBuffer_Release(&spans);
+        PyBuffer_Release(&starts); PyBuffer_Release(&ends); PyBuffer_Release(&offsets);
+        PyBuffer_Release(&rows); PyBuffer_Release(&row_spans);
+        return PyLong_FromLongLong(output);
+    }
+future_fail:
+    PyBuffer_Release(&entities); PyBuffer_Release(&times); PyBuffer_Release(&spans);
+    PyBuffer_Release(&starts); PyBuffer_Release(&ends); PyBuffer_Release(&offsets);
+    PyBuffer_Release(&rows); PyBuffer_Release(&row_spans);
+    return nullptr;
+}
+
+PyObject* accumulate_kernel(PyObject*, PyObject* args) {
+    PyObject *entities_obj, *times_obj, *starts_obj, *ends_obj, *offsets_obj,
+             *basis_obj, *lookup_obj, *accumulator_obj;
+    if (!PyArg_ParseTuple(args, "OOOOOOOO", &entities_obj, &times_obj,
+                          &starts_obj, &ends_obj, &offsets_obj, &basis_obj,
+                          &lookup_obj, &accumulator_obj)) return nullptr;
+    Py_buffer entities{}, times{}, starts{}, ends{}, offsets{}, basis{}, lookup{},
+              accumulator{};
+    int acquired = 0;
+    const auto release = [&]() {
+        if (acquired >= 8) PyBuffer_Release(&accumulator);
+        if (acquired >= 7) PyBuffer_Release(&lookup);
+        if (acquired >= 6) PyBuffer_Release(&basis);
+        if (acquired >= 5) PyBuffer_Release(&offsets);
+        if (acquired >= 4) PyBuffer_Release(&ends);
+        if (acquired >= 3) PyBuffer_Release(&starts);
+        if (acquired >= 2) PyBuffer_Release(&times);
+        if (acquired >= 1) PyBuffer_Release(&entities);
+    };
+    if (!int64_buffer(entities_obj, &entities, 1, false)) return nullptr;
+    ++acquired;
+    if (!int64_buffer(times_obj, &times, 1, false)) { release(); return nullptr; }
+    ++acquired;
+    if (!int64_buffer(starts_obj, &starts, 1, false)) { release(); return nullptr; }
+    ++acquired;
+    if (!int64_buffer(ends_obj, &ends, 1, false)) { release(); return nullptr; }
+    ++acquired;
+    if (!int64_buffer(offsets_obj, &offsets, 1, false)) { release(); return nullptr; }
+    ++acquired;
+    if (!double_buffer(basis_obj, &basis, 2, false)) { release(); return nullptr; }
+    ++acquired;
+    if (!int64_buffer(lookup_obj, &lookup, 1, false)) { release(); return nullptr; }
+    ++acquired;
+    if (!double_buffer(accumulator_obj, &accumulator, 2, true)) {
+        release(); return nullptr;
+    }
+    ++acquired;
+    const auto count = entities.shape[0], entity_count = starts.shape[0];
+    const auto knots = basis.shape[0], lag = basis.shape[1];
+    const bool valid = times.shape[0] == count && ends.shape[0] == entity_count &&
+                       offsets.shape[0] == entity_count + 1 &&
+                       accumulator.shape[0] >= 0 &&
+                       accumulator.shape[1] == knots;
+    if (!valid) {
+        PyErr_SetString(PyExc_ValueError, "kernel accumulator shape mismatch");
+        release();
+        return nullptr;
+    }
+    const auto* ep = static_cast<const std::int64_t*>(entities.buf);
+    const auto* tp = static_cast<const std::int64_t*>(times.buf);
+    const auto* startp = static_cast<const std::int64_t*>(starts.buf);
+    const auto* endp = static_cast<const std::int64_t*>(ends.buf);
+    const auto* offsetp = static_cast<const std::int64_t*>(offsets.buf);
+    const auto* bp = static_cast<const double*>(basis.buf);
+    const auto* lookp = static_cast<const std::int64_t*>(lookup.buf);
+    auto* out = static_cast<double*>(accumulator.buf);
+    bool invalid = false;
+    Py_BEGIN_ALLOW_THREADS
+    for (std::int64_t i = 0; i < count && !invalid; ++i) {
+        const auto entity = ep[i];
+        if (entity < 0 || entity >= entity_count) {
+            invalid = true;
+            break;
+        }
+        const auto maximum = std::min<std::int64_t>(lag, endp[entity] - tp[i]);
+        const auto base = offsetp[entity] + tp[i] - startp[entity];
+        for (std::int64_t l = 1; l <= maximum; ++l) {
+            const auto row = base + l;
+            if (row < 0 || row >= lookup.shape[0]) {
+                invalid = true;
+                break;
+            }
+            const auto position = lookp[row];
+            if (position < 0 || position >= accumulator.shape[0]) {
+                invalid = true;
+                break;
+            }
+            for (std::int64_t k = 0; k < knots; ++k) {
+                out[position * knots + k] += bp[k * lag + l - 1];
+            }
+        }
+    }
+    Py_END_ALLOW_THREADS
+    if (invalid) {
+        PyErr_SetString(PyExc_ValueError, "kernel row missing from accumulator lookup");
+        release();
+        return nullptr;
+    }
+    release();
     Py_RETURN_NONE;
 }
 
@@ -287,6 +473,9 @@ completion_fail:
 
 PyMethodDef methods[] = {
     {"moments", moments, METH_VARARGS, "Deterministic gradient/Fisher moments."},
+    {"set_num_threads", set_num_threads, METH_VARARGS, "Set deterministic OpenMP worker count."},
+    {"future_rows", future_rows, METH_VARARGS, "Strict-future footprint rows."},
+    {"accumulate_kernel", accumulate_kernel, METH_VARARGS, "Accumulate newly admitted kernel completions."},
     {"kernel_contributions", kernel_contributions, METH_VARARGS, "Strict-future kernel contributions."},
     {"completion_events", completion_events, METH_VARARGS, "Latest-witness completion events."},
     {nullptr, nullptr, 0, nullptr},

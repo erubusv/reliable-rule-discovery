@@ -9,11 +9,17 @@ import numpy as np
 import pandas as pd
 
 from crbstpp.likelihood import conjugate_sum, loss_rows
-from crbstpp.native import completion_events, cpu_available, cuda_available, moments
+from crbstpp.native import (
+    completion_events,
+    cpu_available,
+    cuda_available,
+    moments,
+    moments_batch,
+)
 from crbstpp.response import Context, ResponseEngine
 from crbstpp.config import RunConfig
 from crbstpp.data import Dataset, write_dataset
-from crbstpp.rules import Support
+from crbstpp.rules import RuleIdentity, Support
 from crbstpp.search import SupportOptimizer
 from crbstpp.solver import fit_model_matrix
 
@@ -101,6 +107,27 @@ class NumericalParityTests(unittest.TestCase):
                     hessian, reference_hessian, rtol=1e-13, atol=1e-13
                 )
 
+    def test_batched_cpu_and_cuda_moments_match_scalar_reference(self) -> None:
+        rng = np.random.default_rng(101)
+        x = rng.normal(size=(5, 193, 4))
+        first = rng.normal(size=193)
+        second = rng.uniform(0.01, 2.0, size=193)
+        reference = [moments(block, first, second, device="cpu") for block in x]
+        for device in ("cpu", "cuda:0", "cuda:1") if cuda_available() else ("cpu",):
+            gradient, hessian = moments_batch(x, first, second, device=device)
+            np.testing.assert_allclose(
+                gradient,
+                np.asarray([item[0] for item in reference]),
+                rtol=1e-13,
+                atol=1e-13,
+            )
+            np.testing.assert_allclose(
+                hessian,
+                np.asarray([item[1] for item in reference]),
+                rtol=1e-13,
+                atol=1e-13,
+            )
+
     def test_compiled_completion_matches_python_reference(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             data = synthetic_dataset(Path(directory) / "data", 30)
@@ -119,6 +146,76 @@ class NumericalParityTests(unittest.TestCase):
             np.testing.assert_allclose(
                 compiled_block.values, reference_block.values, rtol=0, atol=0
             )
+
+    def test_compiled_footprint_matches_python_reference(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            data = synthetic_dataset(Path(directory) / "data", 30)
+            context = Context.make(data, np.arange(30, dtype=np.int32))
+            rule = RuleIdentity((0, 1), 2, 1)
+            compiled = ResponseEngine(data, lag=3, knot_count=3, cache_bytes=1024**2)
+            compiled_rows = compiled.footprint_rows(context, rule, 2)
+            with mock.patch("crbstpp.response.future_rows", return_value=None):
+                reference = ResponseEngine(
+                    data, lag=3, knot_count=3, cache_bytes=1024**2
+                )
+                reference_rows = reference.footprint_rows(context, rule, 2)
+            np.testing.assert_array_equal(compiled_rows, reference_rows)
+
+    def test_effective_windows_equal_exact_response_classes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            data = synthetic_dataset(Path(directory) / "data", 45)
+            context = Context.make(data, np.arange(45, dtype=np.int32))
+            engine = ResponseEngine(data, lag=3, knot_count=2, cache_bytes=8 * 1024**2)
+            windows = (0, 1, 2, 3)
+            exact = []
+            distinct = []
+            for window in windows:
+                block = engine.block(context, (0, 1), window)
+                np.testing.assert_array_equal(
+                    engine.response_rows(context, (0, 1), window), block.rows
+                )
+                if not len(block.rows):
+                    continue
+                if any(
+                    np.array_equal(block.rows, previous.rows)
+                    and np.array_equal(block.values, previous.values)
+                    for previous in distinct
+                ):
+                    continue
+                exact.append(window)
+                distinct.append(block)
+            self.assertEqual(
+                engine.effective_windows(context, (0, 1), windows), tuple(exact)
+            )
+
+    def test_nested_response_thresholds_equal_every_exact_window(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            data = synthetic_dataset(Path(directory) / "data", 45)
+            context = Context.make(data, np.arange(45, dtype=np.int32))
+            engine = ResponseEngine(data, lag=3, knot_count=2, cache_bytes=8 * 1024**2)
+            windows = (0, 1, 2, 3)
+            rows, minimum_spans = engine.response_row_thresholds(
+                context, (0, 1), max(windows)
+            )
+            batched = engine.response_rows_many(context, (0, 1), windows)
+            reference = {
+                window: engine.block(context, (0, 1), window) for window in windows
+            }
+            engine.clear_caches()
+            blocks = engine.blocks_many(context, (0, 1), windows)
+            for window in windows:
+                expected = rows[minimum_spans <= window * data.ticks_per_unit]
+                np.testing.assert_array_equal(batched[window], expected)
+                np.testing.assert_array_equal(batched[window], reference[window].rows)
+                np.testing.assert_array_equal(
+                    blocks[window].rows, reference[window].rows
+                )
+                np.testing.assert_allclose(
+                    blocks[window].values,
+                    reference[window].values,
+                    rtol=0,
+                    atol=0,
+                )
 
     def test_latest_witness_completion_updates_all_three_sources(self) -> None:
         sources = [
@@ -199,6 +296,184 @@ class NumericalParityTests(unittest.TestCase):
                 if exact.fit.converged:
                     self.assertLessEqual(bounds.lower_score, exact.score + 1e-7)
                     self.assertGreaterEqual(bounds.upper_score + 1e-7, exact.score)
+
+    def test_fused_w_and_sign_pricing_matches_unfused_reference(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            data = synthetic_dataset(Path(directory) / "data", 90)
+            fit_codes, _, _ = data.split((0.6, 0.2, 0.2), 111)
+            config = RunConfig(
+                dataset=str(data.root),
+                q_max=2,
+                impact_lag=3,
+                knot_count=2,
+                formation_windows=(0, 1, 2),
+                solver_tolerance=1e-8,
+                solver_max_iter=150,
+                cache_bytes=16 * 1024**2,
+                early_warning_horizon=3,
+                pricing_devices=(),
+            )
+            optimizer = SupportOptimizer(Context.make(data, fit_codes), config)
+            empty = optimizer.records[Support(())]
+            rules = tuple(
+                rule for rule in optimizer.dictionary if rule.antecedent == (0, 1)
+            )
+            fused = optimizer._price_skeleton(
+                empty,
+                (0, 1),
+                tuple(rule.window for rule in rules),
+                device="cpu",
+            )
+            for rule in rules:
+                gradient, hessian = optimizer._legacy_block_price_components(
+                    empty, rule, device="cpu"
+                )
+                np.testing.assert_allclose(
+                    fused[rule.window][0], gradient, rtol=1e-13, atol=1e-13
+                )
+                np.testing.assert_allclose(
+                    fused[rule.window][1], hessian, rtol=1e-13, atol=1e-13
+                )
+
+    def test_dual_geometry_is_shared_across_signs(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            data = synthetic_dataset(Path(directory) / "data", 75)
+            fit_codes, _, _ = data.split((0.6, 0.2, 0.2), 111)
+            config = RunConfig(
+                dataset=str(data.root),
+                q_max=1,
+                impact_lag=3,
+                knot_count=2,
+                formation_windows=(0,),
+                solver_tolerance=1e-8,
+                solver_max_iter=150,
+                cache_bytes=8 * 1024**2,
+                early_warning_horizon=3,
+                pricing_devices=(),
+            )
+            optimizer = SupportOptimizer(Context.make(data, fit_codes), config)
+            empty = optimizer.records[Support(())]
+            for sign in (-1, 1):
+                rule = RuleIdentity((0,), 0, sign)
+                optimizer.bounds(empty, Support.of((rule,)))
+            self.assertGreaterEqual(optimizer.diagnostics.dual_geometry_cache_hits, 1)
+
+    def test_directional_relaxation_contains_exact_support_scores(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            data = synthetic_dataset(Path(directory) / "data", 90)
+            fit_codes, _, _ = data.split((0.6, 0.2, 0.2), 111)
+            config = RunConfig(
+                dataset=str(data.root),
+                q_max=2,
+                impact_lag=3,
+                knot_count=2,
+                formation_windows=(0, 1, 2),
+                solver_tolerance=1e-8,
+                solver_max_iter=150,
+                cache_bytes=16 * 1024**2,
+                early_warning_horizon=3,
+                pricing_devices=(),
+            )
+            optimizer = SupportOptimizer(Context.make(data, fit_codes), config)
+            empty = optimizer.records[Support(())]
+            supports = [Support.of((rule,)) for rule in optimizer.dictionary]
+            a = RuleIdentity((0,), 0, 1)
+            b = RuleIdentity((1,), 0, -1)
+            ab = next(
+                rule
+                for rule in optimizer.dictionary
+                if rule.antecedent == (0, 1) and rule.sign > 0
+            )
+            supports.extend((Support.of((a, b)), Support.of((a, ab))))
+            for support in supports:
+                exact = optimizer.fit(support, empty)
+                if exact.fit.converged:
+                    self.assertGreaterEqual(
+                        optimizer.directional_upper_score(support) + 1e-7,
+                        exact.score,
+                    )
+
+    def test_histogram_standalone_screen_equals_generic_safe_bounds(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            data = synthetic_dataset(Path(directory) / "data", 90)
+            fit_codes, _, _ = data.split((0.6, 0.2, 0.2), 111)
+            config = RunConfig(
+                dataset=str(data.root),
+                q_max=2,
+                impact_lag=3,
+                knot_count=2,
+                formation_windows=(0, 1, 2),
+                solver_tolerance=1e-8,
+                solver_max_iter=150,
+                cache_bytes=16 * 1024**2,
+                early_warning_horizon=3,
+                pricing_devices=(),
+            )
+            optimizer = SupportOptimizer(Context.make(data, fit_codes), config)
+            empty = optimizer.records[Support(())]
+            identities = tuple(
+                rule for rule in optimizer.dictionary if rule.antecedent == (0, 1)
+            )
+            generic = optimizer._safe_identity_survivors(empty, identities, 0.0)
+            generic_upper = {
+                rule: min(
+                    optimizer.localized_upper_score(Support.of((rule,))),
+                    optimizer.directional_upper_score(Support.of((rule,))),
+                )
+                for rule in identities
+            }
+            optimizer._relaxed_upper_cache.clear()
+            optimizer._directional_upper_cache.clear()
+            histogram = optimizer._safe_standalone_survivors(empty, (0, 1), identities)
+            histogram_upper = {
+                rule: min(
+                    optimizer.localized_upper_score(Support.of((rule,))),
+                    optimizer.directional_upper_score(Support.of((rule,))),
+                )
+                for rule in identities
+            }
+            self.assertEqual(generic, histogram)
+            for rule in identities:
+                self.assertAlmostEqual(
+                    generic_upper[rule], histogram_upper[rule], places=10
+                )
+
+    def test_parallel_exact_batch_matches_serial_solver(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            data = synthetic_dataset(Path(directory) / "data", 90)
+            fit_codes, _, _ = data.split((0.6, 0.2, 0.2), 111)
+            common = dict(
+                dataset=str(data.root),
+                q_max=2,
+                impact_lag=3,
+                knot_count=2,
+                formation_windows=(0, 1),
+                solver_tolerance=1e-8,
+                solver_max_iter=150,
+                cache_bytes=16 * 1024**2,
+                early_warning_horizon=3,
+                pricing_devices=(),
+            )
+            serial = SupportOptimizer(
+                Context.make(data, fit_codes), RunConfig(**common, exact_workers=1)
+            )
+            parallel = SupportOptimizer(
+                Context.make(data, fit_codes), RunConfig(**common, exact_workers=3)
+            )
+            supports = [Support.of((rule,)) for rule in serial.dictionary[:6]]
+            serial_records = serial.fit_many(supports, serial.records[Support(())])
+            parallel_records = parallel.fit_many(
+                supports, parallel.records[Support(())]
+            )
+            for left, right in zip(serial_records, parallel_records, strict=True):
+                self.assertEqual(left.fit.converged, right.fit.converged)
+                self.assertAlmostEqual(left.fit.nll, right.fit.nll, places=11)
+                np.testing.assert_allclose(
+                    left.fit.coefficients,
+                    right.fit.coefficients,
+                    rtol=1e-12,
+                    atol=1e-12,
+                )
 
     def test_continuous_poisson_uses_exact_tick_exposure(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
