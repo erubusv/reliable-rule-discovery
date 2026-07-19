@@ -7,7 +7,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from .data import Dataset
-from .native import kernel_contributions
+from .native import completion_events, kernel_contributions
 from .rules import Antecedent, ClosureTerm, RuleIdentity, Support, hierarchy_closure
 
 
@@ -103,6 +103,9 @@ class ModelMatrix:
     rule_slices: tuple[slice, ...]
     support: Support
     closure: tuple[ClosureTerm, ...]
+    active_rows: np.ndarray
+    active_age_bins: np.ndarray
+    aggregate_bins: np.ndarray
 
     @property
     def dimension(self) -> int:
@@ -110,16 +113,30 @@ class ModelMatrix:
 
 
 class ResponseEngine:
-    def __init__(self, dataset: Dataset, *, lag: int, knot_count: int, cache_bytes: int):
+    def __init__(
+        self, dataset: Dataset, *, lag: int, knot_count: int, cache_bytes: int
+    ):
         self.dataset = dataset
-        self.lag = int(lag)
-        self.knot_count = int(knot_count)
-        self.basis = triangular_basis(lag, knot_count)
-        maximum_age = int(
-            np.max(dataset.baseline_origins + dataset.end_times - dataset.start_times)
+        self.lag_units = int(lag)
+        self.lag = int(lag) * dataset.ticks_per_unit
+        self.tick_exposure = (
+            1.0 / dataset.ticks_per_unit if dataset.likelihood == "poisson" else 1.0
         )
-        self.baseline_dimension = max(1, maximum_age // self.lag + 1)
+        self.knot_count = int(knot_count)
+        self.basis = triangular_basis(self.lag, knot_count)
+        if dataset.likelihood == "poisson":
+            # Unit integral in the declared continuous-time unit (hours for
+            # IBM), rather than unit sum in implementation ticks.
+            self.basis *= dataset.ticks_per_unit
+        # A single common intercept is the preregistered null.  Unregularized
+        # age dummies have nonattained MLEs whenever a bin has no adverse event,
+        # which is common in low-rate finance data and invalidates both J and
+        # Fenchel certificates.  Time-varying baseline predicates therefore
+        # belong in an explicitly preregistered future model, not an implicit
+        # data-dependent bin merge.
+        self.baseline_dimension = 1
         self.cache_bytes = max(0, int(cache_bytes))
+        self._block_cache_limit = 3 * self.cache_bytes // 4
         self._cache: OrderedDict[tuple, SparseBlock] = OrderedDict()
         self._cache_size = 0
         self._completion_cache: OrderedDict[
@@ -129,9 +146,12 @@ class ResponseEngine:
         self._completion_cache_limit = min(self.cache_bytes // 4, 2 * 1024**3)
         self._source_cache: dict[tuple[int, int], tuple[np.ndarray, np.ndarray]] = {}
         self._baseline_cache: dict[int, np.ndarray] = {}
+        self._entity_age_cache: dict[int, np.ndarray] = {}
         self._lock = threading.RLock()
 
-    def _source(self, predicate: int, context: Context) -> tuple[np.ndarray, np.ndarray]:
+    def _source(
+        self, predicate: int, context: Context
+    ) -> tuple[np.ndarray, np.ndarray]:
         key = (id(context), int(predicate))
         with self._lock:
             cached = self._source_cache.get(key)
@@ -145,7 +165,9 @@ class ResponseEngine:
             self._source_cache[key] = result
         return result
 
-    def completions(self, context: Context, antecedent: Antecedent) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    def completions(
+        self, context: Context, antecedent: Antecedent
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         key = (id(context), antecedent)
         with self._lock:
             cached = self._completion_cache.get(key)
@@ -153,14 +175,24 @@ class ResponseEngine:
                 self._completion_cache.move_to_end(key)
                 return cached
         sources = [self._source(predicate, context) for predicate in antecedent]
+        compiled = completion_events(sources)
+        if compiled is not None:
+            result = (
+                compiled[0].astype(np.int32, copy=False),
+                compiled[1],
+                compiled[2],
+            )
+            return self._retain_completions(key, result)
         per_source: list[dict[int, np.ndarray]] = []
         for entities, times in sources:
             mapping: dict[int, np.ndarray] = {}
             if len(entities):
                 unique, first = np.unique(entities, return_index=True)
                 for index, entity in enumerate(unique):
-                    right = first[index + 1] if index + 1 < len(first) else len(entities)
-                    mapping[int(entity)] = np.unique(times[first[index]:right])
+                    right = (
+                        first[index + 1] if index + 1 < len(first) else len(entities)
+                    )
+                    mapping[int(entity)] = np.unique(times[first[index] : right])
             per_source.append(mapping)
         eligible = set(per_source[0]) if per_source else set()
         for mapping in per_source[1:]:
@@ -181,7 +213,10 @@ class ResponseEngine:
             positions = np.zeros(len(streams), dtype=np.int64)
             for time in union:
                 for source_index, stream in enumerate(streams):
-                    while positions[source_index] < len(stream) and stream[positions[source_index]] <= time:
+                    while (
+                        positions[source_index] < len(stream)
+                        and stream[positions[source_index]] <= time
+                    ):
                         latest[source_index] = stream[positions[source_index]]
                         positions[source_index] += 1
                 if np.all(latest != np.iinfo(np.int64).min):
@@ -193,8 +228,21 @@ class ResponseEngine:
             np.asarray(completion_times, dtype=np.int64),
             np.asarray(completion_spans, dtype=np.int64),
         )
+        return self._retain_completions(key, result)
+
+    def _retain_completions(
+        self,
+        key: tuple[int, Antecedent],
+        result: tuple[np.ndarray, np.ndarray, np.ndarray],
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         size = sum(array.nbytes for array in result)
+        if size > self._completion_cache_limit:
+            return result
         with self._lock:
+            existing = self._completion_cache.get(key)
+            if existing is not None:
+                self._completion_cache.move_to_end(key)
+                return existing
             self._completion_cache[key] = result
             self._completion_cache_size += size
             while (
@@ -236,12 +284,44 @@ class ResponseEngine:
             np.add.at(difference, middle_right[has_middle], -self.lag)
             totals += np.cumsum(difference[:-1])
         if not np.isclose(float(totals.sum()), float(context.n_grid)):
-            raise AssertionError("baseline aggregation does not cover the observation grid")
+            raise AssertionError(
+                "baseline aggregation does not cover the observation grid"
+            )
         with self._lock:
             self._baseline_cache[key] = totals
         return totals
 
-    def block(self, context: Context, antecedent: Antecedent, window: int) -> SparseBlock:
+    def entity_age_counts(self, context: Context) -> np.ndarray:
+        key = id(context)
+        with self._lock:
+            cached = self._entity_age_cache.get(key)
+            if cached is not None:
+                return cached
+        origins = context.baseline_origins.astype(np.int64, copy=False)[:, None]
+        final_ages = (context.baseline_origins + context.ends - context.starts).astype(
+            np.int64, copy=False
+        )[:, None]
+        bins = np.arange(self.baseline_dimension, dtype=np.int64)[None, :]
+        left = np.maximum(origins, bins * self.lag)
+        right = np.minimum(final_ages, (bins + 1) * self.lag - 1)
+        counts = np.maximum(0, right - left + 1).astype(np.float64)
+        # The final bin also contains ages beyond its nominal upper edge.
+        if self.baseline_dimension:
+            final_left = np.maximum(
+                origins[:, 0], (self.baseline_dimension - 1) * self.lag
+            )
+            counts[:, -1] = np.maximum(0, final_ages[:, 0] - final_left + 1)
+        if not np.allclose(counts.sum(axis=1), context.ends - context.starts + 1):
+            raise AssertionError(
+                "entity baseline counts do not cover observation intervals"
+            )
+        with self._lock:
+            self._entity_age_cache[key] = counts
+        return counts
+
+    def block(
+        self, context: Context, antecedent: Antecedent, window: int
+    ) -> SparseBlock:
         key = (id(context), antecedent, int(window))
         with self._lock:
             cached = self._cache.get(key)
@@ -249,17 +329,28 @@ class ResponseEngine:
                 self._cache.move_to_end(key)
                 return cached
         entities, times, spans = self.completions(context, antecedent)
-        keep = spans <= int(window)
+        window_ticks = int(window) * self.dataset.ticks_per_unit
+        keep = spans <= window_ticks
         entities, times, spans = entities[keep], times[keep], spans[keep]
         contributions = kernel_contributions(
-            entities, times, spans, context.starts, context.ends,
-            context.offsets, self.basis, int(window),
+            entities,
+            times,
+            spans,
+            context.starts,
+            context.ends,
+            context.offsets,
+            self.basis,
+            window_ticks,
         )
         if contributions is None:
             contribution_rows: list[int] = []
             contribution_values: list[np.ndarray] = []
-            for entity, completion in zip(entities.tolist(), times.tolist(), strict=True):
-                base = int(context.offsets[entity] + completion - context.starts[entity])
+            for entity, completion in zip(
+                entities.tolist(), times.tolist(), strict=True
+            ):
+                base = int(
+                    context.offsets[entity] + completion - context.starts[entity]
+                )
                 remaining = int(context.ends[entity] - completion)
                 for lag in range(1, min(self.lag, remaining) + 1):
                     contribution_rows.append(base + lag)
@@ -282,10 +373,16 @@ class ResponseEngine:
             rows = np.zeros(0, dtype=np.int64)
             matrix = np.zeros((0, self.knot_count), dtype=np.float64)
         result = SparseBlock(rows, matrix)
+        if result.nbytes > self._block_cache_limit:
+            return result
         with self._lock:
+            existing = self._cache.get(key)
+            if existing is not None:
+                self._cache.move_to_end(key)
+                return existing
             self._cache[key] = result
             self._cache_size += result.nbytes
-            while self._cache_size > self.cache_bytes and len(self._cache) > 1:
+            while self._cache_size > self._block_cache_limit and len(self._cache) > 1:
                 _, removed = self._cache.popitem(last=False)
                 self._cache_size -= removed.nbytes
         return result
@@ -297,14 +394,26 @@ class ResponseEngine:
         *,
         forced_closure: tuple[ClosureTerm, ...] | None = None,
     ) -> ModelMatrix:
-        closure = hierarchy_closure(support) if forced_closure is None else tuple(sorted(forced_closure))
-        closure_blocks = [self.block(context, term.antecedent, term.window) for term in closure]
-        rule_blocks = [self.block(context, rule.antecedent, rule.window) for rule in support.rules]
+        closure = (
+            hierarchy_closure(support)
+            if forced_closure is None
+            else tuple(sorted(forced_closure))
+        )
+        closure_blocks = [
+            self.block(context, term.antecedent, term.window) for term in closure
+        ]
+        rule_blocks = [
+            self.block(context, rule.antecedent, rule.window) for rule in support.rules
+        ]
         all_blocks = [*closure_blocks, *rule_blocks]
         active_rows = [block.rows for block in all_blocks if len(block.rows)]
         if len(context.target_rows):
             active_rows.append(context.target_rows)
-        union = np.unique(np.concatenate(active_rows)) if active_rows else np.zeros(0, dtype=np.int64)
+        union = (
+            np.unique(np.concatenate(active_rows))
+            if active_rows
+            else np.zeros(0, dtype=np.int64)
+        )
         local, times = context.rows_to_entity_time(union)
         ages = context.baseline_origins[local] + times - context.starts[local]
         age_count = self.baseline_dimension
@@ -323,7 +432,7 @@ class ResponseEngine:
             if block_index >= len(closure_blocks):
                 sign = float(support.rules[block_index - len(closure_blocks)].sign)
             left = baseline_dim + block_index * self.knot_count
-            x_active[positions, left:left + self.knot_count] = sign * block.values
+            x_active[positions, left : left + self.knot_count] = sign * block.values
         # Aggregate all rows outside the active union exactly by baseline age bin.
         total_by_age = self._baseline_totals(context)
         active_by_age = np.bincount(age_bins, minlength=age_count).astype(np.float64)
@@ -337,15 +446,27 @@ class ResponseEngine:
         ] = 1.0
         x = np.concatenate([x_active, x_aggregate], axis=0)
         target_position = np.searchsorted(union, context.target_rows)
-        matched = (target_position < len(union)) & (union[np.minimum(target_position, max(0, len(union) - 1))] == context.target_rows) if len(union) else np.zeros(len(context.target_rows), dtype=bool)
+        matched = (
+            (target_position < len(union))
+            & (
+                union[np.minimum(target_position, max(0, len(union) - 1))]
+                == context.target_rows
+            )
+            if len(union)
+            else np.zeros(len(context.target_rows), dtype=bool)
+        )
         event_active = np.zeros(len(union), dtype=np.float64)
         if np.any(matched):
-            np.add.at(event_active, target_position[matched], context.target_counts[matched])
+            np.add.at(
+                event_active, target_position[matched], context.target_counts[matched]
+            )
         # target rows were explicitly included, so the unmatched branch is an invariant check.
         if len(context.target_rows) and not np.all(matched):
             raise AssertionError("target row missing from active union")
         event_weight = np.concatenate([event_active, np.zeros(len(aggregate_bins))])
-        exposure_weight = np.concatenate([np.ones(len(union)), inactive_by_age[aggregate_bins]])
+        exposure_weight = self.tick_exposure * np.concatenate(
+            [np.ones(len(union)), inactive_by_age[aggregate_bins]]
+        )
         if context.dataset.likelihood == "first_event_cloglog":
             noevent_weight = exposure_weight - event_weight
         else:
@@ -368,6 +489,9 @@ class ResponseEngine:
             rule_slices=rule_slices,
             support=support,
             closure=closure,
+            active_rows=union,
+            active_age_bins=age_bins,
+            aggregate_bins=aggregate_bins,
         )
 
     def linear_predictor(
@@ -390,13 +514,17 @@ class ResponseEngine:
         left = baseline_dimension
         for index, term in enumerate(matrix.closure):
             block = self.block(context, term.antecedent, term.window)
-            beta = coefficients[left + index * self.knot_count : left + (index + 1) * self.knot_count]
+            beta = coefficients[
+                left + index * self.knot_count : left + (index + 1) * self.knot_count
+            ]
             if len(block.rows):
                 eta[block.rows] += block.values @ beta
         left = matrix.free_dimension
         for index, rule in enumerate(matrix.support.rules):
             block = self.block(context, rule.antecedent, rule.window)
-            beta = coefficients[left + index * self.knot_count : left + (index + 1) * self.knot_count]
+            beta = coefficients[
+                left + index * self.knot_count : left + (index + 1) * self.knot_count
+            ]
             if len(block.rows):
                 eta[block.rows] += rule.sign * (block.values @ beta)
         return eta
@@ -432,10 +560,14 @@ class ResponseEngine:
         for index, term in enumerate(matrix.closure):
             insert(
                 self.block(context, term.antecedent, term.window),
-                slice(left + index * self.knot_count, left + (index + 1) * self.knot_count),
+                slice(
+                    left + index * self.knot_count, left + (index + 1) * self.knot_count
+                ),
                 1.0,
             )
-        for rule, destination in zip(matrix.support.rules, matrix.rule_slices, strict=True):
+        for rule, destination in zip(
+            matrix.support.rules, matrix.rule_slices, strict=True
+        ):
             insert(
                 self.block(context, rule.antecedent, rule.window),
                 destination,
@@ -457,12 +589,17 @@ class ResponseEngine:
         self, context: Context, rule: RuleIdentity, horizon: int
     ) -> np.ndarray:
         entities, times, spans = self.completions(context, rule.antecedent)
-        keep = spans <= rule.window
+        keep = spans <= rule.window * self.dataset.ticks_per_unit
         entities, times = entities[keep], times[keep]
         rows: list[np.ndarray] = []
         for entity, completion in zip(entities.tolist(), times.tolist(), strict=True):
-            length = min(int(horizon), int(context.ends[entity] - completion))
+            length = min(
+                int(horizon) * self.dataset.ticks_per_unit,
+                int(context.ends[entity] - completion),
+            )
             if length > 0:
-                base = int(context.offsets[entity] + completion - context.starts[entity])
+                base = int(
+                    context.offsets[entity] + completion - context.starts[entity]
+                )
                 rows.append(base + np.arange(1, length + 1, dtype=np.int64))
         return np.unique(np.concatenate(rows)) if rows else np.zeros(0, dtype=np.int64)

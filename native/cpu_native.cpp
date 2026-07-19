@@ -170,9 +170,125 @@ fail:
     return nullptr;
 }
 
+PyObject* completion_events(PyObject*, PyObject* args) {
+    PyObject *entities_obj, *times_obj, *offsets_obj, *output_entities_obj,
+             *output_times_obj, *output_spans_obj;
+    if (!PyArg_ParseTuple(args, "OOOOOO", &entities_obj, &times_obj, &offsets_obj,
+                          &output_entities_obj, &output_times_obj, &output_spans_obj)) {
+        return nullptr;
+    }
+    Py_buffer entities{}, times{}, offsets{}, output_entities{}, output_times{}, output_spans{};
+    if (!int64_buffer(entities_obj, &entities, 1, false)) return nullptr;
+    if (!int64_buffer(times_obj, &times, 1, false)) { PyBuffer_Release(&entities); return nullptr; }
+    if (!int64_buffer(offsets_obj, &offsets, 1, false)) {
+        PyBuffer_Release(&entities); PyBuffer_Release(&times); return nullptr;
+    }
+    if (!int64_buffer(output_entities_obj, &output_entities, 1, true)) {
+        PyBuffer_Release(&entities); PyBuffer_Release(&times); PyBuffer_Release(&offsets); return nullptr;
+    }
+    if (!int64_buffer(output_times_obj, &output_times, 1, true)) {
+        PyBuffer_Release(&entities); PyBuffer_Release(&times); PyBuffer_Release(&offsets);
+        PyBuffer_Release(&output_entities); return nullptr;
+    }
+    if (!int64_buffer(output_spans_obj, &output_spans, 1, true)) {
+        PyBuffer_Release(&entities); PyBuffer_Release(&times); PyBuffer_Release(&offsets);
+        PyBuffer_Release(&output_entities); PyBuffer_Release(&output_times); return nullptr;
+    }
+    const auto event_count = entities.shape[0];
+    const auto source_count = offsets.shape[0] - 1;
+    bool valid = times.shape[0] == event_count && source_count >= 1 && source_count <= 3 &&
+                 output_entities.shape[0] >= event_count && output_times.shape[0] >= event_count &&
+                 output_spans.shape[0] >= event_count;
+    const auto* ep = static_cast<const std::int64_t*>(entities.buf);
+    const auto* tp = static_cast<const std::int64_t*>(times.buf);
+    const auto* op = static_cast<const std::int64_t*>(offsets.buf);
+    if (valid) {
+        valid = op[0] == 0 && op[source_count] == event_count;
+        for (std::int64_t source = 0; source < source_count; ++source) {
+            valid = valid && op[source] <= op[source + 1];
+        }
+    }
+    if (!valid) {
+        PyErr_SetString(PyExc_ValueError, "completion event buffer shape mismatch");
+        goto completion_fail;
+    }
+    {
+        auto* out_e = static_cast<std::int64_t*>(output_entities.buf);
+        auto* out_t = static_cast<std::int64_t*>(output_times.buf);
+        auto* out_s = static_cast<std::int64_t*>(output_spans.buf);
+        std::vector<std::int64_t> position(source_count), end(source_count), group_end(source_count);
+        for (std::int64_t source = 0; source < source_count; ++source) {
+            position[source] = op[source];
+            end[source] = op[source + 1];
+        }
+        std::int64_t output = 0;
+        while (true) {
+            bool exhausted = false;
+            std::int64_t candidate_entity = std::numeric_limits<std::int64_t>::min();
+            for (std::int64_t source = 0; source < source_count; ++source) {
+                if (position[source] >= end[source]) { exhausted = true; break; }
+                candidate_entity = std::max(candidate_entity, ep[position[source]]);
+            }
+            if (exhausted) break;
+            bool aligned = true;
+            for (std::int64_t source = 0; source < source_count; ++source) {
+                while (position[source] < end[source] && ep[position[source]] < candidate_entity) {
+                    const auto skipped = ep[position[source]];
+                    while (position[source] < end[source] && ep[position[source]] == skipped) ++position[source];
+                }
+                if (position[source] >= end[source]) { exhausted = true; break; }
+                if (ep[position[source]] != candidate_entity) aligned = false;
+            }
+            if (exhausted) break;
+            if (!aligned) continue;
+            for (std::int64_t source = 0; source < source_count; ++source) {
+                group_end[source] = position[source];
+                while (group_end[source] < end[source] && ep[group_end[source]] == candidate_entity) {
+                    ++group_end[source];
+                }
+            }
+            std::vector<std::int64_t> cursor = position;
+            std::vector<std::int64_t> latest(source_count, std::numeric_limits<std::int64_t>::min());
+            while (true) {
+                std::int64_t next_time = std::numeric_limits<std::int64_t>::max();
+                for (std::int64_t source = 0; source < source_count; ++source) {
+                    if (cursor[source] < group_end[source]) next_time = std::min(next_time, tp[cursor[source]]);
+                }
+                if (next_time == std::numeric_limits<std::int64_t>::max()) break;
+                bool witnessed = true;
+                std::int64_t minimum = std::numeric_limits<std::int64_t>::max();
+                std::int64_t maximum = std::numeric_limits<std::int64_t>::min();
+                for (std::int64_t source = 0; source < source_count; ++source) {
+                    while (cursor[source] < group_end[source] && tp[cursor[source]] <= next_time) {
+                        latest[source] = tp[cursor[source]++];
+                    }
+                    witnessed = witnessed && latest[source] != std::numeric_limits<std::int64_t>::min();
+                    minimum = std::min(minimum, latest[source]);
+                    maximum = std::max(maximum, latest[source]);
+                }
+                if (witnessed) {
+                    out_e[output] = candidate_entity;
+                    out_t[output] = next_time;
+                    out_s[output] = maximum - minimum;
+                    ++output;
+                }
+            }
+            position = group_end;
+        }
+        PyBuffer_Release(&entities); PyBuffer_Release(&times); PyBuffer_Release(&offsets);
+        PyBuffer_Release(&output_entities); PyBuffer_Release(&output_times); PyBuffer_Release(&output_spans);
+        return PyLong_FromLongLong(output);
+    }
+completion_fail:
+    PyBuffer_Release(&entities); PyBuffer_Release(&times); PyBuffer_Release(&offsets);
+    PyBuffer_Release(&output_entities); PyBuffer_Release(&output_times); PyBuffer_Release(&output_spans);
+    return nullptr;
+}
+
 PyMethodDef methods[] = {
     {"moments", moments, METH_VARARGS, "Deterministic gradient/Fisher moments."},
     {"kernel_contributions", kernel_contributions, METH_VARARGS, "Strict-future kernel contributions."},
+    {"completion_events", completion_events, METH_VARARGS, "Latest-witness completion events."},
     {nullptr, nullptr, 0, nullptr},
 };
 

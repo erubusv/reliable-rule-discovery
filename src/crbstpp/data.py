@@ -32,8 +32,15 @@ def _sha256_file(path: Path) -> str:
 def _dataset_identity(manifest: dict[str, object]) -> dict[str, object]:
     """Return exactly the provenance-bearing payload protected by the digest."""
     names = (
-        "schema", "predicate_names", "likelihood", "time_unit",
-        "adverse_event_name", "f0_contract", "files", "provenance",
+        "schema",
+        "predicate_names",
+        "likelihood",
+        "time_unit",
+        "ticks_per_unit",
+        "adverse_event_name",
+        "f0_contract",
+        "files",
+        "provenance",
     )
     return {name: manifest[name] for name in names}
 
@@ -67,6 +74,7 @@ class Dataset:
     target_multiplicity: np.ndarray
     likelihood: str
     time_unit: str
+    ticks_per_unit: int
     adverse_event_name: str
     f0_contract: dict[str, object]
     digest: str
@@ -98,10 +106,18 @@ class Dataset:
         if likelihood not in SUPPORTED_LIKELIHOODS:
             raise ValueError(f"unsupported likelihood: {likelihood}")
         files = manifest.get("files")
-        if not isinstance(files, dict) or set(files) != {"entities", "events", "targets"}:
+        if not isinstance(files, dict) or set(files) != {
+            "entities",
+            "events",
+            "targets",
+        }:
             raise ValueError("manifest must name entities/events/targets files")
         for name, metadata in files.items():
-            if not isinstance(metadata, dict) or "path" not in metadata or "sha256" not in metadata:
+            if (
+                not isinstance(metadata, dict)
+                or "path" not in metadata
+                or "sha256" not in metadata
+            ):
                 raise ValueError(f"invalid file manifest entry: {name}")
             path = root / str(metadata["path"])
             if not path.is_file() or _sha256_file(path) != metadata["sha256"]:
@@ -110,7 +126,11 @@ class Dataset:
         events = pd.read_parquet(root / files["events"]["path"])
         targets = pd.read_parquet(root / files["targets"]["path"])
         expected_entities = [
-            "entity_id", "start_time", "end_time", "baseline_origin", "split_group"
+            "entity_id",
+            "start_time",
+            "end_time",
+            "baseline_origin",
+            "split_group",
         ]
         expected_events = ["entity_code", "time", "predicate_code"]
         expected_targets = ["entity_code", "time", "multiplicity"]
@@ -120,7 +140,9 @@ class Dataset:
             raise ValueError("invalid events schema")
         if targets.columns.tolist() != expected_targets:
             raise ValueError("invalid targets schema")
-        predicate_names = tuple(str(value) for value in manifest.get("predicate_names", ()))
+        predicate_names = tuple(
+            str(value) for value in manifest.get("predicate_names", ())
+        )
         if not predicate_names or len(set(predicate_names)) != len(predicate_names):
             raise ValueError("predicate_names must be nonempty and unique")
         result = cls(
@@ -139,6 +161,7 @@ class Dataset:
             target_multiplicity=targets["multiplicity"].to_numpy(dtype=np.int32),
             likelihood=likelihood,
             time_unit=str(manifest["time_unit"]),
+            ticks_per_unit=int(manifest["ticks_per_unit"]),
             adverse_event_name=str(manifest["adverse_event_name"]),
             f0_contract=dict(manifest.get("f0_contract", {})),
             digest=str(manifest["dataset_digest"]),
@@ -161,27 +184,42 @@ class Dataset:
             raise ValueError("entity IDs must be unique")
         if not self.adverse_event_name:
             raise ValueError("adverse_event_name must be pre-registered")
+        if self.ticks_per_unit < 1:
+            raise ValueError("ticks_per_unit must be positive")
         if not all(self.f0_contract.get(name) is True for name in REQUIRED_F0):
             raise ValueError("dataset does not satisfy the F0 preprocessing contract")
         for entities, times, label in (
             (self.event_entities, self.event_times, "predicate"),
             (self.target_entities, self.target_times, "target"),
         ):
-            if entities.shape != times.shape or np.any(entities < 0) or np.any(entities >= n):
+            if (
+                entities.shape != times.shape
+                or np.any(entities < 0)
+                or np.any(entities >= n)
+            ):
                 raise ValueError(f"invalid {label} arrays")
             if len(times):
-                if np.any(times < self.start_times[entities]) or np.any(times > self.end_times[entities]):
+                if np.any(times < self.start_times[entities]) or np.any(
+                    times > self.end_times[entities]
+                ):
                     raise ValueError(f"{label} outside observation bounds")
         if self.event_predicates.shape != self.event_times.shape:
             raise ValueError("invalid predicate code array")
-        if np.any(self.event_predicates < 0) or np.any(self.event_predicates >= self.n_predicates):
+        if np.any(self.event_predicates < 0) or np.any(
+            self.event_predicates >= self.n_predicates
+        ):
             raise ValueError("predicate code out of range")
-        if self.target_multiplicity.shape != self.target_times.shape or np.any(self.target_multiplicity < 1):
+        if self.target_multiplicity.shape != self.target_times.shape or np.any(
+            self.target_multiplicity < 1
+        ):
             raise ValueError("invalid target multiplicity")
         if len(self.event_times) > 1:
             previous_entity, entity = self.event_entities[:-1], self.event_entities[1:]
             previous_time, time = self.event_times[:-1], self.event_times[1:]
-            previous_predicate, predicate = self.event_predicates[:-1], self.event_predicates[1:]
+            previous_predicate, predicate = (
+                self.event_predicates[:-1],
+                self.event_predicates[1:],
+            )
             bad = (entity < previous_entity) | (
                 (entity == previous_entity)
                 & (
@@ -192,7 +230,10 @@ class Dataset:
             if np.any(bad):
                 raise ValueError("predicate events must be strictly sorted and unique")
         if len(self.target_times) > 1:
-            previous_entity, entity = self.target_entities[:-1], self.target_entities[1:]
+            previous_entity, entity = (
+                self.target_entities[:-1],
+                self.target_entities[1:],
+            )
             previous_time, time = self.target_times[:-1], self.target_times[1:]
             if np.any(
                 (entity < previous_entity)
@@ -202,9 +243,13 @@ class Dataset:
         if self.likelihood == "first_event_cloglog":
             counts = np.bincount(self.target_entities, minlength=n)
             if np.any(counts > 1) or np.any(self.target_multiplicity != 1):
-                raise ValueError("first-event cloglog requires at most one target per entity")
+                raise ValueError(
+                    "first-event cloglog requires at most one target per entity"
+                )
 
-    def predicate_stream(self, predicate: int, entities: np.ndarray | None = None) -> tuple[np.ndarray, np.ndarray]:
+    def predicate_stream(
+        self, predicate: int, entities: np.ndarray | None = None
+    ) -> tuple[np.ndarray, np.ndarray]:
         mask = self.event_predicates == int(predicate)
         stream_entities = self.event_entities[mask]
         stream_times = self.event_times[mask]
@@ -215,10 +260,14 @@ class Dataset:
         keep = selected[stream_entities]
         return stream_entities[keep], stream_times[keep]
 
-    def split(self, fractions: tuple[float, float, float], seed: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    def split(
+        self, fractions: tuple[float, float, float], seed: int
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Split complete entities; ordered groups are used when nonconstant."""
         if len(np.unique(self.split_groups)) > 1:
             groups, counts = np.unique(self.split_groups, return_counts=True)
+            if len(groups) < 3:
+                raise ValueError("ordered entity split requires at least three cohorts")
             cumulative = np.cumsum(counts)
             first_target = fractions[0] * self.n_entities
             second_target = (fractions[0] + fractions[1]) * self.n_entities
@@ -226,19 +275,33 @@ class Dataset:
             second = int(np.argmin(np.abs(cumulative - second_target)))
             if second <= first:
                 second = min(len(groups) - 1, first + 1)
-            return tuple(
+            parts = tuple(
                 np.flatnonzero(mask).astype(np.int32)
                 for mask in (
                     self.split_groups <= groups[first],
-                    (self.split_groups > groups[first]) & (self.split_groups <= groups[second]),
+                    (self.split_groups > groups[first])
+                    & (self.split_groups <= groups[second]),
                     self.split_groups > groups[second],
                 )
-            )  # type: ignore[return-value]
-        rng = np.random.default_rng(int(seed))
-        order = rng.permutation(self.n_entities)
-        first = int(round(fractions[0] * self.n_entities))
-        second = int(round((fractions[0] + fractions[1]) * self.n_entities))
-        return tuple(np.sort(part).astype(np.int32) for part in np.split(order, [first, second]))  # type: ignore[return-value]
+            )  # type: ignore[assignment]
+        else:
+            rng = np.random.default_rng(int(seed))
+            order = rng.permutation(self.n_entities)
+            first = int(round(fractions[0] * self.n_entities))
+            second = int(round((fractions[0] + fractions[1]) * self.n_entities))
+            parts = tuple(
+                np.sort(part).astype(np.int32)
+                for part in np.split(order, [first, second])
+            )
+        if any(len(part) == 0 for part in parts):
+            raise ValueError("entity split produced an empty fit/cert/test partition")
+        combined = np.concatenate(parts)
+        if (
+            len(combined) != self.n_entities
+            or len(np.unique(combined)) != self.n_entities
+        ):
+            raise AssertionError("entity split is not a disjoint partition")
+        return parts  # type: ignore[return-value]
 
 
 def write_dataset(
@@ -250,6 +313,7 @@ def write_dataset(
     predicate_names: Iterable[str],
     likelihood: str,
     time_unit: str,
+    ticks_per_unit: int = 1,
     adverse_event_name: str,
     f0_contract: dict[str, object],
     provenance: dict[str, object],
@@ -269,12 +333,17 @@ def write_dataset(
     files = {}
     for name in ("entities", "events", "targets"):
         path = root / f"{name}.parquet"
-        files[name] = {"path": path.name, "sha256": _sha256_file(path), "bytes": path.stat().st_size}
+        files[name] = {
+            "path": path.name,
+            "sha256": _sha256_file(path),
+            "bytes": path.stat().st_size,
+        }
     identity: dict[str, object] = {
         "schema": DATASET_SCHEMA,
         "predicate_names": list(predicate_names),
         "likelihood": likelihood,
         "time_unit": time_unit,
+        "ticks_per_unit": int(ticks_per_unit),
         "adverse_event_name": adverse_event_name,
         "f0_contract": f0_contract,
         "files": files,

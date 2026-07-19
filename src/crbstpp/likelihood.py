@@ -15,7 +15,9 @@ def cloglog_event_terms(eta: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.nda
     large = x > 40.0
     middle = ~(small | large)
     xs = x[small]
-    value[small] = -np.log(np.maximum(xs, np.finfo(float).tiny)) + xs / 2.0 - xs * xs / 24.0
+    value[small] = (
+        -np.log(np.maximum(xs, np.finfo(float).tiny)) + xs / 2.0 - xs * xs / 24.0
+    )
     first[small] = -1.0 + xs / 2.0 - xs * xs / 12.0
     second[small] = xs / 2.0 - xs * xs / 6.0
     xm = x[middle]
@@ -82,7 +84,9 @@ def _mixed_cloglog_value_gradient(
 ) -> tuple[float, float]:
     values, first, _ = cloglog_event_terms(np.asarray([eta]))
     intensity = math.exp(min(eta, 700.0))
-    return noevent * intensity + event * float(values[0]), noevent * intensity + event * float(first[0])
+    return noevent * intensity + event * float(
+        values[0]
+    ), noevent * intensity + event * float(first[0])
 
 
 def cloglog_conjugate(

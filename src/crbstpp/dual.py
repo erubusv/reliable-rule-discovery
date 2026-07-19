@@ -92,16 +92,24 @@ def dual_certificate(
                 event_weight=matrix.event_weight,
             )
             domain_margin = float(np.min(dual + matrix.event_weight))
-            if likelihood == "first_event_cloglog" and np.any(matrix.noevent_weight == 0):
+            if likelihood == "first_event_cloglog" and np.any(
+                matrix.noevent_weight == 0
+            ):
                 domain_margin = min(
                     domain_margin,
                     float(np.min(-dual[matrix.noevent_weight == 0])),
                 )
             feasible = bool(math.isfinite(value) and domain_margin >= -tolerance)
             return DualCertificate(
-                feasible, -value if feasible else -math.inf,
-                equality, inequality, domain_margin, iteration,
+                feasible,
+                -value if feasible else -math.inf,
+                equality,
+                inequality,
+                domain_margin,
+                iteration,
             )
     equality = float(np.max(np.abs(free.T @ dual))) if free.shape[1] else 0.0
     inequality = float(np.min(cone.T @ dual)) if cone.shape[1] else math.inf
-    return DualCertificate(False, -math.inf, equality, inequality, -math.inf, int(max_iter))
+    return DualCertificate(
+        False, -math.inf, equality, inequality, -math.inf, int(max_iter)
+    )

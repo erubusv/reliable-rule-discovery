@@ -28,7 +28,7 @@ class BuildExt(_build_ext):
             "-Xcompiler",
             "-fPIC",
             "-gencode",
-            "arch=compute_89,code=sm_89",
+            "arch=compute_89,code=[sm_89,compute_89]",
             str(Path("native") / "pricing_cuda.cu"),
             "-o",
             str(output_dir / "libcrbstpp_cuda.so"),

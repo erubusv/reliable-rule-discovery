@@ -33,7 +33,6 @@ class RunConfig:
     pricing_workers: int = 12
     pricing_devices: tuple[str, ...] = ("cuda:0", "cuda:1")
     cache_bytes: int = 8 * 1024**3
-    checkpoint_seconds: float = 60.0
     metadata: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
@@ -58,7 +57,9 @@ class RunConfig:
         windows = tuple(int(value) for value in self.formation_windows)
         if not windows or windows != tuple(sorted(set(windows))) or windows[0] < 0:
             raise ValueError("formation_windows must be sorted, unique and nonnegative")
-        if len(self.split_fractions) != 3 or any(value <= 0 for value in self.split_fractions):
+        if len(self.split_fractions) != 3 or any(
+            value <= 0 for value in self.split_fractions
+        ):
             raise ValueError("three positive split fractions are required")
         if not math.isclose(sum(self.split_fractions), 1.0, abs_tol=1.0e-12):
             raise ValueError("split fractions must sum to one")
@@ -74,8 +75,15 @@ class RunConfig:
             raise ValueError("search_tolerance must be nonnegative")
         if self.exact_workers < 1 or self.pricing_workers < 1:
             raise ValueError("worker counts must be positive")
-        if self.cache_bytes < 0 or self.checkpoint_seconds <= 0:
-            raise ValueError("invalid cache/checkpoint controls")
+        if self.exact_workers > 3:
+            raise ValueError("exact fit concurrency is capped at three")
+        for device in self.pricing_devices:
+            if device != "cpu" and not (
+                device.startswith("cuda:") and device[5:].isdigit()
+            ):
+                raise ValueError(f"invalid pricing device: {device}")
+        if self.cache_bytes < 0:
+            raise ValueError("cache_bytes must be nonnegative")
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -84,4 +92,3 @@ class RunConfig:
     def digest(self) -> str:
         blob = json.dumps(self.to_dict(), sort_keys=True, separators=(",", ":"))
         return hashlib.sha256(blob.encode("utf-8")).hexdigest()
-

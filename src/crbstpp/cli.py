@@ -21,9 +21,10 @@ def _parser() -> argparse.ArgumentParser:
     freddie.add_argument("--vintage", action="append", default=[])
     freddie.add_argument("--overwrite", action="store_true")
     ibm = datasets.add_parser("ibm")
-    ibm.add_argument("--raw-zip", type=Path, default=Path("data/ibm_aml/raw/HI-Small_Trans.csv.zip"))
+    ibm.add_argument(
+        "--raw-zip", type=Path, default=Path("data/ibm_aml/raw/HI-Small_Trans.csv.zip")
+    )
     ibm.add_argument("--output-root", type=Path, required=True)
-    ibm.add_argument("--max-rows", type=int)
     ibm.add_argument("--overwrite", action="store_true")
     fit = commands.add_parser("fit")
     fit.add_argument("--config", type=Path, required=True)
@@ -40,13 +41,16 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "preprocess":
         if args.dataset_name == "freddie":
             output = preprocess_freddie(
-                args.input_root, args.output_root,
-                vintages=tuple(args.vintage), overwrite=args.overwrite,
+                args.input_root,
+                args.output_root,
+                vintages=tuple(args.vintage),
+                overwrite=args.overwrite,
             )
         else:
             output = preprocess_ibm(
-                args.raw_zip, args.output_root,
-                overwrite=args.overwrite, max_rows=args.max_rows,
+                args.raw_zip,
+                args.output_root,
+                overwrite=args.overwrite,
             )
         print(output)
         return 0
@@ -66,4 +70,3 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

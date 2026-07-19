@@ -30,6 +30,25 @@ def atomic_json(path: str | Path, payload: dict[str, Any]) -> None:
             pass
 
 
+def atomic_text(path: str | Path, value: str) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+    )
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            handle.write(value)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_name, path)
+    finally:
+        try:
+            os.unlink(temporary_name)
+        except FileNotFoundError:
+            pass
+
+
 def load_checkpoint(
     path: str | Path, *, config_digest: str, dataset_digest: str
 ) -> dict[str, Any]:
@@ -41,4 +60,3 @@ def load_checkpoint(
     if payload.get("dataset_digest") != dataset_digest:
         raise ValueError("checkpoint dataset digest mismatch")
     return payload
-

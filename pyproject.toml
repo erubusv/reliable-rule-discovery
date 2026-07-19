@@ -15,8 +15,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-gpu = ["torch>=2.1"]
-test = ["pytest>=7"]
+test = ["pytest>=7", "ruff>=0.12"]
 
 [project.scripts]
 crbstpp = "crbstpp.cli:main"
@@ -31,4 +30,3 @@ include = ["crbstpp*"]
 [tool.pytest.ini_options]
 testpaths = ["tests/crbstpp"]
 addopts = "-q"
-

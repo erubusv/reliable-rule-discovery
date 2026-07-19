@@ -15,7 +15,9 @@ class ObjectiveSpec:
     knot_count: int
     window_count_by_order: tuple[int, int, int]
 
-    def penalty_for_dimension(self, support: Support, parameter_dimension: int) -> float:
+    def penalty_for_dimension(
+        self, support: Support, parameter_dimension: int
+    ) -> float:
         size = len(support.rules)
         if size == 0:
             return 0.0
@@ -39,7 +41,9 @@ class ObjectiveSpec:
         )
         return self.penalty_for_dimension(support, parameter_dimension)
 
-    def penalty(self, support: Support, matrix: ModelMatrix, baseline_dimension: int) -> float:
+    def penalty(
+        self, support: Support, matrix: ModelMatrix, baseline_dimension: int
+    ) -> float:
         parameter_dimension = matrix.dimension - int(baseline_dimension)
         penalty = self.penalty_for_dimension(support, parameter_dimension)
         expected = self.structural_penalty(support)
@@ -57,9 +61,7 @@ class SupportRecord:
     score: float
 
 
-def support_score(
-    *, baseline_nll: float, fit_nll: float, penalty: float
-) -> float:
+def support_score(*, baseline_nll: float, fit_nll: float, penalty: float) -> float:
     if not math.isfinite(fit_nll):
         return -math.inf
     return float(2.0 * (baseline_nll - fit_nll) - penalty)

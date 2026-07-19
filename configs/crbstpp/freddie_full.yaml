@@ -16,5 +16,3 @@ exact_workers: 3
 pricing_workers: 12
 pricing_devices: [cuda:0, cuda:1]
 cache_bytes: 8589934592
-checkpoint_seconds: 60.0
-

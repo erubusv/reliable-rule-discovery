@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import hashlib
 import re
 import shutil
@@ -13,16 +12,38 @@ from ..data import write_dataset
 
 
 PERFORMANCE_COLUMNS = (
-    "loan_id", "monthly_reporting_period", "current_actual_upb",
-    "current_loan_delinquency_status", "loan_age", "remaining_months_to_maturity",
-    "defect_settlement_date", "modification_flag", "zero_balance_code",
-    "zero_balance_effective_date", "current_interest_rate", "current_deferred_upb",
-    "ddlpi", "mi_recoveries", "net_sales_proceeds", "non_mi_recoveries", "expenses",
-    "legal_costs", "maintenance_preservation_costs", "taxes_insurance", "misc_expenses",
-    "actual_loss", "modification_cost", "step_modification_flag", "deferred_payment_plan",
-    "eltv", "zero_balance_removal_upb", "delinquent_accrued_interest",
-    "delinquency_due_to_disaster", "borrower_assistance_status_code",
-    "current_month_modification_cost", "interest_bearing_upb",
+    "loan_id",
+    "monthly_reporting_period",
+    "current_actual_upb",
+    "current_loan_delinquency_status",
+    "loan_age",
+    "remaining_months_to_maturity",
+    "defect_settlement_date",
+    "modification_flag",
+    "zero_balance_code",
+    "zero_balance_effective_date",
+    "current_interest_rate",
+    "current_deferred_upb",
+    "ddlpi",
+    "mi_recoveries",
+    "net_sales_proceeds",
+    "non_mi_recoveries",
+    "expenses",
+    "legal_costs",
+    "maintenance_preservation_costs",
+    "taxes_insurance",
+    "misc_expenses",
+    "actual_loss",
+    "modification_cost",
+    "step_modification_flag",
+    "deferred_payment_plan",
+    "eltv",
+    "zero_balance_removal_upb",
+    "delinquent_accrued_interest",
+    "delinquency_due_to_disaster",
+    "borrower_assistance_status_code",
+    "current_month_modification_cost",
+    "interest_bearing_upb",
 )
 
 PREDICATES = (
@@ -43,12 +64,23 @@ PREDICATES = (
 
 def _read(path: Path) -> pd.DataFrame:
     use = [
-        "loan_id", "monthly_reporting_period", "current_actual_upb",
-        "current_loan_delinquency_status", "loan_age", "zero_balance_code", "eltv",
+        "loan_id",
+        "monthly_reporting_period",
+        "current_actual_upb",
+        "current_loan_delinquency_status",
+        "loan_age",
+        "zero_balance_code",
+        "eltv",
     ]
     frame = pd.read_csv(
-        path, sep="|", header=None, names=PERFORMANCE_COLUMNS, usecols=use,
-        dtype="string", keep_default_na=False, engine="c",
+        path,
+        sep="|",
+        header=None,
+        names=PERFORMANCE_COLUMNS,
+        usecols=use,
+        dtype="string",
+        keep_default_na=False,
+        engine="c",
     )
     for name in use:
         frame[name] = frame[name].str.strip()
@@ -81,14 +113,18 @@ def _prefix(frame: pd.DataFrame) -> pd.DataFrame:
     frame["position"] = frame.groupby("loan_id", sort=False).cumcount()
     first_target = (
         frame.loc[frame["target"], ["loan_id", "position"]]
-        .groupby("loan_id", sort=False)["position"].min()
+        .groupby("loan_id", sort=False)["position"]
+        .min()
     )
     stop = frame["loan_id"].map(first_target)
     frame = frame.loc[stop.isna() | frame["position"].le(stop)].copy()
-    gap = frame["loan_id"].eq(frame["loan_id"].shift()) & ~frame["time"].eq(frame["time"].shift() + 1)
+    gap = frame["loan_id"].eq(frame["loan_id"].shift()) & ~frame["time"].eq(
+        frame["time"].shift() + 1
+    )
     first_gap = (
         frame.loc[gap, ["loan_id", "position"]]
-        .groupby("loan_id", sort=False)["position"].min()
+        .groupby("loan_id", sort=False)["position"]
+        .min()
     )
     gap_stop = frame["loan_id"].map(first_gap)
     frame = frame.loc[gap_stop.isna() | frame["position"].lt(gap_stop)].copy()
@@ -106,7 +142,11 @@ def _predicate_matrix(frame: pd.DataFrame) -> pd.DataFrame:
 
     def band(values: pd.Series) -> pd.Series:
         return pd.Series(
-            np.select([values.lt(80).fillna(False), values.lt(100).fillna(False)], [0, 1], default=2),
+            np.select(
+                [values.lt(80).fillna(False), values.lt(100).fillna(False)],
+                [0, 1],
+                default=2,
+            ),
             index=frame.index,
         )
 
@@ -114,7 +154,12 @@ def _predicate_matrix(frame: pd.DataFrame) -> pd.DataFrame:
     epair = prev1 & valid & valid1
     prior_rise = prev2 & valid1 & valid2 & b1.eq(b2) & e1.gt(e2)
     prior_fall = prev2 & valid1 & valid2 & b1.eq(b2) & e1.lt(e2)
-    upb, u1, u2, u3 = frame["upb"], frame["upb"].shift(), frame["upb"].shift(2), frame["upb"].shift(3)
+    upb, u1, u2, u3 = (
+        frame["upb"],
+        frame["upb"].shift(),
+        frame["upb"].shift(2),
+        frame["upb"].shift(3),
+    )
     pair = prev1 & upb.gt(0) & u1.gt(0)
     triple = pair & prev2 & u2.gt(0)
     quad = triple & prev3 & u3.gt(0)
@@ -157,13 +202,17 @@ def preprocess_freddie(
     pattern = re.compile(r"historical_data_time_(\d{4}Q[1-4])\.txt$")
     paths: list[tuple[str, Path]] = []
     requested = set(vintages)
-    for path in input_root.glob("[0-9][0-9][0-9][0-9]/Q[1-4]/historical_data_time_*.txt"):
+    for path in input_root.glob(
+        "[0-9][0-9][0-9][0-9]/Q[1-4]/historical_data_time_*.txt"
+    ):
         match = pattern.match(path.name)
         if match and (not requested or match.group(1) in requested):
             paths.append((match.group(1), path))
     paths.sort()
     if requested - {name for name, _ in paths}:
-        raise FileNotFoundError(f"missing vintages: {sorted(requested - {name for name, _ in paths})}")
+        raise FileNotFoundError(
+            f"missing vintages: {sorted(requested - {name for name, _ in paths})}"
+        )
     if not paths:
         raise FileNotFoundError("no Freddie performance files found")
     entity_parts, event_parts, target_parts = [], [], []
@@ -174,29 +223,58 @@ def preprocess_freddie(
         frame = _prefix(raw)
         matrix = _predicate_matrix(frame)
         groups = frame.groupby("loan_id", sort=False)
-        entities = groups.agg(
-            start_time=("time", "first"), end_time=("time", "last"), start_age=("loan_age_num", "first")
-        ).reset_index().rename(columns={"loan_id": "entity_id"})
-        if bool(entities["start_age"].isna().any() or (entities["start_age"] < 0).any()):
+        entities = (
+            groups.agg(
+                start_time=("time", "first"),
+                end_time=("time", "last"),
+                start_age=("loan_age_num", "first"),
+            )
+            .reset_index()
+            .rename(columns={"loan_id": "entity_id"})
+        )
+        if bool(
+            entities["start_age"].isna().any() or (entities["start_age"] < 0).any()
+        ):
             raise ValueError("invalid Freddie start loan age")
-        entities["split_group"] = entities["start_time"].astype(np.int64) - entities["start_age"].astype(np.int64)
+        entities["split_group"] = entities["start_time"].astype(np.int64) - entities[
+            "start_age"
+        ].astype(np.int64)
         entities["baseline_origin"] = entities["start_age"].astype(np.int64)
-        entity_codes = pd.Series(np.arange(len(entities), dtype=np.int32) + entity_offset, index=entities["entity_id"])
+        entity_codes = pd.Series(
+            np.arange(len(entities), dtype=np.int32) + entity_offset,
+            index=entities["entity_id"],
+        )
         active = matrix.to_numpy(dtype=bool)
         row_index, predicate_code = np.nonzero(active)
-        events = pd.DataFrame({
-            "entity_code": frame.iloc[row_index]["loan_id"].map(entity_codes).to_numpy(dtype=np.int32),
-            "time": frame.iloc[row_index]["time"].to_numpy(dtype=np.int64),
-            "predicate_code": predicate_code.astype(np.int16),
-        })
+        events = pd.DataFrame(
+            {
+                "entity_code": frame.iloc[row_index]["loan_id"]
+                .map(entity_codes)
+                .to_numpy(dtype=np.int32),
+                "time": frame.iloc[row_index]["time"].to_numpy(dtype=np.int64),
+                "predicate_code": predicate_code.astype(np.int16),
+            }
+        )
         target_rows = frame.loc[frame["target"]]
-        targets = pd.DataFrame({
-            "entity_code": target_rows["loan_id"].map(entity_codes).to_numpy(dtype=np.int32),
-            "time": target_rows["time"].to_numpy(dtype=np.int64),
-            "multiplicity": np.ones(len(target_rows), dtype=np.int32),
-        })
+        targets = pd.DataFrame(
+            {
+                "entity_code": target_rows["loan_id"]
+                .map(entity_codes)
+                .to_numpy(dtype=np.int32),
+                "time": target_rows["time"].to_numpy(dtype=np.int64),
+                "multiplicity": np.ones(len(target_rows), dtype=np.int32),
+            }
+        )
         entity_parts.append(
-            entities[["entity_id", "start_time", "end_time", "baseline_origin", "split_group"]]
+            entities[
+                [
+                    "entity_id",
+                    "start_time",
+                    "end_time",
+                    "baseline_origin",
+                    "split_group",
+                ]
+            ]
         )
         event_parts.append(events)
         target_parts.append(targets)
@@ -207,12 +285,17 @@ def preprocess_freddie(
                 digest.update(chunk)
         source_digests[vintage] = digest.hexdigest()
     entities = pd.concat(entity_parts, ignore_index=True)
-    events = pd.concat(event_parts, ignore_index=True).sort_values(
-        ["entity_code", "time", "predicate_code"], kind="stable"
-    ).drop_duplicates().reset_index(drop=True)
-    targets = pd.concat(target_parts, ignore_index=True).sort_values(
-        ["entity_code", "time"], kind="stable"
-    ).reset_index(drop=True)
+    events = (
+        pd.concat(event_parts, ignore_index=True)
+        .sort_values(["entity_code", "time", "predicate_code"], kind="stable")
+        .drop_duplicates()
+        .reset_index(drop=True)
+    )
+    targets = (
+        pd.concat(target_parts, ignore_index=True)
+        .sort_values(["entity_code", "time"], kind="stable")
+        .reset_index(drop=True)
+    )
     return write_dataset(
         output_root,
         entities=entities,
@@ -221,6 +304,7 @@ def preprocess_freddie(
         predicate_names=PREDICATES,
         likelihood="first_event_cloglog",
         time_unit="month",
+        ticks_per_unit=1,
         adverse_event_name="first serious mortgage delinquency (90+ DPD or REO acquisition)",
         f0_contract={
             "dynamic_predicates": True,

@@ -20,7 +20,9 @@ class RuleIdentity:
         if tuple(sorted(set(self.antecedent))) != self.antecedent:
             raise ValueError("antecedent must be sorted and unique")
         if self.window < 0 or (len(self.antecedent) == 1 and self.window != 0):
-            raise ValueError("singleton window is zero; higher-order windows are nonnegative")
+            raise ValueError(
+                "singleton window is zero; higher-order windows are nonnegative"
+            )
         if self.sign not in {-1, 1}:
             raise ValueError("sign must be -1 or +1")
 
@@ -35,7 +37,10 @@ class ClosureTerm:
     window: int
 
     def __post_init__(self) -> None:
-        if not self.antecedent or tuple(sorted(set(self.antecedent))) != self.antecedent:
+        if (
+            not self.antecedent
+            or tuple(sorted(set(self.antecedent))) != self.antecedent
+        ):
             raise ValueError("invalid closure antecedent")
         if len(self.antecedent) == 1 and self.window != 0:
             raise ValueError("singleton closure window must be zero")
@@ -51,7 +56,9 @@ class Support:
             raise ValueError("support rules must be sorted and unique")
         antecedents = [rule.antecedent for rule in ordered]
         if len(set(antecedents)) != len(antecedents):
-            raise ValueError("one support cannot contain two identities of one antecedent")
+            raise ValueError(
+                "one support cannot contain two identities of one antecedent"
+            )
 
     @classmethod
     def of(cls, rules: Iterable[RuleIdentity]) -> "Support":
@@ -149,4 +156,3 @@ def one_exchange_neighbors(
             if trial not in emitted:
                 emitted.add(trial)
                 yield trial
-
