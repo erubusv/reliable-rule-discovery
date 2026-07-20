@@ -30,6 +30,40 @@ from tests.crbstpp.test_core import synthetic_dataset
 
 
 class NumericalParityTests(unittest.TestCase):
+    def test_restricted_drop_scores_are_feasible_lower_bounds(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            data = synthetic_dataset(Path(directory) / "data", 120)
+            fit_codes, _, _ = data.split((0.6, 0.2, 0.2), 111)
+            config = RunConfig(
+                dataset=str(data.root),
+                q_max=2,
+                impact_lag=3,
+                knot_count=2,
+                formation_windows=(0, 1, 2),
+                solver_tolerance=1e-8,
+                solver_max_iter=150,
+                cache_bytes=32 * 1024**2,
+                early_warning_horizon=3,
+                pricing_devices=(),
+            )
+            optimizer = SupportOptimizer(Context.make(data, fit_codes), config)
+            empty = optimizer.records[Support(())]
+            support = Support.of(
+                (
+                    RuleIdentity((0,), 0, 1),
+                    RuleIdentity((1,), 0, 1),
+                )
+            )
+            current = optimizer.fit(support, empty)
+            self.assertTrue(current.fit.converged)
+            self.assertIsNone(optimizer._best_restricted_drop(current))
+            for rule in support.rules:
+                trial = support.drop(rule)
+                restricted = optimizer._restricted_drop_scores[(support, trial)]
+                full = optimizer.fit(trial, current)
+                if full.fit.converged:
+                    self.assertGreaterEqual(full.score + 1e-8, restricted)
+
     def test_restricted_add_score_is_a_feasible_full_support_lower_bound(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             data = synthetic_dataset(Path(directory) / "data", 120)

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import itertools
 import tempfile
 import unittest
 from pathlib import Path
@@ -16,6 +17,7 @@ from crbstpp.rules import (
     RuleIdentity,
     Support,
     hierarchy_closure,
+    one_exchange_neighbors,
 )
 from crbstpp.search import SupportOptimizer
 from crbstpp.solver import fit_model_matrix
@@ -147,7 +149,7 @@ class LikelihoodSolverTests(unittest.TestCase):
             self.assertTrue(certificate.feasible)
             self.assertLessEqual(certificate.nll_lower_bound, fit.nll + 1e-6)
 
-    def test_small_block_search_has_no_profiled_add_move(self) -> None:
+    def test_small_block_search_matches_exhaustive_stationary_reference(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             data = synthetic_dataset(Path(directory) / "data")
             fit_codes, _, _ = data.split((0.6, 0.2, 0.2), 111)
@@ -166,8 +168,44 @@ class LikelihoodSolverTests(unittest.TestCase):
             optimizer = SupportOptimizer(Context.make(data, fit_codes), config)
             result = optimizer.search()
             self.assertGreater(len(result.family), 0)
+            self.assertGreater(len(result.terminals), 0)
+            empty = optimizer.records[Support(())]
+            groups = [
+                [
+                    None,
+                    *[
+                        rule
+                        for rule in optimizer.dictionary
+                        if rule.antecedent == antecedent
+                    ],
+                ]
+                for antecedent in optimizer.skeletons
+            ]
+            supports = [
+                Support.of(rule for rule in choice if rule is not None)
+                for choice in itertools.product(*groups)
+            ]
+            exhaustive = [
+                record
+                for record in optimizer.fit_many(supports, empty)
+                if record.fit.converged
+            ]
+            best = max(exhaustive, key=lambda record: record.score)
             for terminal in result.terminals:
                 self.assertIsNone(optimizer._best_profiled_move(terminal))
+                neighbours = optimizer.fit_many(
+                    list(one_exchange_neighbors(terminal.support, optimizer.dictionary)),
+                    terminal,
+                )
+                self.assertFalse(
+                    any(
+                        record.fit.converged
+                        and record.score
+                        > terminal.score + config.search_tolerance
+                        for record in neighbours
+                    )
+                )
+                self.assertAlmostEqual(terminal.score, best.score, places=8)
 
     def test_parallel_search_matches_serial_family(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
