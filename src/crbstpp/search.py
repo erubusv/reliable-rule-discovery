@@ -1331,36 +1331,43 @@ class SupportOptimizer:
                 end = min(len(maximum.rows), start + 131_072)
                 rows = maximum.rows[start:end]
                 _, first, second = self._pricing_rows(current, rows)
-                candidates = []
-                for window in missing:
+                candidate_batch = np.zeros(
+                    (len(missing), len(rows), self.config.knot_count),
+                    dtype=np.float64,
+                )
+                for batch_index, window in enumerate(missing):
                     block = blocks[window]
-                    candidate = np.zeros(
-                        (len(rows), self.config.knot_count), dtype=np.float64
-                    )
                     left = int(np.searchsorted(block.rows, rows[0], side="left"))
                     right = int(np.searchsorted(block.rows, rows[-1], side="right"))
                     if right > left:
                         block_rows = block.rows[left:right]
-                        candidate[np.searchsorted(rows, block_rows)] = block.values[
-                            left:right
-                        ]
-                    candidates.append(candidate)
-                candidate_batch = np.asarray(candidates, dtype=np.float64)
-                tile_gradients, tile_hessians = moments_batch(
-                    candidate_batch, first, second, device=device
+                        candidate_batch[
+                            batch_index, np.searchsorted(rows, block_rows)
+                        ] = block.values[left:right]
+                batch_moments = moments_batch(
+                    candidate_batch,
+                    first,
+                    second,
+                    device=device,
+                    return_second_gradient=(
+                        current.matrix.dimension == 1
+                        and len(indices) == 1
+                        and int(indices[0]) == 0
+                    ),
                 )
+                tile_gradients, tile_hessians = batch_moments[:2]
                 if len(indices):
                     flat_candidates = candidate_batch.transpose(1, 0, 2).reshape(
                         len(rows), -1
                     )
-                    weighted_candidates = second[:, None] * flat_candidates
                     if (
                         current.matrix.dimension == 1
                         and len(indices) == 1
                         and int(indices[0]) == 0
                     ):
-                        flat_cross = np.sum(weighted_candidates, axis=0, keepdims=True)
+                        flat_cross = batch_moments[2].reshape(1, -1)
                     else:
+                        weighted_candidates = second[:, None] * flat_candidates
                         design = self.engine.design_at_rows_with_context(
                             self.context, current.matrix, rows
                         )
@@ -2054,17 +2061,20 @@ class SupportOptimizer:
                         blocks[(antecedent, window)],
                         len(closure) * self.config.knot_count,
                     )
-            tile_gradients, tile_hessians = moments_batch(
-                candidate_batch, first, second, device=device
+            batch_moments = moments_batch(
+                candidate_batch,
+                first,
+                second,
+                device=device,
+                return_second_gradient=baseline_only,
             )
+            tile_gradients, tile_hessians = batch_moments[:2]
             tile_crosses = np.zeros(
                 (batch_size, len(indices), maximum_dimension), dtype=np.float64
             )
             if len(indices):
                 if baseline_only:
-                    tile_crosses[:, 0, :] = np.einsum(
-                        "r,brd->bd", second, candidate_batch, optimize=True
-                    )
+                    tile_crosses[:, 0, :] = batch_moments[2]
                 else:
                     tile_crosses = np.einsum(
                         "ri,r,brd->bid",
@@ -2157,10 +2167,13 @@ class SupportOptimizer:
         ]
         devices = self.config.pricing_devices
         if devices:
-            worker_count = min(
-                self.config.pricing_workers,
-                max(len(devices), self.config.pricing_workers // 2),
-            )
+            # Dense response footprints are now generated through a bounded
+            # bitmap rather than O(completions * lag) temporary arrays.  It is
+            # therefore safe to keep every physical pricing core occupied:
+            # two workers feed the GPUs while the remaining workers execute
+            # the identical CPU moments path.  Scheduling changes neither the
+            # candidate family nor any accumulated float64 objective.
+            worker_count = self.config.pricing_workers
             device_schedule = (
                 *devices,
                 *("cpu",) * max(0, worker_count - len(devices)),
@@ -2184,9 +2197,8 @@ class SupportOptimizer:
 
         if len(groups) > 1:
             with ThreadPoolExecutor(
-                # Two GPU workers plus bounded one-thread CPU workers keep both
-                # accelerators and spare physical cores busy without allowing
-                # all 12 producers to retain full W tensors simultaneously.
+                # Each producer is single-threaded; the bounded response
+                # representation keeps this at physical-core concurrency.
                 max_workers=min(worker_count, len(groups)),
                 thread_name_prefix="crbstpp-block-score",
             ) as executor:

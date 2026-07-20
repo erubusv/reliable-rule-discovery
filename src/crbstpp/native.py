@@ -144,6 +144,8 @@ def _cuda_library():
                     ctypes.c_int64,
                     ctypes.c_int64,
                     ctypes.c_int64,
+                    ctypes.c_int,
+                    pointer,
                     pointer,
                     pointer,
                 ]
@@ -219,8 +221,13 @@ def moments(
 
 
 def moments_batch(
-    x: np.ndarray, first: np.ndarray, second: np.ndarray, *, device: str = "cpu"
-) -> tuple[np.ndarray, np.ndarray]:
+    x: np.ndarray,
+    first: np.ndarray,
+    second: np.ndarray,
+    *,
+    device: str = "cpu",
+    return_second_gradient: bool = False,
+) -> tuple[np.ndarray, np.ndarray] | tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Moments for B candidate blocks sharing row derivatives."""
     x = np.ascontiguousarray(x, dtype=np.float64)
     first = np.ascontiguousarray(first, dtype=np.float64)
@@ -229,6 +236,7 @@ def moments_batch(
         raise ValueError("batched moment buffer shape mismatch")
     gradient = np.empty((x.shape[0], x.shape[2]), dtype=np.float64)
     hessian = np.empty((x.shape[0], x.shape[2], x.shape[2]), dtype=np.float64)
+    second_gradient = np.empty_like(gradient)
     if device.startswith("cuda") and _cuda_library() is not None:
         index = int(device.split(":", 1)[1]) if ":" in device else 0
         pointer = ctypes.POINTER(ctypes.c_double)
@@ -240,14 +248,26 @@ def moments_batch(
             x.shape[0],
             x.shape[1],
             x.shape[2],
+            int(return_second_gradient),
             gradient.ctypes.data_as(pointer),
             hessian.ctypes.data_as(pointer),
+            second_gradient.ctypes.data_as(pointer),
         )
         if status == 0:
-            return gradient, hessian
+            return (
+                (gradient, hessian, second_gradient)
+                if return_second_gradient
+                else (gradient, hessian)
+            )
     for index in range(x.shape[0]):
         gradient[index], hessian[index] = moments(x[index], first, second, device="cpu")
-    return gradient, hessian
+        if return_second_gradient:
+            second_gradient[index] = x[index].T @ second
+    return (
+        (gradient, hessian, second_gradient)
+        if return_second_gradient
+        else (gradient, hessian)
+    )
 
 
 def nonnegative_quadratic_gains(
@@ -458,6 +478,68 @@ def completion_events(
         output_entities[:count],
         output_times[:count],
         output_spans[:count],
+    )
+
+
+def completion_window_counts(
+    sources: list[tuple[np.ndarray, np.ndarray]],
+    ends: np.ndarray,
+    windows: np.ndarray,
+) -> np.ndarray | None:
+    """Count productive completions for nested W without materializing them."""
+    if _cpu_native is None or not hasattr(_cpu_native, "completion_window_counts"):
+        return None
+    if not 1 <= len(sources) <= 3:
+        raise ValueError("completion requires one to three predicate sources")
+    windows = np.ascontiguousarray(windows, dtype=np.int64)
+    if windows.ndim != 1 or not len(windows):
+        raise ValueError("completion windows must be a nonempty vector")
+    lengths = np.asarray([len(entities) for entities, _ in sources], dtype=np.int64)
+    offsets = np.zeros(len(sources) + 1, dtype=np.int64)
+    offsets[1:] = np.cumsum(lengths)
+    entities = np.ascontiguousarray(
+        np.concatenate([item[0] for item in sources]), dtype=np.int64
+    )
+    times = np.ascontiguousarray(
+        np.concatenate([item[1] for item in sources]), dtype=np.int64
+    )
+    ends = np.ascontiguousarray(ends, dtype=np.int64)
+    counts = np.empty(len(windows), dtype=np.int64)
+    _cpu_native.completion_window_counts(
+        entities, times, offsets, ends, windows, counts
+    )
+    return counts
+
+
+def response_min_spans(
+    entities: np.ndarray,
+    times: np.ndarray,
+    spans: np.ndarray,
+    starts: np.ndarray,
+    ends: np.ndarray,
+    offsets: np.ndarray,
+    *,
+    horizon: int,
+    n_grid: int,
+) -> tuple[np.ndarray, np.ndarray] | None:
+    """Return exact response rows/minimum spans through a bounded dense bitmap."""
+    if _cpu_native is None or not hasattr(_cpu_native, "response_min_spans"):
+        return None
+    entities = np.ascontiguousarray(entities, dtype=np.int64)
+    times = np.ascontiguousarray(times, dtype=np.int64)
+    spans = np.ascontiguousarray(spans, dtype=np.int64)
+    starts = np.ascontiguousarray(starts, dtype=np.int64)
+    ends = np.ascontiguousarray(ends, dtype=np.int64)
+    offsets = np.ascontiguousarray(offsets, dtype=np.int64)
+    sentinel = np.iinfo(np.int32).max
+    threshold = np.full(int(n_grid), sentinel, dtype=np.int32)
+    _cpu_native.response_min_spans(
+        entities, times, spans, starts, ends, offsets, int(horizon), threshold
+    )
+    active = threshold != sentinel
+    return (
+        np.flatnonzero(active).astype(np.int64, copy=False),
+        threshold[active].astype(np.int64),
     )
 
 

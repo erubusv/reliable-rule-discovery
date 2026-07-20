@@ -2,6 +2,7 @@
 #include <Python.h>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -32,6 +33,19 @@ bool int64_buffer(PyObject* object, Py_buffer* view, int dimensions, bool writab
     if (view->ndim != dimensions || view->itemsize != static_cast<Py_ssize_t>(sizeof(std::int64_t))) {
         PyBuffer_Release(view);
         PyErr_SetString(PyExc_ValueError, "expected a C-contiguous int64 buffer");
+        return false;
+    }
+    return true;
+}
+
+bool int32_buffer(PyObject* object, Py_buffer* view, int dimensions, bool writable) {
+    const int flags = PyBUF_ND | PyBUF_FORMAT | PyBUF_C_CONTIGUOUS |
+                      (writable ? PyBUF_WRITABLE : 0);
+    if (PyObject_GetBuffer(object, view, flags) != 0) return false;
+    if (view->ndim != dimensions ||
+        view->itemsize != static_cast<Py_ssize_t>(sizeof(std::int32_t))) {
+        PyBuffer_Release(view);
+        PyErr_SetString(PyExc_ValueError, "expected a C-contiguous int32 buffer");
         return false;
     }
     return true;
@@ -970,7 +984,7 @@ PyObject* completion_events(PyObject*, PyObject* args) {
         auto* out_e = static_cast<std::int64_t*>(output_entities.buf);
         auto* out_t = static_cast<std::int64_t*>(output_times.buf);
         auto* out_s = static_cast<std::int64_t*>(output_spans.buf);
-        std::vector<std::int64_t> position(source_count), end(source_count), group_end(source_count);
+        std::array<std::int64_t, 3> position{}, end{}, group_end{};
         for (std::int64_t source = 0; source < source_count; ++source) {
             position[source] = op[source];
             end[source] = op[source + 1];
@@ -1002,8 +1016,10 @@ PyObject* completion_events(PyObject*, PyObject* args) {
                     ++group_end[source];
                 }
             }
-            std::vector<std::int64_t> cursor = position;
-            std::vector<std::int64_t> latest(source_count, std::numeric_limits<std::int64_t>::min());
+            std::array<std::int64_t, 3> cursor{}, latest{};
+            latest.fill(std::numeric_limits<std::int64_t>::min());
+            for (std::int64_t source = 0; source < source_count; ++source)
+                cursor[source] = position[source];
             while (true) {
                 std::int64_t next_time = std::numeric_limits<std::int64_t>::max();
                 for (std::int64_t source = 0; source < source_count; ++source) {
@@ -1041,6 +1057,220 @@ completion_fail:
     return nullptr;
 }
 
+PyObject* completion_window_counts(PyObject*, PyObject* args) {
+    PyObject *entities_obj, *times_obj, *offsets_obj, *ends_obj, *windows_obj,
+             *counts_obj;
+    if (!PyArg_ParseTuple(args, "OOOOOO", &entities_obj, &times_obj, &offsets_obj,
+                          &ends_obj, &windows_obj, &counts_obj)) {
+        return nullptr;
+    }
+    Py_buffer entities{}, times{}, offsets{}, ends{}, windows{}, counts{};
+    int acquired = 0;
+    auto release = [&]() {
+        if (acquired >= 6) PyBuffer_Release(&counts);
+        if (acquired >= 5) PyBuffer_Release(&windows);
+        if (acquired >= 4) PyBuffer_Release(&ends);
+        if (acquired >= 3) PyBuffer_Release(&offsets);
+        if (acquired >= 2) PyBuffer_Release(&times);
+        if (acquired >= 1) PyBuffer_Release(&entities);
+    };
+    if (!int64_buffer(entities_obj, &entities, 1, false)) return nullptr;
+    ++acquired;
+    if (!int64_buffer(times_obj, &times, 1, false)) { release(); return nullptr; }
+    ++acquired;
+    if (!int64_buffer(offsets_obj, &offsets, 1, false)) { release(); return nullptr; }
+    ++acquired;
+    if (!int64_buffer(ends_obj, &ends, 1, false)) { release(); return nullptr; }
+    ++acquired;
+    if (!int64_buffer(windows_obj, &windows, 1, false)) { release(); return nullptr; }
+    ++acquired;
+    if (!int64_buffer(counts_obj, &counts, 1, true)) { release(); return nullptr; }
+    ++acquired;
+
+    const auto event_count = entities.shape[0];
+    const auto source_count = offsets.shape[0] - 1;
+    const auto window_count = windows.shape[0];
+    const auto* ep = static_cast<const std::int64_t*>(entities.buf);
+    const auto* tp = static_cast<const std::int64_t*>(times.buf);
+    const auto* op = static_cast<const std::int64_t*>(offsets.buf);
+    const auto* endp = static_cast<const std::int64_t*>(ends.buf);
+    const auto* wp = static_cast<const std::int64_t*>(windows.buf);
+    auto* cp = static_cast<std::int64_t*>(counts.buf);
+    bool valid = times.shape[0] == event_count && source_count >= 1 &&
+                 source_count <= 3 && window_count >= 1 &&
+                 counts.shape[0] == window_count && op[0] == 0 &&
+                 op[source_count] == event_count;
+    for (std::int64_t source = 0; valid && source < source_count; ++source) {
+        valid = op[source] <= op[source + 1];
+    }
+    for (std::int64_t index = 0; valid && index < window_count; ++index) {
+        valid = wp[index] >= 0 && (index == 0 || wp[index - 1] < wp[index]);
+    }
+    for (std::int64_t index = 0; valid && index < event_count; ++index) {
+        valid = ep[index] >= 0 && ep[index] < ends.shape[0];
+    }
+    if (!valid) {
+        PyErr_SetString(PyExc_ValueError, "completion window-count buffer mismatch");
+        release();
+        return nullptr;
+    }
+    std::fill(cp, cp + window_count, 0);
+    {
+        std::array<std::int64_t, 3> position{}, source_end{}, group_end{};
+        std::vector<std::int64_t> difference(window_count + 1, 0);
+        for (std::int64_t source = 0; source < source_count; ++source) {
+            position[source] = op[source];
+            source_end[source] = op[source + 1];
+        }
+        Py_BEGIN_ALLOW_THREADS
+        while (true) {
+            bool exhausted = false;
+            std::int64_t candidate_entity = std::numeric_limits<std::int64_t>::min();
+            for (std::int64_t source = 0; source < source_count; ++source) {
+                if (position[source] >= source_end[source]) { exhausted = true; break; }
+                candidate_entity = std::max(candidate_entity, ep[position[source]]);
+            }
+            if (exhausted) break;
+            bool aligned = true;
+            for (std::int64_t source = 0; source < source_count; ++source) {
+                while (position[source] < source_end[source] &&
+                       ep[position[source]] < candidate_entity) {
+                    const auto skipped = ep[position[source]];
+                    while (position[source] < source_end[source] &&
+                           ep[position[source]] == skipped) ++position[source];
+                }
+                if (position[source] >= source_end[source]) { exhausted = true; break; }
+                if (ep[position[source]] != candidate_entity) aligned = false;
+            }
+            if (exhausted) break;
+            if (!aligned) continue;
+            for (std::int64_t source = 0; source < source_count; ++source) {
+                group_end[source] = position[source];
+                while (group_end[source] < source_end[source] &&
+                       ep[group_end[source]] == candidate_entity) ++group_end[source];
+            }
+            std::array<std::int64_t, 3> cursor{}, latest{};
+            latest.fill(std::numeric_limits<std::int64_t>::min());
+            for (std::int64_t source = 0; source < source_count; ++source)
+                cursor[source] = position[source];
+            while (true) {
+                std::int64_t next_time = std::numeric_limits<std::int64_t>::max();
+                for (std::int64_t source = 0; source < source_count; ++source) {
+                    if (cursor[source] < group_end[source])
+                        next_time = std::min(next_time, tp[cursor[source]]);
+                }
+                if (next_time == std::numeric_limits<std::int64_t>::max()) break;
+                bool witnessed = true;
+                std::int64_t minimum = std::numeric_limits<std::int64_t>::max();
+                std::int64_t maximum = std::numeric_limits<std::int64_t>::min();
+                for (std::int64_t source = 0; source < source_count; ++source) {
+                    while (cursor[source] < group_end[source] &&
+                           tp[cursor[source]] <= next_time) {
+                        latest[source] = tp[cursor[source]++];
+                    }
+                    witnessed = witnessed &&
+                        latest[source] != std::numeric_limits<std::int64_t>::min();
+                    minimum = std::min(minimum, latest[source]);
+                    maximum = std::max(maximum, latest[source]);
+                }
+                if (witnessed && next_time < endp[candidate_entity]) {
+                    const auto span = maximum - minimum;
+                    const auto* admitted = std::lower_bound(wp, wp + window_count, span);
+                    if (admitted != wp + window_count) ++difference[admitted - wp];
+                }
+            }
+            position = group_end;
+        }
+        std::int64_t cumulative = 0;
+        for (std::int64_t index = 0; index < window_count; ++index) {
+            cumulative += difference[index];
+            cp[index] = cumulative;
+        }
+        Py_END_ALLOW_THREADS
+    }
+    release();
+    Py_RETURN_NONE;
+}
+
+PyObject* response_min_spans(PyObject*, PyObject* args) {
+    PyObject *entities_obj, *times_obj, *spans_obj, *starts_obj, *ends_obj,
+             *offsets_obj, *threshold_obj;
+    int horizon;
+    if (!PyArg_ParseTuple(args, "OOOOOOiO", &entities_obj, &times_obj, &spans_obj,
+                          &starts_obj, &ends_obj, &offsets_obj, &horizon,
+                          &threshold_obj)) {
+        return nullptr;
+    }
+    Py_buffer entities{}, times{}, spans{}, starts{}, ends{}, offsets{}, threshold{};
+    int acquired = 0;
+    auto release = [&]() {
+        if (acquired >= 7) PyBuffer_Release(&threshold);
+        if (acquired >= 6) PyBuffer_Release(&offsets);
+        if (acquired >= 5) PyBuffer_Release(&ends);
+        if (acquired >= 4) PyBuffer_Release(&starts);
+        if (acquired >= 3) PyBuffer_Release(&spans);
+        if (acquired >= 2) PyBuffer_Release(&times);
+        if (acquired >= 1) PyBuffer_Release(&entities);
+    };
+    if (!int64_buffer(entities_obj, &entities, 1, false)) return nullptr;
+    ++acquired;
+    if (!int64_buffer(times_obj, &times, 1, false)) { release(); return nullptr; }
+    ++acquired;
+    if (!int64_buffer(spans_obj, &spans, 1, false)) { release(); return nullptr; }
+    ++acquired;
+    if (!int64_buffer(starts_obj, &starts, 1, false)) { release(); return nullptr; }
+    ++acquired;
+    if (!int64_buffer(ends_obj, &ends, 1, false)) { release(); return nullptr; }
+    ++acquired;
+    if (!int64_buffer(offsets_obj, &offsets, 1, false)) { release(); return nullptr; }
+    ++acquired;
+    if (!int32_buffer(threshold_obj, &threshold, 1, true)) { release(); return nullptr; }
+    ++acquired;
+    const auto count = entities.shape[0];
+    const auto entity_count = starts.shape[0];
+    const auto* ep = static_cast<const std::int64_t*>(entities.buf);
+    const auto* tp = static_cast<const std::int64_t*>(times.buf);
+    const auto* sp = static_cast<const std::int64_t*>(spans.buf);
+    const auto* startp = static_cast<const std::int64_t*>(starts.buf);
+    const auto* endp = static_cast<const std::int64_t*>(ends.buf);
+    const auto* offsetp = static_cast<const std::int64_t*>(offsets.buf);
+    auto* out = static_cast<std::int32_t*>(threshold.buf);
+    bool valid = horizon >= 0 && times.shape[0] == count && spans.shape[0] == count &&
+                 ends.shape[0] == entity_count && offsets.shape[0] == entity_count + 1 &&
+                 offsetp[entity_count] == threshold.shape[0];
+    for (std::int64_t index = 0; valid && index < count; ++index) {
+        if (ep[index] < 0 || ep[index] >= entity_count || sp[index] < 0 ||
+            sp[index] >= std::numeric_limits<std::int32_t>::max()) {
+            valid = false;
+            break;
+        }
+        const auto entity = ep[index];
+        const auto length = std::min<std::int64_t>(horizon, endp[entity] - tp[index]);
+        const auto base = offsetp[entity] + tp[index] - startp[entity];
+        valid = tp[index] >= startp[entity] && tp[index] <= endp[entity] &&
+                base >= 0 && base + std::max<std::int64_t>(0, length) <
+                                 threshold.shape[0];
+    }
+    if (!valid) {
+        PyErr_SetString(PyExc_ValueError, "response minimum-span buffer mismatch");
+        release();
+        return nullptr;
+    }
+    Py_BEGIN_ALLOW_THREADS
+    for (std::int64_t index = 0; index < count; ++index) {
+        const auto entity = ep[index];
+        const auto length = std::min<std::int64_t>(horizon, endp[entity] - tp[index]);
+        const auto base = offsetp[entity] + tp[index] - startp[entity];
+        for (std::int64_t lag = 1; lag <= length; ++lag) {
+            out[base + lag] = std::min(
+                out[base + lag], static_cast<std::int32_t>(sp[index]));
+        }
+    }
+    Py_END_ALLOW_THREADS
+    release();
+    Py_RETURN_NONE;
+}
+
 PyMethodDef methods[] = {
     {"moments", moments, METH_VARARGS, "Deterministic gradient/Fisher moments."},
     {"nonnegative_quadratic_gains", nonnegative_quadratic_gains, METH_VARARGS, "Exact batched nonnegative quadratic gains."},
@@ -1052,6 +1282,8 @@ PyMethodDef methods[] = {
     {"sparse_joint_moments", sparse_joint_moments, METH_VARARGS, "Exact moments of sparse joint blocks."},
     {"kernel_contributions", kernel_contributions, METH_VARARGS, "Strict-future kernel contributions."},
     {"completion_events", completion_events, METH_VARARGS, "Latest-witness completion events."},
+    {"completion_window_counts", completion_window_counts, METH_VARARGS, "Streaming productive completion counts by W."},
+    {"response_min_spans", response_min_spans, METH_VARARGS, "Dense exact minimum witness span per response row."},
     {nullptr, nullptr, 0, nullptr},
 };
 

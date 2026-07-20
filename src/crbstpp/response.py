@@ -11,8 +11,10 @@ from .native import (
     aggregate_design_rows_with_groups,
     accumulate_kernel,
     completion_events,
+    completion_window_counts,
     future_rows,
     kernel_contributions,
+    response_min_spans,
 )
 from .rules import Antecedent, ClosureTerm, RuleIdentity, Support, hierarchy_closure
 
@@ -355,6 +357,24 @@ class ResponseEngine:
         """
         if not windows:
             return ()
+        ordered_windows = tuple(sorted(set(map(int, windows))))
+        sources = [self._source(predicate, context) for predicate in antecedent]
+        compiled_counts = completion_window_counts(
+            sources,
+            context.ends,
+            np.asarray(ordered_windows, dtype=np.int64)
+            * self.dataset.ticks_per_unit,
+        )
+        if compiled_counts is not None:
+            previous = 0
+            effective: list[int] = []
+            for window, admitted in zip(
+                ordered_windows, compiled_counts.tolist(), strict=True
+            ):
+                if admitted > previous:
+                    effective.append(window)
+                    previous = admitted
+            return tuple(effective)
         entities, times, spans = self.completions(context, antecedent)
         if not len(entities):
             return ()
@@ -364,7 +384,7 @@ class ResponseEngine:
             return ()
         previous = 0
         effective: list[int] = []
-        for window in windows:
+        for window in ordered_windows:
             admitted = int(
                 np.searchsorted(
                     productive_spans,
@@ -1190,15 +1210,33 @@ class ResponseEngine:
             times[admitted],
             spans[admitted],
         )
-        compiled = future_rows(
-            entities,
-            times,
-            spans,
-            context.starts,
-            context.ends,
-            context.offsets,
-            window=int(maximum_window_ticks),
-            horizon=int(horizon_ticks),
+        # A dense minimum-span bitmap avoids materializing and sorting
+        # O(completions * horizon) temporary rows on bounded discrete grids.
+        # This changes only representation; fine continuous-time grids retain
+        # the sparse expansion below.
+        dense_representation = context.n_grid <= 64_000_000
+        compiled = (
+            response_min_spans(
+                entities,
+                times,
+                spans,
+                context.starts,
+                context.ends,
+                context.offsets,
+                horizon=int(horizon_ticks),
+                n_grid=context.n_grid,
+            )
+            if dense_representation
+            else future_rows(
+                entities,
+                times,
+                spans,
+                context.starts,
+                context.ends,
+                context.offsets,
+                window=int(maximum_window_ticks),
+                horizon=int(horizon_ticks),
+            )
         )
         if compiled is None:
             raw_rows: list[np.ndarray] = []
@@ -1221,7 +1259,9 @@ class ResponseEngine:
             )
         else:
             generated_rows, generated_spans = compiled
-        if len(generated_rows):
+        if dense_representation and compiled is not None:
+            rows, minimum_spans = generated_rows, generated_spans
+        elif len(generated_rows):
             order = np.argsort(generated_rows, kind="stable")
             ordered_rows = generated_rows[order]
             ordered_spans = generated_spans[order]

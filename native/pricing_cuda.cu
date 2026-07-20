@@ -92,12 +92,14 @@ struct Workspace {
     double* first = nullptr;
     double* second = nullptr;
     double* gradient = nullptr;
+    double* cross = nullptr;
     double* hessian = nullptr;
     std::size_t x_capacity = 0;
     std::size_t weighted_capacity = 0;
     std::size_t first_capacity = 0;
     std::size_t second_capacity = 0;
     std::size_t gradient_capacity = 0;
+    std::size_t cross_capacity = 0;
     std::size_t hessian_capacity = 0;
     cublasHandle_t handle = nullptr;
 };
@@ -178,7 +180,8 @@ extern "C" int crbstpp_cuda_moments(
 extern "C" int crbstpp_cuda_moments_batch(
     int device, const double* host_x, const double* host_first,
     const double* host_second, std::int64_t batches, std::int64_t rows,
-    std::int64_t columns, double* host_gradient, double* host_hessian) {
+    std::int64_t columns, int compute_cross, double* host_gradient,
+    double* host_hessian, double* host_cross) {
     if (device < 0 || device >= static_cast<int>(workspaces.size())) return 1;
     Workspace& workspace = workspaces[device];
     std::lock_guard<std::mutex> lock(workspace.mutex);
@@ -194,6 +197,8 @@ extern "C" int crbstpp_cuda_moments_batch(
         !reserve(&workspace.first, &workspace.first_capacity, row_bytes) ||
         !reserve(&workspace.second, &workspace.second_capacity, row_bytes) ||
         !reserve(&workspace.gradient, &workspace.gradient_capacity, gradient_bytes) ||
+        (compute_cross &&
+         !reserve(&workspace.cross, &workspace.cross_capacity, gradient_bytes)) ||
         !reserve(&workspace.hessian, &workspace.hessian_capacity, hessian_bytes))
         return 2;
     if (workspace.handle == nullptr &&
@@ -205,6 +210,10 @@ extern "C" int crbstpp_cuda_moments_batch(
         return 2;
     gradient_batch_kernel<<<batches * columns, threads, threads * sizeof(double)>>>(
         workspace.x, workspace.first, batches, rows, columns, workspace.gradient);
+    if (compute_cross) {
+        gradient_batch_kernel<<<batches * columns, threads, threads * sizeof(double)>>>(
+            workspace.x, workspace.second, batches, rows, columns, workspace.cross);
+    }
     {
         const std::int64_t count = batches * rows * columns;
         const int blocks = static_cast<int>((count + threads - 1) / threads);
@@ -230,6 +239,9 @@ extern "C" int crbstpp_cuda_moments_batch(
     if (
         cudaMemcpy(host_gradient, workspace.gradient, gradient_bytes,
                    cudaMemcpyDeviceToHost) != cudaSuccess ||
+        (compute_cross &&
+         cudaMemcpy(host_cross, workspace.cross, gradient_bytes,
+                    cudaMemcpyDeviceToHost) != cudaSuccess) ||
         cudaMemcpy(host_hessian, workspace.hessian, hessian_bytes,
                    cudaMemcpyDeviceToHost) != cudaSuccess)
         return 2;

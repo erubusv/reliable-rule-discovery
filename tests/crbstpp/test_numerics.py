@@ -689,6 +689,7 @@ class NumericalParityTests(unittest.TestCase):
         first = rng.normal(size=193)
         second = rng.uniform(0.01, 2.0, size=193)
         reference = [moments(block, first, second, device="cpu") for block in x]
+        reference_cross = np.einsum("brd,r->bd", x, second)
         for device in ("cpu", "cuda:0", "cuda:1") if cuda_available() else ("cpu",):
             gradient, hessian = moments_batch(x, first, second, device=device)
             np.testing.assert_allclose(
@@ -697,6 +698,10 @@ class NumericalParityTests(unittest.TestCase):
                 rtol=1e-13,
                 atol=1e-13,
             )
+            gradient, hessian, cross = moments_batch(
+                x, first, second, device=device, return_second_gradient=True
+            )
+            np.testing.assert_allclose(cross, reference_cross, rtol=1e-13, atol=1e-13)
             np.testing.assert_allclose(
                 hessian,
                 np.asarray([item[1] for item in reference]),
@@ -730,7 +735,10 @@ class NumericalParityTests(unittest.TestCase):
             rule = RuleIdentity((0, 1), 2, 1)
             compiled = ResponseEngine(data, lag=3, knot_count=3, cache_bytes=1024**2)
             compiled_rows = compiled.footprint_rows(context, rule, 2)
-            with mock.patch("crbstpp.response.future_rows", return_value=None):
+            with (
+                mock.patch("crbstpp.response.response_min_spans", return_value=None),
+                mock.patch("crbstpp.response.future_rows", return_value=None),
+            ):
                 reference = ResponseEngine(
                     data, lag=3, knot_count=3, cache_bytes=1024**2
                 )
