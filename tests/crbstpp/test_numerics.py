@@ -32,6 +32,7 @@ from crbstpp.search import (
     SupportOptimizer,
     _RestrictedAddBounds,
     _nonnegative_quadratic_gain,
+    _nonnegative_quadratic_solution,
 )
 from crbstpp.solver import _objective, fit_model_matrix, fit_offset_design
 
@@ -479,6 +480,83 @@ class NumericalParityTests(unittest.TestCase):
             ]
         )
         np.testing.assert_allclose(compiled, reference, rtol=1e-12, atol=1e-12)
+
+    def test_nonnegative_quadratic_solution_attains_reported_gain(self) -> None:
+        gradient = np.asarray([-2.0, 0.5, -1.0, 0.2])
+        hessian = np.asarray(
+            [
+                [2.0, 0.2, 0.1, 0.0],
+                [0.2, 1.5, 0.0, 0.1],
+                [0.1, 0.0, 1.0, 0.1],
+                [0.0, 0.1, 0.1, 1.2],
+            ]
+        )
+        gain, direction = _nonnegative_quadratic_solution(gradient, hessian)
+        self.assertTrue(np.all(direction >= 0.0))
+        attained = -gradient @ direction - 0.5 * direction @ hessian @ direction
+        self.assertAlmostEqual(gain, attained)
+        self.assertAlmostEqual(gain, _nonnegative_quadratic_gain(gradient, hessian))
+
+    def test_offset_warm_start_preserves_exact_optimum(self) -> None:
+        index = np.arange(80)
+        design = np.column_stack((np.ones(80), 0.2 + (index % 7) / 7.0))
+        offset = -2.0 + 0.005 * index
+        event = np.zeros(80, dtype=np.float64)
+        event[[2, 7, 11, 19, 31, 47, 63, 71]] = 1.0
+        exposure = np.ones(80, dtype=np.float64)
+        cold = fit_offset_design(
+            design,
+            offset,
+            exposure,
+            exposure,
+            event,
+            likelihood="poisson",
+            free_dimension=1,
+            tolerance=1e-9,
+            max_iter=200,
+        )
+        warm = fit_offset_design(
+            design,
+            offset,
+            exposure,
+            exposure,
+            event,
+            likelihood="poisson",
+            free_dimension=1,
+            tolerance=1e-9,
+            max_iter=200,
+            warm_start=cold.coefficients,
+        )
+        self.assertTrue(cold.converged, cold.message)
+        self.assertTrue(warm.converged, warm.message)
+        np.testing.assert_allclose(warm.coefficients, cold.coefficients, atol=1e-9)
+        self.assertAlmostEqual(warm.nll, cold.nll, places=10)
+
+    def test_reliability_price_fails_open_when_f3_is_untestable(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            data = synthetic_dataset(Path(directory) / "data", 90)
+            fit_codes, _, _ = data.split((0.6, 0.2, 0.2), 111)
+            config = RunConfig(
+                dataset=str(data.root),
+                q_max=1,
+                impact_lag=3,
+                knot_count=2,
+                formation_windows=(0,),
+                solver_tolerance=1e-8,
+                solver_max_iter=150,
+                cache_bytes=16 * 1024**2,
+                early_warning_horizon=3,
+                pricing_devices=(),
+            )
+            optimizer = SupportOptimizer(Context.make(data, fit_codes), config)
+            empty = optimizer.records[Support(())]
+            rule = RuleIdentity((0,), 0, 1)
+            price = optimizer._reliability_price(empty, rule)
+            self.assertFalse(price.testable)
+            self.assertTrue(price.admissible)
+            self.assertEqual(
+                optimizer.diagnostics.reliability_untestable_fail_open, 1
+            )
 
     def test_lossless_design_aggregation_preserves_objective_and_moments(self) -> None:
         rng = np.random.default_rng(82)

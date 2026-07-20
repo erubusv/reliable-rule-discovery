@@ -281,6 +281,7 @@ def fit_offset_design(
     tolerance: float,
     max_iter: int,
     device: str = "cpu",
+    warm_start: np.ndarray | None = None,
 ) -> FitResult:
     """Exactly optimize a small new block around a frozen linear predictor."""
     x = np.ascontiguousarray(x, dtype=np.float64)
@@ -294,7 +295,14 @@ def fit_offset_design(
         for value in (offset, exposure_weight, noevent_weight, event_weight)
     ) or not 0 <= free_dimension <= dimension:
         raise ValueError("offset block design shape mismatch")
-    beta = np.zeros(dimension, dtype=np.float64)
+    if warm_start is None:
+        beta = np.zeros(dimension, dtype=np.float64)
+    else:
+        beta = np.asarray(warm_start, dtype=np.float64).copy()
+        if beta.shape != (dimension,) or not np.all(np.isfinite(beta)):
+            raise ValueError("invalid offset-block warm start")
+        if np.any(beta[free_dimension:] < 0.0):
+            raise ValueError("offset-block warm start violates the nonnegative cone")
     # Recession directions depend only on design signs and event/no-event
     # support; the finite frozen offset does not change them.
     for index in range(dimension):

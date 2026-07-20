@@ -26,6 +26,7 @@ class RunConfig:
     alpha: float = 0.05
     early_warning_horizon: int = 12
     probability_materiality: float = 0.0
+    reliability_aware_search: bool = True
     solver_tolerance: float = 2.0e-7
     solver_max_iter: int = 100
     search_tolerance: float = 1.0e-8
@@ -69,6 +70,8 @@ class RunConfig:
             raise ValueError("early_warning_horizon must lie in [1, impact_lag]")
         if not 0 <= self.probability_materiality < 1:
             raise ValueError("probability_materiality must lie in [0, 1)")
+        if not isinstance(self.reliability_aware_search, bool):
+            raise ValueError("reliability_aware_search must be boolean")
         if self.solver_tolerance <= 0 or self.solver_max_iter < 1:
             raise ValueError("invalid solver controls")
         if self.search_tolerance < 0:

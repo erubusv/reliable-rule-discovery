@@ -27,6 +27,11 @@ from .native import (
     nonnegative_quadratic_gains,
 )
 from .objective import ObjectiveSpec, SupportRecord, support_score
+from .reliability import (
+    environment_spec,
+    one_sided_mean_pvalue,
+    worst_case_total_variation_mean,
+)
 from .response import Context, ModelMatrix, ResponseEngine, SparseBlock
 from .rules import (
     EMPTY_SUPPORT,
@@ -59,6 +64,27 @@ class _RestrictedAddBounds:
     lower_gain: float
     upper_gain: float
     dual: DualCertificate | None
+
+
+@dataclass(frozen=True)
+class _ReliabilityPrice:
+    """D_fit first-order analogue of the held-out F1--F3 gates.
+
+    These margins only define the reliability-constrained search domain.  They
+    are never reported as statistical evidence; independent D_cert tests remain
+    the sole certification decision.
+    """
+
+    admissible: bool
+    testable: bool
+    global_gain: float
+    horizon_gain: float
+    robust_gain: float
+    robust_probability: float
+    global_pvalue: float
+    horizon_pvalue: float
+    probability_pvalue: float
+    direction: np.ndarray
 
 
 @dataclass
@@ -117,6 +143,14 @@ class SearchDiagnostics:
     restricted_geometry_builds: int = 0
     restricted_geometry_hits: int = 0
     restricted_geometry_evictions: int = 0
+    reliability_price_evaluations: int = 0
+    reliability_global_screens: int = 0
+    reliability_horizon_screens: int = 0
+    reliability_environment_screens: int = 0
+    reliability_probability_screens: int = 0
+    reliability_untestable_fail_open: int = 0
+    reliability_numeric_fail_open: int = 0
+    reliability_warm_starts: int = 0
 
 
 @dataclass(frozen=True)
@@ -166,10 +200,18 @@ class _RestrictedGeometry:
 
 def _nonnegative_quadratic_gain(gradient: np.ndarray, hessian: np.ndarray) -> float:
     """Solve the tiny M-dimensional nonnegative Fisher pricing problem exactly."""
+    return _nonnegative_quadratic_solution(gradient, hessian)[0]
+
+
+def _nonnegative_quadratic_solution(
+    gradient: np.ndarray, hessian: np.ndarray
+) -> tuple[float, np.ndarray]:
+    """Return the exact active-set solution and gain of the knot-block QP."""
     gradient = np.asarray(gradient, dtype=np.float64)
     hessian = 0.5 * (np.asarray(hessian, dtype=np.float64) + np.asarray(hessian).T)
     dimension = len(gradient)
     best = 0.0
+    best_delta = np.zeros(dimension, dtype=np.float64)
     for mask in range(1, 1 << dimension):
         active = np.asarray(
             [index for index in range(dimension) if mask & (1 << index)]
@@ -190,8 +232,10 @@ def _nonnegative_quadratic_gain(gradient: np.ndarray, hessian: np.ndarray) -> fl
         if np.any(stationarity[inactive] < -1.0e-8):
             continue
         gain = -float(gradient @ delta) - 0.5 * float(delta @ hessian @ delta)
-        best = max(best, gain)
-    return best
+        if gain > best:
+            best = gain
+            best_delta = delta
+    return best, best_delta
 
 
 class SupportOptimizer:
@@ -287,6 +331,13 @@ class SupportOptimizer:
         ] = {}
         self._restricted_geometry_bytes = 0
         self._restricted_geometry_limit = max(1, config.cache_bytes // 16)
+        self._environments = environment_spec(context, config)
+        self._reliability_prices: OrderedDict[
+            tuple[Support, RuleIdentity], _ReliabilityPrice
+        ] = OrderedDict()
+        self._reliability_price_limit = max(
+            1, min(200_000, config.cache_bytes // max(1, 64 * config.knot_count))
+        )
         baseline_matrix = self.engine.model_matrix(context, EMPTY_SUPPORT)
         baseline_fit = fit_model_matrix(
             baseline_matrix,
@@ -346,6 +397,7 @@ class SupportOptimizer:
         self._restricted_geometries.clear()
         self._restricted_geometry_events.clear()
         self._restricted_geometry_bytes = 0
+        self._reliability_prices.clear()
         self._dual_geometry_cache.clear()
         baseline = self.records.get(EMPTY_SUPPORT)
         self.records.clear()
@@ -555,6 +607,7 @@ class SupportOptimizer:
         closure: tuple[ClosureTerm, ...],
         *,
         device: str | None = None,
+        source: SupportRecord | None = None,
     ) -> tuple[ModelMatrix, FitResult]:
         """Fit a forced-closure model with a shared certification cache."""
         key = (support, tuple(closure))
@@ -572,11 +625,13 @@ class SupportOptimizer:
             with self._state_lock:
                 self.diagnostics.forced_fit_cache_hits += 1
             return matrix, cached
+        warm = None if source is None else self.warm_start(source, matrix)
         fit = fit_model_matrix(
             matrix,
             likelihood=self.context.dataset.likelihood,
             tolerance=self.config.solver_tolerance,
             max_iter=self.config.solver_max_iter,
+            warm_start=warm,
             device=device or (self.config.pricing_devices or ("cpu",))[0],
         )
         with self._state_lock:
@@ -586,9 +641,21 @@ class SupportOptimizer:
     def fit_fixed_many(
         self,
         specifications: list[tuple[Support, tuple[ClosureTerm, ...]]],
+        *,
+        sources: list[SupportRecord | None] | None = None,
     ) -> list[tuple[ModelMatrix, FitResult]]:
+        source_list = (
+            [None] * len(specifications) if sources is None else list(sources)
+        )
+        if len(source_list) != len(specifications):
+            raise ValueError("forced-fit source batch length mismatch")
         if len(specifications) <= 1 or self.config.exact_workers == 1:
-            return [self.fit_fixed(*specification) for specification in specifications]
+            return [
+                self.fit_fixed(*specification, source=source)
+                for specification, source in zip(
+                    specifications, source_list, strict=True
+                )
+            ]
         with self._state_lock:
             self.diagnostics.parallel_exact_batches += 1
         threads_per_fit = max(
@@ -598,17 +665,25 @@ class SupportOptimizer:
         devices = self.config.pricing_devices or ("cpu",)
 
         def fit_one(
-            indexed: tuple[int, tuple[Support, tuple[ClosureTerm, ...]]],
+            indexed: tuple[
+                int, tuple[Support, tuple[ClosureTerm, ...]], SupportRecord | None
+            ],
         ) -> tuple[ModelMatrix, FitResult]:
             configure_cpu_threads(threads_per_fit)
-            index, item = indexed
-            return self.fit_fixed(*item, device=devices[index % len(devices)])
+            index, item, source = indexed
+            return self.fit_fixed(
+                *item, device=devices[index % len(devices)], source=source
+            )
 
         with ThreadPoolExecutor(
             max_workers=min(self.config.exact_workers, len(specifications)),
             thread_name_prefix="crbstpp-fixed",
         ) as executor:
-            return list(executor.map(fit_one, enumerate(specifications)))
+            jobs = (
+                (index, specification, source_list[index])
+                for index, specification in enumerate(specifications)
+            )
+            return list(executor.map(fit_one, jobs))
 
     def _fit_embedded_closure_null(
         self,
@@ -1235,6 +1310,206 @@ class SupportOptimizer:
         )[rule.window]
         return _nonnegative_quadratic_gain(float(rule.sign) * gradient, hessian)
 
+    def _reliability_price(
+        self,
+        current: SupportRecord,
+        rule: RuleIdentity,
+        *,
+        device: str = "cpu",
+    ) -> _ReliabilityPrice:
+        """Profile one knot direction against D_fit analogues of F1--F3.
+
+        The global conditional-Fisher direction is reused for every margin.
+        This is deliberately a local, support-conditioned search definition,
+        not a prediction of the independent D_cert p-values.  A single temporal
+        environment cannot identify F3 and therefore fails open rather than
+        deleting the whole dictionary.
+        """
+        key = (current.support, rule)
+        with self._state_lock:
+            cached = self._reliability_prices.get(key)
+            if cached is not None:
+                self._reliability_prices.move_to_end(key)
+                return cached
+            self.diagnostics.reliability_price_evaluations += 1
+        gradient, hessian = self._price_skeleton(
+            current, rule.antecedent, (rule.window,), device=device
+        )[rule.window]
+        global_gain, direction = _nonnegative_quadratic_solution(
+            float(rule.sign) * gradient, hessian
+        )
+        if len(self._environments.labels) <= 1:
+            result = _ReliabilityPrice(
+                True,
+                False,
+                global_gain,
+                math.nan,
+                math.nan,
+                math.nan,
+                1.0,
+                1.0,
+                1.0,
+                direction,
+            )
+            with self._state_lock:
+                self.diagnostics.reliability_untestable_fail_open += 1
+                self._reliability_prices[key] = result
+            return result
+        try:
+            block = self.engine.block(self.context, rule.antecedent, rule.window)
+            if not len(block.rows) or not np.any(direction > 0.0):
+                result = _ReliabilityPrice(
+                    False,
+                    True,
+                    global_gain,
+                    0.0,
+                    0.0,
+                    0.0,
+                    1.0,
+                    1.0,
+                    1.0,
+                    direction,
+                )
+            else:
+                activation = block.values @ direction
+                eta_direction = float(rule.sign) * activation
+                eta, first, _ = self._raw_pricing_components(current)
+                row_gain = -first[block.rows] * eta_direction
+                horizon_rows = self.engine.footprint_rows(
+                    self.context, rule, self.config.early_warning_horizon
+                )
+                positions = np.searchsorted(horizon_rows, block.rows)
+                matched = positions < len(horizon_rows)
+                if len(horizon_rows):
+                    safe = np.minimum(positions, len(horizon_rows) - 1)
+                    matched &= horizon_rows[safe] == block.rows
+                local, _ = self.context.rows_to_entity_time(block.rows)
+                entity_gain = np.bincount(
+                    local,
+                    weights=row_gain,
+                    minlength=len(self.context.entity_codes),
+                )
+                entity_horizon = np.bincount(
+                    local[matched],
+                    weights=row_gain[matched],
+                    minlength=len(self.context.entity_codes),
+                )
+                horizon_gain = float(np.mean(entity_horizon))
+                global_pvalue, global_testable = one_sided_mean_pvalue(entity_gain)
+                horizon_pvalue, horizon_testable = one_sided_mean_pvalue(
+                    entity_horizon
+                )
+                environment_gain = np.bincount(
+                    self._environments.inverse,
+                    weights=entity_gain,
+                    minlength=len(self._environments.labels),
+                ) / self._environments.counts
+                robust_gain = worst_case_total_variation_mean(
+                    environment_gain,
+                    self._environments.probabilities,
+                    self._environments.l1_radius,
+                )
+                # Match certification's entity-level future probability: for
+                # either sign, sign*dP/d(beta)=exp(-H)*dH is nonnegative.
+                horizon_local, _ = self.context.rows_to_entity_time(horizon_rows)
+                horizon_intensity = (
+                    np.exp(np.clip(eta[horizon_rows], -745.0, 700.0))
+                    / self.context.dataset.ticks_per_unit
+                )
+                hazard = np.bincount(
+                    horizon_local,
+                    weights=horizon_intensity,
+                    minlength=len(self.context.entity_codes),
+                )
+                hazard_direction = np.bincount(
+                    local[matched],
+                    weights=(
+                        np.exp(np.clip(eta[block.rows[matched]], -745.0, 700.0))
+                        * np.maximum(activation[matched], 0.0)
+                        / self.context.dataset.ticks_per_unit
+                    ),
+                    minlength=len(self.context.entity_codes),
+                )
+                entity_probability = np.exp(np.clip(-hazard, -745.0, 0.0)) * (
+                    hazard_direction
+                )
+                probability_pvalue, probability_testable = one_sided_mean_pvalue(
+                    entity_probability
+                )
+                environment_probability = np.bincount(
+                    self._environments.inverse,
+                    weights=entity_probability,
+                    minlength=len(self._environments.labels),
+                ) / self._environments.counts
+                robust_probability = worst_case_total_variation_mean(
+                    environment_probability,
+                    self._environments.probabilities,
+                    self._environments.l1_radius,
+                )
+                margins = np.asarray(
+                    [global_gain, horizon_gain, robust_gain, robust_probability],
+                    dtype=np.float64,
+                )
+                if not np.all(np.isfinite(margins)):
+                    raise FloatingPointError("nonfinite reliability price")
+                tolerance = self.config.search_tolerance
+                global_ok = global_testable and global_pvalue <= self.config.alpha
+                horizon_ok = (
+                    horizon_gain > tolerance
+                    and horizon_testable
+                    and horizon_pvalue <= self.config.alpha
+                )
+                environment_ok = robust_gain > tolerance
+                probability_ok = (
+                    robust_probability > tolerance
+                    and probability_testable
+                    and probability_pvalue <= self.config.alpha
+                )
+                result = _ReliabilityPrice(
+                    bool(global_ok and horizon_ok and environment_ok and probability_ok),
+                    True,
+                    global_gain,
+                    horizon_gain,
+                    robust_gain,
+                    robust_probability,
+                    global_pvalue,
+                    horizon_pvalue,
+                    probability_pvalue,
+                    direction,
+                )
+                with self._state_lock:
+                    self.diagnostics.reliability_global_screens += int(not global_ok)
+                    self.diagnostics.reliability_horizon_screens += int(
+                        not horizon_ok
+                    )
+                    self.diagnostics.reliability_environment_screens += int(
+                        not environment_ok
+                    )
+                    self.diagnostics.reliability_probability_screens += int(
+                        not probability_ok
+                    )
+        except (FloatingPointError, ValueError, ArithmeticError):
+            result = _ReliabilityPrice(
+                True,
+                False,
+                global_gain,
+                math.nan,
+                math.nan,
+                math.nan,
+                1.0,
+                1.0,
+                1.0,
+                direction,
+            )
+            with self._state_lock:
+                self.diagnostics.reliability_numeric_fail_open += 1
+        with self._state_lock:
+            self._reliability_prices[key] = result
+            self._reliability_prices.move_to_end(key)
+            while len(self._reliability_prices) > self._reliability_price_limit:
+                self._reliability_prices.popitem(last=False)
+        return result
+
     def _legacy_block_price_components(
         self, current: SupportRecord, rule: RuleIdentity, *, device: str = "cpu"
     ) -> tuple[np.ndarray, np.ndarray]:
@@ -1743,7 +2018,7 @@ class SupportOptimizer:
     def _rank_profiled_identities(
         self, current: SupportRecord, identities: tuple[RuleIdentity, ...]
     ) -> list[tuple[float, float, RuleIdentity]]:
-        """Profile the best W/sign score once per antecedent skeleton."""
+        """Profile the best global-MDL W/sign once per antecedent skeleton."""
         scored = self._rank_mdl_identities(current, identities)
         profiled: list[tuple[float, float, RuleIdentity]] = []
         for antecedent in sorted({item[2].antecedent for item in scored}):
@@ -1754,6 +2029,33 @@ class SupportOptimizer:
         with self._state_lock:
             self.diagnostics.profiled_skeletons += len(profiled)
         return sorted(profiled, key=lambda item: (-item[0], item[2]))
+
+    def _reliability_survivors(
+        self, current: SupportRecord, rules: tuple[RuleIdentity, ...]
+    ) -> tuple[RuleIdentity, ...]:
+        """Apply reliability pricing only after cheaper exact-safe screens."""
+        if not self.config.reliability_aware_search or not rules:
+            return rules
+        devices = self.config.pricing_devices or ("cpu",)
+
+        def evaluate(indexed: tuple[int, RuleIdentity]) -> tuple[RuleIdentity, bool]:
+            configure_cpu_threads(1)
+            index, rule = indexed
+            price = self._reliability_price(
+                current, rule, device=devices[index % len(devices)]
+            )
+            return rule, price.admissible
+
+        if len(rules) == 1:
+            evaluated = [evaluate((0, rules[0]))]
+        else:
+            with ThreadPoolExecutor(
+                max_workers=min(self.config.pricing_workers, len(rules)),
+                thread_name_prefix="crbstpp-reliability-price",
+            ) as executor:
+                evaluated = list(executor.map(evaluate, enumerate(rules)))
+        admitted = {rule for rule, keep in evaluated if keep}
+        return tuple(rule for rule in rules if rule in admitted)
 
     def _local_score_maxima(
         self, profiled: list[tuple[float, float, RuleIdentity]]
@@ -2187,6 +2489,14 @@ class SupportOptimizer:
         admissible = [item for item in admissible if item[2] in safe]
         if not admissible:
             return None
+        reliable = set(
+            self._reliability_survivors(
+                current, tuple(item[2] for item in admissible)
+            )
+        )
+        admissible = [item for item in admissible if item[2] in reliable]
+        if not admissible:
+            return None
 
         # The analytic relaxation is already cached by the safe survivor pass.
         # It orders work without constructing a candidate problem.  Conditional
@@ -2566,6 +2876,29 @@ class SupportOptimizer:
         if rule.sign < 0:
             design = design.copy()
             design[:, -self.config.knot_count :] *= -1.0
+        warm: np.ndarray | None = None
+        if self.config.reliability_aware_search:
+            price = self._reliability_prices.get((current.support, rule))
+            if price is not None and np.any(price.direction > 0.0):
+                candidate = np.zeros(design.shape[1], dtype=np.float64)
+                candidate[-self.config.knot_count :] = price.direction
+                # A Fisher step can be too long away from the local quadratic
+                # region.  Backtracking to a feasible NLL-improving point is
+                # deterministic and never changes the exact block optimum.
+                for _ in range(32):
+                    values, _, _ = loss_rows(
+                        problem.offset + design @ candidate,
+                        likelihood=self.context.dataset.likelihood,
+                        exposure_weight=problem.exposure,
+                        noevent_weight=problem.noevent,
+                        event_weight=problem.event,
+                    )
+                    if float(np.sum(values)) <= problem.old_nll:
+                        warm = candidate
+                        with self._state_lock:
+                            self.diagnostics.reliability_warm_starts += 1
+                        break
+                    candidate *= 0.5
         fit = fit_offset_design(
             design,
             problem.offset,
@@ -2577,6 +2910,7 @@ class SupportOptimizer:
             tolerance=self.config.solver_tolerance,
             max_iter=self.config.solver_max_iter,
             device=device or (self.config.pricing_devices or ("cpu",))[0],
+            warm_start=warm,
         )
         with self._state_lock:
             self.diagnostics.restricted_block_fits += 1
@@ -2758,6 +3092,15 @@ class SupportOptimizer:
                 )
             )
             admissible = [item for item in admissible if item[2] in safe_rules]
+        if admissible:
+            reliable_rules = set(
+                self._reliability_survivors(
+                    empty, tuple(item[2] for item in admissible)
+                )
+            )
+            admissible = [
+                item for item in admissible if item[2] in reliable_rules
+            ]
         standalone: dict[Support, SupportRecord] = {}
         for start in range(0, len(admissible), self.config.exact_workers):
             wave = admissible[start : start + self.config.exact_workers]

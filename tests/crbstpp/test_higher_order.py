@@ -122,8 +122,14 @@ class HigherOrderRecoveryTests(unittest.TestCase):
                 pricing_devices=(),
             )
             fit_optimizer = SupportOptimizer(Context.make(data, fit_codes), config)
+            pair = RuleIdentity((0, 1), 0, 1)
+            price = fit_optimizer._reliability_price(
+                fit_optimizer.records[Support(())], pair
+            )
+            self.assertTrue(price.testable)
+            self.assertTrue(price.admissible)
             record = fit_optimizer.fit(
-                Support.of((RuleIdentity((0, 1), 0, 1),)),
+                Support.of((pair,)),
                 fit_optimizer.records[Support(())],
             )
             self.assertGreater(record.score, 0)

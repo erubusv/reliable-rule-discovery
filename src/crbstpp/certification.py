@@ -9,10 +9,20 @@ from .config import RunConfig
 from .likelihood import loss_rows
 from .objective import SupportRecord
 from .report import Certificate
+from .reliability import (
+    environment_robust_mean as _environment_robust_mean,
+    environment_spec as _environment_spec,
+    multinomial_l1_radius,
+    worst_case_total_variation_mean,
+)
 from .response import Context, ModelMatrix, ResponseEngine
 from .rules import ClosureTerm, EMPTY_SUPPORT, RuleIdentity, Support, hierarchy_closure
 from .search import SupportOptimizer, support_key
 from .solver import FitResult
+
+# Backward-compatible private test hooks; implementation is shared with search.
+_multinomial_l1_radius = multinomial_l1_radius
+_worst_case_total_variation_mean = worst_case_total_variation_mean
 
 
 @dataclass(frozen=True)
@@ -36,134 +46,6 @@ class CertificationResult:
     models: tuple[CertifiedModel, ...]
     certified: tuple[CertifiedModel, ...]
     family_size: int
-
-
-@dataclass(frozen=True)
-class _EnvironmentSpec:
-    """Natural held-out environments and their calibrated mixture set."""
-
-    inverse: np.ndarray
-    labels: np.ndarray
-    counts: np.ndarray
-    probabilities: np.ndarray
-    l1_radius: float
-    source: str
-
-
-def _multinomial_l1_radius(n: int, environments: int, alpha: float) -> float:
-    """Finite-sample confidence radius for multinomial mixture weights.
-
-    The Bretagnolle--Huber--Carol inequality gives
-    ``P(||p_hat-p||_1 >= eps) <= 2**K exp(-n eps**2/2)``.  Thus the radius is
-    fixed by sample size, environment count and the pre-registered alpha; no
-    hand-selected stress magnitude or inferred market regime is introduced.
-    """
-    if n < 1:
-        raise ValueError("environment calibration requires observations")
-    if environments <= 1:
-        return 0.0
-    radius = math.sqrt(
-        2.0
-        * (float(environments) * math.log(2.0) + math.log(1.0 / float(alpha)))
-        / float(n)
-    )
-    return min(2.0, radius)
-
-
-def _environment_spec(context: Context, config: RunConfig) -> _EnvironmentSpec:
-    """Use pre-existing financial cohorts rather than inferred regimes."""
-    raw = context.dataset.split_groups[context.entity_codes]
-    source = "dataset.split_groups"
-    if len(np.unique(raw)) <= 1:
-        # Recurrent datasets such as IBM intentionally use random entity
-        # splitting and therefore have no split-group cohort.  Their entity
-        # entry times still define an outcome-blind temporal cohort.  The block
-        # width is the complete formation-plus-impact horizon, not a tuned
-        # market-regime threshold.
-        width = max(
-            1,
-            (max(config.formation_windows) + config.impact_lag)
-            * context.dataset.ticks_per_unit,
-        )
-        origin = int(np.min(context.starts))
-        raw = (context.starts - origin) // width
-        source = "entity_start_time/formation_plus_impact_horizon"
-    labels, inverse, counts = np.unique(raw, return_inverse=True, return_counts=True)
-    counts = counts.astype(np.float64)
-    probabilities = counts / float(np.sum(counts))
-    return _EnvironmentSpec(
-        inverse=np.asarray(inverse, dtype=np.int64),
-        labels=np.asarray(labels),
-        counts=counts,
-        probabilities=probabilities,
-        l1_radius=_multinomial_l1_radius(len(raw), len(labels), config.alpha),
-        source=source,
-    )
-
-
-def _worst_case_total_variation_mean(
-    values: np.ndarray,
-    probabilities: np.ndarray,
-    l1_radius: float,
-) -> float:
-    """Exact minimum mean over an L1 ball on a finite environment simplex."""
-    values = np.asarray(values, dtype=np.float64)
-    probabilities = np.asarray(probabilities, dtype=np.float64)
-    if (
-        values.ndim != 1
-        or probabilities.shape != values.shape
-        or not len(values)
-        or np.any(probabilities < 0.0)
-        or not np.isclose(float(np.sum(probabilities)), 1.0)
-        or not 0.0 <= l1_radius <= 2.0
-    ):
-        raise ValueError("invalid finite-environment ambiguity problem")
-    if len(values) == 1 or l1_radius == 0.0:
-        return float(probabilities @ values)
-    weights = probabilities.copy()
-    low_order = np.argsort(values, kind="stable")
-    high_order = low_order[::-1]
-    budget = min(1.0, 0.5 * float(l1_radius))
-    low_index = high_index = 0
-    tolerance = 16.0 * np.finfo(float).eps
-    while budget > tolerance:
-        while (
-            low_index < len(values) and weights[low_order[low_index]] >= 1.0 - tolerance
-        ):
-            low_index += 1
-        while high_index < len(values) and weights[high_order[high_index]] <= tolerance:
-            high_index += 1
-        if low_index >= len(values) or high_index >= len(values):
-            break
-        low = int(low_order[low_index])
-        high = int(high_order[high_index])
-        if low == high or values[low] >= values[high]:
-            break
-        moved = min(budget, 1.0 - weights[low], weights[high])
-        if moved <= tolerance:
-            break
-        weights[low] += moved
-        weights[high] -= moved
-        budget -= moved
-    return float(weights @ values)
-
-
-def _environment_robust_mean(
-    values: np.ndarray, environments: _EnvironmentSpec
-) -> tuple[float, np.ndarray]:
-    values = np.asarray(values, dtype=np.float64)
-    if values.shape != environments.inverse.shape:
-        raise ValueError("entity gain and environment arrays must align")
-    sums = np.bincount(
-        environments.inverse,
-        weights=values,
-        minlength=len(environments.labels),
-    )
-    means = sums / environments.counts
-    worst = _worst_case_total_variation_mean(
-        means, environments.probabilities, environments.l1_radius
-    )
-    return worst, means
 
 
 def one_sided_mean_test(values: np.ndarray, threshold: float = 0.0) -> EffectTest:
@@ -287,9 +169,10 @@ def _fit_on_discovery(
     support: Support,
     *,
     closure: tuple[ClosureTerm, ...] | None = None,
+    source: SupportRecord | None = None,
 ) -> tuple[ModelMatrix, FitResult]:
     resolved = hierarchy_closure(support) if closure is None else closure
-    return optimizer.fit_fixed(support, resolved)
+    return optimizer.fit_fixed(support, resolved, source=source)
 
 
 def _holm_adjust(pvalues: list[float]) -> list[float]:
@@ -303,12 +186,47 @@ def _holm_adjust(pvalues: list[float]) -> list[float]:
     return adjusted
 
 
+def _prefit_family_nulls(
+    optimizer: SupportOptimizer,
+    family: tuple[SupportRecord, ...],
+) -> None:
+    """Warm and cache every unique D_fit null in bounded parallel waves.
+
+    Certification used to launch a separate fit wave inside every support,
+    leaving two of the three exact workers idle for singleton models.  The
+    models and optima are identical; only their deterministic execution order
+    and warm starts change.  Wave-local matrices are released before the next
+    wave so peak memory remains bounded by ``exact_workers``.
+    """
+    jobs: dict[
+        tuple[Support, tuple[ClosureTerm, ...]], SupportRecord
+    ] = {}
+    for record in family:
+        closure = hierarchy_closure(record.support)
+        jobs.setdefault((EMPTY_SUPPORT, closure), record)
+        for root in record.support.rules:
+            drop_support = _branch_drop(record.support, root)
+            drop_closure = _branch_null_closure(
+                record.matrix.closure, drop_support, root
+            )
+            jobs.setdefault((drop_support, drop_closure), record)
+    ordered = sorted(jobs, key=lambda item: (item[0].rules, item[1]))
+    width = max(1, optimizer.config.exact_workers)
+    for start in range(0, len(ordered), width):
+        wave = ordered[start : start + width]
+        optimizer.fit_fixed_many(
+            list(wave),
+            sources=[jobs[item] for item in wave],
+        )
+
+
 def certify_family(
     optimizer: SupportOptimizer,
     certification_context: Context,
     family: tuple[SupportRecord, ...],
     config: RunConfig,
 ) -> CertificationResult:
+    _prefit_family_nulls(optimizer, family)
     cert_engine = ResponseEngine(
         certification_context.dataset,
         lag=config.impact_lag,
@@ -325,7 +243,7 @@ def certify_family(
         )
         closure = hierarchy_closure(record.support)
         null_matrix, null_fit = _fit_on_discovery(
-            optimizer, EMPTY_SUPPORT, closure=closure
+            optimizer, EMPTY_SUPPORT, closure=closure, source=record
         )
         if not null_fit.converged:
             reasons.append("closure_null_nonconvergence")
@@ -363,7 +281,10 @@ def certify_family(
                 record.matrix.closure, drop_support, root
             )
             branch_specifications.append((drop_support, drop_closure))
-        branch_models = optimizer.fit_fixed_many(branch_specifications)
+        branch_models = optimizer.fit_fixed_many(
+            branch_specifications,
+            sources=[record] * len(branch_specifications),
+        )
         rule_pvalues: list[float] = []
         rule_diagnostics: list[dict[str, object]] = []
         rule_f3: list[bool] = []
