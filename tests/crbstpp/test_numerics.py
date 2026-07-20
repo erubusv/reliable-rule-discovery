@@ -10,23 +10,143 @@ import pandas as pd
 
 from crbstpp.likelihood import conjugate_sum, loss_rows
 from crbstpp.native import (
+    aggregate_design_rows,
+    aggregate_design_rows_with_groups,
     completion_events,
     cpu_available,
     cuda_available,
     moments,
     moments_batch,
+    nonnegative_quadratic_gains,
 )
 from crbstpp.response import Context, ResponseEngine
 from crbstpp.config import RunConfig
 from crbstpp.data import Dataset, write_dataset
 from crbstpp.rules import RuleIdentity, Support
-from crbstpp.search import SupportOptimizer
+from crbstpp.search import SupportOptimizer, _nonnegative_quadratic_gain
 from crbstpp.solver import _objective, fit_model_matrix
 
 from tests.crbstpp.test_core import synthetic_dataset
 
 
 class NumericalParityTests(unittest.TestCase):
+    def test_restricted_add_score_is_a_feasible_full_support_lower_bound(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            data = synthetic_dataset(Path(directory) / "data", 120)
+            fit_codes, _, _ = data.split((0.6, 0.2, 0.2), 111)
+            config = RunConfig(
+                dataset=str(data.root),
+                q_max=2,
+                impact_lag=3,
+                knot_count=2,
+                formation_windows=(0, 1, 2),
+                solver_tolerance=1e-8,
+                solver_max_iter=150,
+                cache_bytes=32 * 1024**2,
+                early_warning_horizon=3,
+                pricing_devices=(),
+            )
+            optimizer = SupportOptimizer(Context.make(data, fit_codes), config)
+            empty = optimizer.records[Support(())]
+            compared = 0
+            for rule in optimizer.dictionary:
+                restricted = optimizer._restricted_add_score(empty, rule)
+                if not np.isfinite(restricted):
+                    continue
+                full = optimizer.fit(Support.of((rule,)), empty)
+                self.assertGreaterEqual(full.score + 1e-8, restricted)
+                compared += 1
+            self.assertGreater(compared, 0)
+
+    def test_incremental_support_matrix_matches_fresh_construction(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            data = synthetic_dataset(Path(directory) / "data", 120)
+            context = Context.make(
+                data, np.arange(data.n_entities, dtype=np.int32)
+            )
+            engine = ResponseEngine(
+                data, lag=3, knot_count=2, cache_bytes=32 * 1024**2
+            )
+            source_support = Support.of((RuleIdentity((0,), 0, 1),))
+            target_support = source_support.add(RuleIdentity((0, 1), 2, -1))
+            source = engine.model_matrix(context, source_support)
+            incremental = engine.extend_model_matrix(
+                context, target_support, source
+            )
+            fresh = engine.model_matrix(context, target_support)
+            for left, right in (
+                (incremental.x, fresh.x),
+                (incremental.exposure_weight, fresh.exposure_weight),
+                (incremental.noevent_weight, fresh.noevent_weight),
+                (incremental.event_weight, fresh.event_weight),
+                (incremental.active_rows, fresh.active_rows),
+                (incremental.active_design_groups, fresh.active_design_groups),
+            ):
+                np.testing.assert_array_equal(left, right)
+
+    def test_compiled_nonnegative_quadratic_batch_matches_reference(self) -> None:
+        rng = np.random.default_rng(314)
+        gradients = rng.normal(size=(257, 4))
+        factors = rng.normal(size=(257, 4, 4))
+        hessians = np.einsum("bki,bkj->bij", factors, factors)
+        hessians += 0.1 * np.eye(4)[None, :, :]
+        compiled = nonnegative_quadratic_gains(gradients, hessians)
+        self.assertIsNotNone(compiled)
+        reference = np.asarray(
+            [
+                _nonnegative_quadratic_gain(gradient, hessian)
+                for gradient, hessian in zip(
+                    gradients, hessians, strict=True
+                )
+            ]
+        )
+        np.testing.assert_allclose(compiled, reference, rtol=1e-12, atol=1e-12)
+
+    def test_lossless_design_aggregation_preserves_objective_and_moments(self) -> None:
+        rng = np.random.default_rng(82)
+        prototypes = rng.normal(size=(17, 6))
+        prototypes[0, 0] = -0.0
+        assignment = rng.integers(0, len(prototypes), size=400)
+        assignment[:2] = 0
+        x = prototypes[assignment]
+        x[0, 0] = 0.0
+        exposure = rng.uniform(0.1, 2.0, size=len(x))
+        noevent = rng.uniform(0.1, 2.0, size=len(x))
+        event = rng.integers(0, 2, size=len(x)).astype(np.float64)
+        beta = rng.normal(size=x.shape[1])
+        aggregated = aggregate_design_rows(x, exposure, noevent, event)
+        grouped = aggregate_design_rows_with_groups(x, exposure, noevent, event)
+        self.assertLessEqual(len(aggregated[0]), len(prototypes))
+        np.testing.assert_array_equal(grouped[0][grouped[4]], x)
+        for left, right in zip(aggregated, grouped[:4], strict=True):
+            np.testing.assert_array_equal(left, right)
+        for likelihood in ("poisson", "first_event_cloglog"):
+            original_rows, original_first, original_second = loss_rows(
+                x @ beta,
+                likelihood=likelihood,
+                exposure_weight=exposure,
+                noevent_weight=noevent,
+                event_weight=event,
+            )
+            reduced_rows, reduced_first, reduced_second = loss_rows(
+                aggregated[0] @ beta,
+                likelihood=likelihood,
+                exposure_weight=aggregated[1],
+                noevent_weight=aggregated[2],
+                event_weight=aggregated[3],
+            )
+            original_moments = moments(x, original_first, original_second)
+            reduced_moments = moments(aggregated[0], reduced_first, reduced_second)
+            self.assertAlmostEqual(
+                float(np.sum(original_rows)), float(np.sum(reduced_rows)), places=11
+            )
+            np.testing.assert_allclose(
+                reduced_moments[0], original_moments[0], rtol=1e-12, atol=1e-12
+            )
+            np.testing.assert_allclose(
+                reduced_moments[1], original_moments[1], rtol=1e-12, atol=1e-12
+            )
+
     def test_poisson_value_gradient_hessian_and_conjugate(self) -> None:
         rng = np.random.default_rng(9)
         x = rng.normal(size=(31, 5))

@@ -12,7 +12,13 @@ import numpy as np
 from .config import RunConfig
 from .dual import DualCertificate, DualGeometry, dual_certificate, dual_geometry
 from .likelihood import loss_rows
-from .native import configure_cpu_threads, moments, moments_batch
+from .native import (
+    aggregate_design_rows,
+    configure_cpu_threads,
+    moments,
+    moments_batch,
+    nonnegative_quadratic_gains,
+)
 from .objective import ObjectiveSpec, SupportRecord, support_score
 from .response import Context, ModelMatrix, ResponseEngine, SparseBlock
 from .rules import (
@@ -24,7 +30,7 @@ from .rules import (
     hierarchy_closure,
     skeletons,
 )
-from .solver import FitResult, fit_model_matrix
+from .solver import FitResult, fit_model_matrix, fit_offset_design
 
 
 @dataclass(frozen=True)
@@ -66,7 +72,19 @@ class SearchDiagnostics:
     block_score_screens: int = 0
     block_score_admissible: int = 0
     block_score_exact_rejections: int = 0
+    profiled_skeletons: int = 0
+    score_basin_nodes: int = 0
+    score_basin_seeds: int = 0
+    positive_primitive_roots: int = 0
     nonnested_exact_audits: int = 0
+    full_dictionary_audits: int = 0
+    working_set_expansions: int = 0
+    working_set_skeletons: int = 0
+    restricted_block_fits: int = 0
+    restricted_block_screens: int = 0
+    joint_block_fits: int = 0
+    joint_block_candidates: int = 0
+    joint_block_pruned: int = 0
 
 
 @dataclass(frozen=True)
@@ -116,12 +134,15 @@ def _nonnegative_quadratic_gain(gradient: np.ndarray, hessian: np.ndarray) -> fl
 
 
 class SupportOptimizer:
-    """Exact fixed-support fits with hierarchy-aware block-score search.
+    """Exact fixed-support fits with profiled rule-block score search.
 
-    Every accepted move is an exact MDL improvement.  Inactive blocks whose
-    joint Fisher score cannot pay both the complete hierarchy cost and the
-    reported rule's conditional cost are excluded from the local audit.  This
-    yields block-score stationarity rather than exact one-exchange stationarity.
+    W/sign are discrete nuisance identities profiled within each antecedent
+    skeleton.  Only a skeleton's best MDL-positive rule-block direction is
+    exact-fitted with its hierarchy closure.  Every accepted move improves the
+    exact MDL objective.  Only terminal supports reach certification, whose F2
+    branch test removes closure-driven reported rules.  The terminal claim is
+    a full-dictionary profiled score-basin fixed point under joint restricted
+    correction, not drop/swap or exhaustive one-exchange stationarity.
     """
 
     def __init__(self, context: Context, config: RunConfig):
@@ -154,7 +175,7 @@ class SupportOptimizer:
         self._state_lock = threading.RLock()
         self._record_cache_bytes = 0
         self._record_cache_limit = max(1, 2 * config.cache_bytes // 8)
-        self._addition_cache: dict[Support, Support | None] = {}
+        self._splice_radius: dict[Support, int] = {}
         self._relaxed_upper_cache: OrderedDict[tuple, float] = OrderedDict()
         self._relaxed_upper_limit = max(1, min(200_000, config.cache_bytes // 256))
         self._directional_upper_cache: OrderedDict[Support, float] = OrderedDict()
@@ -163,6 +184,11 @@ class SupportOptimizer:
         )
         self._pricing_cache_bytes = 0
         self._pricing_cache_limit = max(1, config.cache_bytes // 8)
+        self._raw_pricing_state: OrderedDict[Support, tuple[np.ndarray, np.ndarray]] = (
+            OrderedDict()
+        )
+        self._raw_pricing_cache_bytes = 0
+        self._raw_pricing_cache_limit = max(1, config.cache_bytes // 8)
         self._block_price_cache: OrderedDict[
             tuple[Support, Antecedent, int], tuple[np.ndarray, np.ndarray]
         ] = OrderedDict()
@@ -174,13 +200,15 @@ class SupportOptimizer:
             1, min(50_000, config.cache_bytes // 4096)
         )
         self._skeleton_witnesses: dict[Antecedent, tuple[float, RuleIdentity]] = {}
-        self._standalone_screen_cache: dict[Antecedent, tuple[RuleIdentity, ...]] = {}
+        self._working_antecedents: set[Antecedent] = set()
+        self._restricted_add_scores: dict[tuple[Support, RuleIdentity], float] = {}
         baseline_matrix = self.engine.model_matrix(context, EMPTY_SUPPORT)
         baseline_fit = fit_model_matrix(
             baseline_matrix,
             likelihood=context.dataset.likelihood,
             tolerance=config.solver_tolerance,
             max_iter=config.solver_max_iter,
+            device=(config.pricing_devices or ("cpu",))[0],
         )
         if not baseline_fit.converged:
             raise RuntimeError(f"baseline fit failed: {baseline_fit.message}")
@@ -217,12 +245,14 @@ class SupportOptimizer:
 
     def release_search_caches(self) -> None:
         self.engine.clear_caches()
-        self._addition_cache.clear()
         self._pricing_state.clear()
         self._pricing_cache_bytes = 0
+        self._raw_pricing_state.clear()
+        self._raw_pricing_cache_bytes = 0
         self._relaxed_upper_cache.clear()
         self._directional_upper_cache.clear()
         self._block_price_cache.clear()
+        self._restricted_add_scores.clear()
         self._dual_geometry_cache.clear()
         baseline = self.records.get(EMPTY_SUPPORT)
         self.records.clear()
@@ -314,7 +344,11 @@ class SupportOptimizer:
         return output
 
     def fit(
-        self, support: Support, source: SupportRecord | None = None
+        self,
+        support: Support,
+        source: SupportRecord | None = None,
+        *,
+        device: str | None = None,
     ) -> SupportRecord:
         with self._state_lock:
             cached = self.records.get(support)
@@ -331,7 +365,12 @@ class SupportOptimizer:
             with self._state_lock:
                 self.diagnostics.fit_cache_hits += 1
                 return self._retain_record(record)
-        matrix = self.engine.model_matrix(self.context, support)
+        matrix = (
+            self.engine.extend_model_matrix(self.context, support, source.matrix)
+            if source is not None
+            and set(source.support.rules).issubset(support.rules)
+            else self.engine.model_matrix(self.context, support)
+        )
         warm = None if source is None else self.warm_start(source, matrix)
         fit = fit_model_matrix(
             matrix,
@@ -339,6 +378,7 @@ class SupportOptimizer:
             tolerance=self.config.solver_tolerance,
             max_iter=self.config.solver_max_iter,
             warm_start=warm,
+            device=device or (self.config.pricing_devices or ("cpu",))[0],
         )
         penalty = self.objective.penalty(support, matrix, self.baseline_dimension)
         score = (
@@ -383,20 +423,25 @@ class SupportOptimizer:
             1, self.config.pricing_workers // self.config.exact_workers
         )
 
-        def fit_one(support: Support) -> SupportRecord:
+        devices = self.config.pricing_devices or ("cpu",)
+
+        def fit_one(item: tuple[int, Support]) -> SupportRecord:
             configure_cpu_threads(threads_per_fit)
-            return self.fit(support, source)
+            index, support = item
+            return self.fit(support, source, device=devices[index % len(devices)])
 
         with ThreadPoolExecutor(
             max_workers=min(self.config.exact_workers, len(ordered)),
             thread_name_prefix="crbstpp-exact",
         ) as executor:
-            return list(executor.map(fit_one, ordered))
+            return list(executor.map(fit_one, enumerate(ordered)))
 
     def fit_fixed(
         self,
         support: Support,
         closure: tuple[ClosureTerm, ...],
+        *,
+        device: str | None = None,
     ) -> tuple[ModelMatrix, FitResult]:
         """Fit a forced-closure model with a shared certification cache."""
         key = (support, tuple(closure))
@@ -419,6 +464,7 @@ class SupportOptimizer:
             likelihood=self.context.dataset.likelihood,
             tolerance=self.config.solver_tolerance,
             max_iter=self.config.solver_max_iter,
+            device=device or (self.config.pricing_devices or ("cpu",))[0],
         )
         with self._state_lock:
             incumbent = self._forced_fits.setdefault(key, fit)
@@ -436,17 +482,20 @@ class SupportOptimizer:
             1, self.config.pricing_workers // self.config.exact_workers
         )
 
+        devices = self.config.pricing_devices or ("cpu",)
+
         def fit_one(
-            item: tuple[Support, tuple[ClosureTerm, ...]],
+            indexed: tuple[int, tuple[Support, tuple[ClosureTerm, ...]]],
         ) -> tuple[ModelMatrix, FitResult]:
             configure_cpu_threads(threads_per_fit)
-            return self.fit_fixed(*item)
+            index, item = indexed
+            return self.fit_fixed(*item, device=devices[index % len(devices)])
 
         with ThreadPoolExecutor(
             max_workers=min(self.config.exact_workers, len(specifications)),
             thread_name_prefix="crbstpp-fixed",
         ) as executor:
-            return list(executor.map(fit_one, specifications))
+            return list(executor.map(fit_one, enumerate(specifications)))
 
     def saturated_upper_score(self, support: Support) -> float:
         return support_score(
@@ -708,6 +757,7 @@ class SupportOptimizer:
                 tolerance=self.config.solver_tolerance,
                 max_iter=3,
                 warm_start=warm,
+                device=(self.config.pricing_devices or ("cpu",))[0],
             )
             one_eta = matrix.x @ splice_fit.coefficients
             one_rows, _, _ = loss_rows(
@@ -797,7 +847,10 @@ class SupportOptimizer:
             event_weight=current.matrix.event_weight,
         )
         _, hessian = moments(
-            current.matrix.x, np.zeros_like(second), second, device="cpu"
+            current.matrix.x,
+            np.zeros_like(second),
+            second,
+            device=(self.config.pricing_devices or ("cpu",))[0],
         )
         active = np.arange(current.matrix.dimension) < current.matrix.free_dimension
         active |= current.fit.coefficients > 1.0e-10
@@ -812,6 +865,52 @@ class SupportOptimizer:
         while self._pricing_cache_bytes > self._pricing_cache_limit:
             _, removed = self._pricing_state.popitem(last=False)
             self._pricing_cache_bytes -= removed[0].nbytes + removed[1].nbytes
+        return result
+
+    def _raw_pricing_derivatives(
+        self, current: SupportRecord
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Cache exact row derivatives once per fitted support state."""
+        with self._state_lock:
+            cached = self._raw_pricing_state.get(current.support)
+            if cached is not None:
+                self._raw_pricing_state.move_to_end(current.support)
+                return cached
+        eta = self.engine.linear_predictor(
+            self.context, current.matrix, current.fit.coefficients
+        )
+        event = np.zeros(self.context.n_grid, dtype=np.float64)
+        if len(self.context.target_rows):
+            event[self.context.target_rows] = self.context.target_counts
+        exposure = np.full(
+            self.context.n_grid, self.engine.tick_exposure, dtype=np.float64
+        )
+        noevent = (
+            exposure - event
+            if self.context.dataset.likelihood == "first_event_cloglog"
+            else exposure
+        )
+        _, first, second = loss_rows(
+            eta,
+            likelihood=self.context.dataset.likelihood,
+            exposure_weight=exposure,
+            noevent_weight=noevent,
+            event_weight=event,
+        )
+        result = (
+            np.ascontiguousarray(first, dtype=np.float64),
+            np.ascontiguousarray(second, dtype=np.float64),
+        )
+        size = result[0].nbytes + result[1].nbytes
+        with self._state_lock:
+            existing = self._raw_pricing_state.get(current.support)
+            if existing is not None:
+                return existing
+            self._raw_pricing_state[current.support] = result
+            self._raw_pricing_cache_bytes += size
+            while self._raw_pricing_cache_bytes > self._raw_pricing_cache_limit:
+                _, removed = self._raw_pricing_state.popitem(last=False)
+                self._raw_pricing_cache_bytes -= removed[0].nbytes + removed[1].nbytes
         return result
 
     def _price_skeleton(
@@ -856,6 +955,7 @@ class SupportOptimizer:
             }
         else:
             indices, inverse = self._pricing_components(current)
+            raw_first, raw_second = self._raw_pricing_derivatives(current)
             gradients = {
                 window: np.zeros(self.config.knot_count, dtype=np.float64)
                 for window in missing
@@ -876,33 +976,8 @@ class SupportOptimizer:
             for start in range(0, len(maximum.rows), 131_072):
                 end = min(len(maximum.rows), start + 131_072)
                 rows = maximum.rows[start:end]
-                design = self.engine.design_at_rows_with_context(
-                    self.context, current.matrix, rows
-                )
-                eta = design @ current.fit.coefficients
-                positions = np.searchsorted(self.context.target_rows, rows)
-                matched = positions < len(self.context.target_rows)
-                if len(self.context.target_rows):
-                    safe = np.minimum(positions, len(self.context.target_rows) - 1)
-                    matched &= self.context.target_rows[safe] == rows
-                event = np.zeros(len(rows), dtype=np.float64)
-                if np.any(matched):
-                    event[matched] = self.context.target_counts[positions[matched]]
-                exposure = np.full(
-                    len(rows), self.engine.tick_exposure, dtype=np.float64
-                )
-                noevent = (
-                    exposure - event
-                    if self.context.dataset.likelihood == "first_event_cloglog"
-                    else exposure
-                )
-                _, first, second = loss_rows(
-                    eta,
-                    likelihood=self.context.dataset.likelihood,
-                    exposure_weight=exposure,
-                    noevent_weight=noevent,
-                    event_weight=event,
-                )
+                first = raw_first[rows]
+                second = raw_second[rows]
                 candidates = []
                 for window in missing:
                     block = blocks[window]
@@ -925,9 +1000,20 @@ class SupportOptimizer:
                     flat_candidates = candidate_batch.transpose(1, 0, 2).reshape(
                         len(rows), -1
                     )
-                    flat_cross = design[:, indices].T @ (
-                        second[:, None] * flat_candidates
-                    )
+                    weighted_candidates = second[:, None] * flat_candidates
+                    if (
+                        current.matrix.dimension == 1
+                        and len(indices) == 1
+                        and int(indices[0]) == 0
+                    ):
+                        flat_cross = np.sum(
+                            weighted_candidates, axis=0, keepdims=True
+                        )
+                    else:
+                        design = self.engine.design_at_rows_with_context(
+                            self.context, current.matrix, rows
+                        )
+                        flat_cross = design[:, indices].T @ weighted_candidates
                     tile_crosses = flat_cross.reshape(
                         len(indices), len(missing), self.config.knot_count
                     ).transpose(1, 0, 2)
@@ -1042,6 +1128,7 @@ class SupportOptimizer:
         self.diagnostics.priced_blocks += len(identities)
         # Build the common conditional information once before worker launch.
         self._pricing_components(current)
+        self._raw_pricing_derivatives(current)
         grouped: dict[Antecedent, set[int]] = {}
         for rule in identities:
             grouped.setdefault(rule.antecedent, set()).add(rule.window)
@@ -1077,16 +1164,35 @@ class SupportOptimizer:
                 for antecedent, windows in groups
             ]
         components = dict(component_items)
-        prices = [
-            (
-                _nonnegative_quadratic_gain(
-                    float(rule.sign) * components[rule.antecedent][rule.window][0],
-                    components[rule.antecedent][rule.window][1],
-                ),
-                rule,
+        gradients = np.asarray(
+            [
+                float(rule.sign)
+                * components[rule.antecedent][rule.window][0]
+                for rule in identities
+            ],
+            dtype=np.float64,
+        )
+        hessians = np.asarray(
+            [
+                components[rule.antecedent][rule.window][1]
+                for rule in identities
+            ],
+            dtype=np.float64,
+        )
+        compiled_gains = nonnegative_quadratic_gains(gradients, hessians)
+        gains = (
+            compiled_gains
+            if compiled_gains is not None
+            else np.asarray(
+                [
+                    _nonnegative_quadratic_gain(gradient, hessian)
+                    for gradient, hessian in zip(
+                        gradients, hessians, strict=True
+                    )
+                ]
             )
-            for rule in identities
-        ]
+        )
+        prices = list(zip(gains.tolist(), identities, strict=True))
         with self._state_lock:
             self.diagnostics.fused_sign_prices += len(identities) - sum(
                 len(windows) for _, windows in groups
@@ -1280,15 +1386,40 @@ class SupportOptimizer:
                     blocks[(antecedent, window)],
                     len(closure) * self.config.knot_count,
                 )
-            tile_gradients, tile_hessians = moments_batch(
-                candidate_batch, first, second, device=device
+            tile_gradients = np.zeros((batch_size, maximum_dimension), dtype=np.float64)
+            tile_hessians = np.zeros(
+                (batch_size, maximum_dimension, maximum_dimension),
+                dtype=np.float64,
             )
-            if len(indices):
-                flat = candidate_batch.transpose(1, 0, 2).reshape(len(rows), -1)
-                flat_cross = design[:, indices].T @ (second[:, None] * flat)
-                tile_crosses = flat_cross.reshape(
-                    len(indices), batch_size, maximum_dimension
-                ).transpose(1, 0, 2)
+            tile_crosses = np.zeros(
+                (batch_size, len(indices), maximum_dimension), dtype=np.float64
+            )
+            active_design = design[:, indices]
+            for batch_index in range(batch_size):
+                candidate = candidate_batch[batch_index]
+                joint = (
+                    np.concatenate((active_design, candidate), axis=1)
+                    if len(indices)
+                    else candidate
+                )
+                joint, reduced_first, reduced_second, _ = aggregate_design_rows(
+                    joint,
+                    first,
+                    second,
+                    np.zeros_like(first),
+                    copy_input=True,
+                )
+                reduced_candidate = joint[:, len(indices) :]
+                tile_gradients[batch_index], tile_hessians[batch_index] = moments(
+                    reduced_candidate,
+                    reduced_first,
+                    reduced_second,
+                    device=device,
+                )
+                if len(indices):
+                    tile_crosses[batch_index] = joint[:, : len(indices)].T @ (
+                        reduced_second[:, None] * reduced_candidate
+                    )
             for batch_index, window in enumerate(nested_windows):
                 gradients[window] += tile_gradients[batch_index]
                 hessians[window] += tile_hessians[batch_index]
@@ -1405,6 +1536,164 @@ class SupportOptimizer:
             best = sorted(candidates, key=lambda item: (-item[0], item[2]))[0]
             self._skeleton_witnesses[antecedent] = (best[0], best[2])
         return sorted(ranked, key=lambda item: (-item[0], item[2]))
+
+    def _rank_profiled_identities(
+        self, current: SupportRecord, identities: tuple[RuleIdentity, ...]
+    ) -> list[tuple[float, float, RuleIdentity]]:
+        """Profile W/sign once per skeleton using its marginal rule block.
+
+        The rule block is conditioned on the currently fitted model, but new
+        hierarchy nuisance is deliberately excluded from pricing.  It enters
+        the exact trial fit.  Only terminal supports enter certification, so a
+        closure-driven high-order identity cannot be reported unless it passes
+        the held-out F2 branch contribution test.
+        """
+        if not identities:
+            return []
+        raw = self._rank_identities(current, identities)
+        scored: list[tuple[float, float, RuleIdentity]] = []
+        current_closure_count = len(current.matrix.closure)
+        log_n = math.log(max(2, self.objective.n_entities))
+        for gain, rule in raw:
+            trial = current.support.add(rule)
+            penalty_delta = self.objective.structural_penalty(trial) - current.penalty
+            closure_delta = (
+                len(hierarchy_closure(trial)) - current_closure_count
+            ) * self.config.knot_count
+            rule_penalty = penalty_delta - closure_delta * log_n
+            scored.append((2.0 * gain - rule_penalty, gain, rule))
+        profiled: list[tuple[float, float, RuleIdentity]] = []
+        for antecedent in sorted({item[2].antecedent for item in scored}):
+            group = [item for item in scored if item[2].antecedent == antecedent]
+            best = sorted(group, key=lambda item: (-item[0], item[2]))[0]
+            profiled.append(best)
+            self._skeleton_witnesses[antecedent] = (best[0], best[2])
+        positive = sum(item[0] > self.config.search_tolerance for item in profiled)
+        with self._state_lock:
+            self.diagnostics.block_score_evaluations += len(identities)
+            self.diagnostics.profiled_skeletons += len(profiled)
+            self.diagnostics.block_score_admissible += positive
+            self.diagnostics.block_score_screens += len(identities) - positive
+        return sorted(profiled, key=lambda item: (-item[0], item[2]))
+
+    def _local_score_maxima(
+        self, profiled: list[tuple[float, float, RuleIdentity]]
+    ) -> list[tuple[float, float, RuleIdentity]]:
+        """Return all positive local maxima of the skeleton add/drop DAG."""
+        by_antecedent = {item[2].antecedent: item for item in profiled}
+
+        def dominates(
+            candidate: tuple[float, float, RuleIdentity],
+            current: tuple[float, float, RuleIdentity],
+        ) -> bool:
+            if candidate[0] > current[0] + self.config.search_tolerance:
+                return True
+            return (
+                abs(candidate[0] - current[0]) <= self.config.search_tolerance
+                and candidate[2] < current[2]
+            )
+
+        positive = [item for item in profiled if item[0] > self.config.search_tolerance]
+        local_maxima: list[tuple[float, float, RuleIdentity]] = []
+        for item in positive:
+            antecedent = item[2].antecedent
+            members = set(antecedent)
+            adjacent = []
+            for other_antecedent, other in by_antecedent.items():
+                if abs(len(other_antecedent) - len(antecedent)) != 1:
+                    continue
+                other_members = set(other_antecedent)
+                if members < other_members or other_members < members:
+                    adjacent.append(other)
+            local_maximum = not any(dominates(other, item) for other in adjacent)
+            if local_maximum:
+                local_maxima.append(item)
+        return sorted(local_maxima, key=lambda item: (-item[0], item[2]))
+
+    def _score_basin_seeds(
+        self, profiled: list[tuple[float, float, RuleIdentity]]
+    ) -> list[tuple[float, float, RuleIdentity]]:
+        """Return one exact-fit representative from every finite score basin.
+
+        Higher-order modes use both the inclusion DAG and the fixed-order
+        one-predicate-exchange graph.  The latter prevents every promising
+        pair from disappearing merely because a triplet has a larger score,
+        while still avoiding an exhaustive exact fit of all positive atoms.
+        """
+        positive = [item for item in profiled if item[0] > self.config.search_tolerance]
+        local_maxima = self._local_score_maxima(profiled)
+        by_order: dict[int, list[tuple[float, float, RuleIdentity]]] = {}
+        for item in positive:
+            by_order.setdefault(item[2].order, []).append(item)
+
+        def dominates(
+            candidate: tuple[float, float, RuleIdentity],
+            current: tuple[float, float, RuleIdentity],
+        ) -> bool:
+            if candidate[0] > current[0] + self.config.search_tolerance:
+                return True
+            return (
+                abs(candidate[0] - current[0]) <= self.config.search_tolerance
+                and candidate[2] < current[2]
+            )
+
+        exchange_maxima: list[tuple[float, float, RuleIdentity]] = []
+        for order, items in by_order.items():
+            if order == 1:
+                continue
+            for item in items:
+                members = set(item[2].antecedent)
+                adjacent = (
+                    other
+                    for other in items
+                    if len(members.intersection(other[2].antecedent)) == order - 1
+                )
+                if not any(dominates(other, item) for other in adjacent):
+                    exchange_maxima.append(item)
+        seeds = {
+            item[2].antecedent: item
+            for item in positive
+            if len(item[2].antecedent) == 1
+        }
+        seeds.update({item[2].antecedent: item for item in local_maxima})
+        seeds.update({item[2].antecedent: item for item in exchange_maxima})
+        self._working_antecedents.update(seeds)
+        with self._state_lock:
+            self.diagnostics.score_basin_nodes += len(positive)
+            self.diagnostics.score_basin_seeds += sum(
+                item[2].order > 1 for item in seeds.values()
+            )
+            self.diagnostics.positive_primitive_roots += sum(
+                len(item[2].antecedent) == 1 for item in positive
+            )
+        return sorted(seeds.values(), key=lambda item: (-item[0], item[2]))
+
+    def _expand_working_set(self, current: SupportRecord) -> bool:
+        """Run one complete delayed-column audit and activate every violation."""
+        existing = set(current.support.antecedents)
+        outside = tuple(
+            rule
+            for rule in self.dictionary
+            if rule.antecedent not in existing
+            and rule.antecedent not in self._working_antecedents
+        )
+        if not outside:
+            return False
+        with self._state_lock:
+            self.diagnostics.full_dictionary_audits += 1
+        profiled = self._rank_profiled_identities(current, outside)
+        additions = {
+            item[2].antecedent
+            for item in profiled
+            if item[0] > self.config.search_tolerance
+        }
+        if not additions:
+            return False
+        self._working_antecedents.update(additions)
+        with self._state_lock:
+            self.diagnostics.working_set_expansions += 1
+            self.diagnostics.working_set_skeletons += len(additions)
+        return True
 
     def _inactive_identities(
         self, support: Support, antecedents: set[Antecedent] | None = None
@@ -1689,145 +1978,366 @@ class SupportOptimizer:
                 self._directional_upper_cache.popitem(last=False)
         return tuple(survivors)
 
-    def _screen_standalones(self, empty: SupportRecord) -> None:
-        """Screen independent skeletons concurrently before any exact fit."""
-        if len(self._standalone_screen_cache) == len(self.skeletons):
-            return
-
-        def screen(
-            antecedent: Antecedent,
-        ) -> tuple[Antecedent, tuple[RuleIdentity, ...]]:
-            configure_cpu_threads(1)
-            identities = tuple(
-                rule for rule in self.dictionary if rule.antecedent == antecedent
-            )
-            return antecedent, self._safe_standalone_survivors(
-                empty, antecedent, identities
-            )
-
-        workers = min(self.config.pricing_workers, len(self.skeletons))
-        if workers <= 1:
-            screened = [screen(antecedent) for antecedent in self.skeletons]
-        else:
-            with ThreadPoolExecutor(
-                max_workers=workers,
-                thread_name_prefix="crbstpp-screen",
-            ) as executor:
-                screened = list(executor.map(screen, self.skeletons))
-        self._standalone_screen_cache.update(screened)
-
-    def _best_addition(
+    def _best_profiled_addition(
         self,
         current: SupportRecord,
         *,
-        antecedents: set[Antecedent] | None = None,
+        antecedents: set[Antecedent],
     ) -> SupportRecord | None:
-        if antecedents is None and current.support in self._addition_cache:
-            cached_support = self._addition_cache[current.support]
-            return None if cached_support is None else self.fit(cached_support, current)
-        identities = self._inactive_identities(current.support, antecedents)
-        if not identities:
-            if antecedents is None:
-                self._addition_cache[current.support] = None
-            return None
-        identities = self._safe_identity_survivors(current, identities, current.score)
-        if not identities:
-            if antecedents is None:
-                self._addition_cache[current.support] = None
-            return None
-        ranked = self._rank_identities(current, identities)
-        survivors: list[tuple[float, Support]] = []
-        for price, rule in ranked:
-            trial = current.support.add(rule)
-            survivors.append((price, trial))
-        evaluated = self.bounds_many(current, [trial for _, trial in survivors])
-        bounds = [
-            (price, item) for (price, _), item in zip(survivors, evaluated, strict=True)
-        ]
-        bounds.sort(
-            key=lambda item: (-item[1].upper_score, -item[0], item[1].support.rules)
-        )
-        incumbent: SupportRecord | None = None
-        incumbent_score = current.score
-        position = 0
-        while position < len(bounds):
-            if (
-                bounds[position][1].upper_score
-                <= incumbent_score + self.config.search_tolerance
-            ):
-                self.diagnostics.dual_screens += len(bounds) - position
-                break
-            wave: list[ProposalBounds] = []
-            while position < len(bounds) and len(wave) < self.config.exact_workers:
-                item = bounds[position][1]
-                position += 1
-                if item.upper_score > incumbent_score + self.config.search_tolerance:
-                    wave.append(item)
-                else:
-                    self.diagnostics.dual_screens += 1
-            records = self.fit_many([item.support for item in wave], current)
-            for record in records:
-                if record.score > incumbent_score + self.config.search_tolerance:
-                    incumbent, incumbent_score = record, record.score
-        if antecedents is None:
-            self._addition_cache[current.support] = (
-                None if incumbent is None else incumbent.support
-            )
-        return incumbent
+        """Fully correct one joint batch of profiled score-basin proposals.
 
-    def _best_block_addition(
-        self,
-        current: SupportRecord,
-        *,
-        minimum_score: float | None = None,
-        antecedents: set[Antecedent] | None = None,
-    ) -> SupportRecord | None:
-        """Exact-refit only MDL-positive joint block-score directions."""
-        acceptance = current.score if minimum_score is None else float(minimum_score)
-        cacheable = antecedents is None and minimum_score is None
-        if cacheable and current.support in self._addition_cache:
-            cached_support = self._addition_cache[current.support]
-            return None if cached_support is None else self.fit(cached_support, current)
+        Candidate blocks share one frozen-current likelihood solve.  Only an
+        exact restricted-MDL improvement triggers a full support refit, so the
+        number of refits no longer scales with the number of candidates.
+        """
+        acceptance = current.score
         identities = self._inactive_identities(current.support, antecedents)
-        ranked = self._rank_block_identities(current, identities)
-        admissible = [
-            item
-            for item in ranked
-            if (not item[3]) or item[0] > self.config.search_tolerance
-        ]
-        for start in range(0, len(admissible), self.config.exact_workers):
-            wave = admissible[start : start + self.config.exact_workers]
-            records = self.fit_many(
-                [current.support.add(item[2]) for item in wave], current
-            )
-            improving = [
-                record
-                for record in records
-                if record.score > acceptance + self.config.search_tolerance
+        ranked = self._rank_profiled_identities(current, identities)
+        priced = self._local_score_maxima(ranked)
+        if not current.support.rules:
+            # Standalone basin seeds were already exact-fitted immediately
+            # before the common path starts.  Reuse those exact feasibility
+            # results instead of solving the same offset blocks again.
+            admissible = [
+                item
+                for item in priced
+                if (
+                    stored := self._stored_records.get(Support.of((item[2],)))
+                )
+                is not None
+                and stored.score > self.config.search_tolerance
             ]
-            if improving:
-                best = sorted(
-                    improving, key=lambda record: (-record.score, record.support.rules)
-                )[0]
-                if cacheable:
-                    self._addition_cache[current.support] = best.support
-                return best
-            with self._state_lock:
-                self.diagnostics.block_score_exact_rejections += len(records)
-        if cacheable:
-            self._addition_cache[current.support] = None
+            screened = len(priced) - len(admissible)
+        else:
+            admissible = priced
+            screened = 0
+        with self._state_lock:
+            self.diagnostics.restricted_block_screens += screened
+        proposal = self._restricted_joint_proposal(
+            current, tuple(item[2] for item in admissible)
+        )
+        if proposal is not None:
+            record = self.fit(proposal, current)
+            if record.score > acceptance + self.config.search_tolerance:
+                return record
+            # The restricted model is a feasible point of the full model, so
+            # this can only be numerical drift beyond the configured tolerance.
+            raise AssertionError("full refit degraded an improving restricted proposal")
         return None
 
-    def _standalone_block_atoms(
+    def _restricted_joint_fit(
+        self,
+        current: SupportRecord,
+        rules: tuple[RuleIdentity, ...],
+    ) -> tuple[
+        FitResult,
+        float,
+        np.ndarray,
+        np.ndarray,
+        tuple[ClosureTerm, ...],
+    ] | None:
+        """Fit all proposed blocks jointly around the frozen current model.
+
+        This is an exact likelihood fit, not a quadratic ranking surrogate.
+        Its objective is a feasible lower bound for the subsequent fully
+        corrective support refit, which makes every accepted batch safe.
+        """
+        if not rules:
+            return None
+        trial = current.support
+        for rule in rules:
+            trial = trial.add(rule)
+        old_closure = set(current.matrix.closure)
+        new_closure = tuple(sorted(set(hierarchy_closure(trial)) - old_closure))
+        specifications = [
+            (term.antecedent, term.window, 1.0) for term in new_closure
+        ] + [
+            (rule.antecedent, rule.window, float(rule.sign)) for rule in rules
+        ]
+        blocks = [
+            self.engine.block(self.context, antecedent, window)
+            for antecedent, window, _ in specifications
+        ]
+        nonempty = [block.rows for block in blocks if len(block.rows)]
+        if not nonempty:
+            return None
+        rows = np.unique(np.concatenate(nonempty))
+        dimension = len(specifications) * self.config.knot_count
+        design = np.zeros((len(rows), dimension), dtype=np.float64)
+        for index, (block, (_, _, sign)) in enumerate(
+            zip(blocks, specifications, strict=True)
+        ):
+            if len(block.rows):
+                positions = np.searchsorted(rows, block.rows)
+                left = index * self.config.knot_count
+                design[positions, left : left + self.config.knot_count] = (
+                    sign * block.values
+                )
+        offset = self.engine.linear_predictor_at_rows(
+            self.context, current.matrix, current.fit.coefficients, rows
+        )
+        event = np.zeros(len(rows), dtype=np.float64)
+        if len(self.context.target_rows):
+            positions = np.searchsorted(self.context.target_rows, rows)
+            matched = positions < len(self.context.target_rows)
+            safe = np.minimum(positions, len(self.context.target_rows) - 1)
+            matched &= self.context.target_rows[safe] == rows
+            event[matched] = self.context.target_counts[positions[matched]]
+        exposure = np.full(len(rows), self.engine.tick_exposure, dtype=np.float64)
+        noevent = (
+            exposure - event
+            if self.context.dataset.likelihood == "first_event_cloglog"
+            else exposure.copy()
+        )
+        joint = np.concatenate((offset[:, None], design), axis=1)
+        joint, exposure, noevent, event = aggregate_design_rows(
+            joint, exposure, noevent, event, copy_input=False
+        )
+        offset, design = joint[:, 0], joint[:, 1:]
+        old_values, _, _ = loss_rows(
+            offset,
+            likelihood=self.context.dataset.likelihood,
+            exposure_weight=exposure,
+            noevent_weight=noevent,
+            event_weight=event,
+        )
+        fit = fit_offset_design(
+            design,
+            offset,
+            exposure,
+            noevent,
+            event,
+            likelihood=self.context.dataset.likelihood,
+            free_dimension=len(new_closure) * self.config.knot_count,
+            tolerance=self.config.solver_tolerance,
+            max_iter=self.config.solver_max_iter,
+            device=(self.config.pricing_devices or ("cpu",))[0],
+        )
+        with self._state_lock:
+            self.diagnostics.joint_block_fits += 1
+            self.diagnostics.joint_block_candidates += len(rules)
+        score = -math.inf
+        if fit.converged:
+            restricted_nll = (
+                current.fit.nll + fit.nll - float(np.sum(old_values))
+            )
+            score = support_score(
+                baseline_nll=self.baseline_nll,
+                fit_nll=restricted_nll,
+                penalty=self.objective.structural_penalty(trial),
+            )
+        hessian = np.zeros((dimension, dimension), dtype=np.float64)
+        if np.all(np.isfinite(fit.coefficients)):
+            _, _, second = loss_rows(
+                offset + design @ fit.coefficients,
+                likelihood=self.context.dataset.likelihood,
+                exposure_weight=exposure,
+                noevent_weight=noevent,
+                event_weight=event,
+            )
+            _, hessian = moments(
+                design,
+                np.zeros_like(second),
+                second,
+                device=(self.config.pricing_devices or ("cpu",))[0],
+            )
+        return fit, score, design, hessian, new_closure
+
+    def _restricted_joint_proposal(
+        self,
+        current: SupportRecord,
+        rules: tuple[RuleIdentity, ...],
+    ) -> Support | None:
+        """Find a maximal improving batch along a deterministic backward path.
+
+        A joint occurrence likelihood exposes redundant blocks before a costly
+        full refit.  Zero blocks are removed together.  If the complete batch
+        pays too much fixed MDL code, the least conditionally material rule is
+        removed and the exact restricted likelihood is reoptimized.  There is
+        no candidate budget and termination takes at most ``len(rules)`` fits.
+        """
+        selected = list(dict.fromkeys(rules))
+        acceptance = current.score + self.config.search_tolerance
+        while selected:
+            outcome = self._restricted_joint_fit(current, tuple(selected))
+            if outcome is None:
+                return None
+            fit, score, design, hessian, new_closure = outcome
+            if fit.converged and score > acceptance:
+                trial = current.support
+                for rule in selected:
+                    trial = trial.add(rule)
+                return trial
+
+            closure_dimension = len(new_closure) * self.config.knot_count
+            coefficients = fit.coefficients
+            block_indices = [
+                np.arange(
+                    closure_dimension + index * self.config.knot_count,
+                    closure_dimension + (index + 1) * self.config.knot_count,
+                )
+                for index in range(len(selected))
+            ]
+            rule_norms = np.asarray(
+                [np.linalg.norm(coefficients[index]) for index in block_indices],
+                dtype=np.float64,
+            )
+            zero = rule_norms <= max(1.0e-12, self.config.solver_tolerance)
+            if np.any(zero):
+                removed = int(np.sum(zero))
+                selected = [
+                    rule for index, rule in enumerate(selected) if not zero[index]
+                ]
+            else:
+                all_indices = np.arange(len(coefficients))
+                trial = current.support
+                for rule in selected:
+                    trial = trial.add(rule)
+                conditional_net = []
+                for index, rule_columns in enumerate(block_indices):
+                    other = np.setdiff1d(
+                        all_indices, rule_columns, assume_unique=True
+                    )
+                    h_rr = hessian[np.ix_(rule_columns, rule_columns)]
+                    if len(other):
+                        h_ro = hessian[np.ix_(rule_columns, other)]
+                        h_oo = hessian[np.ix_(other, other)]
+                        schur = h_rr - h_ro @ np.linalg.pinv(
+                            h_oo,
+                            rcond=max(1.0e-12, self.config.solver_tolerance),
+                        ) @ h_ro.T
+                    else:
+                        schur = h_rr
+                    beta = coefficients[rule_columns]
+                    likelihood_code = float(beta @ schur @ beta)
+                    reduced = trial.drop(selected[index])
+                    penalty_code = (
+                        self.objective.structural_penalty(trial)
+                        - self.objective.structural_penalty(reduced)
+                    )
+                    conditional_net.append(likelihood_code - penalty_code)
+                negative = np.asarray(conditional_net) <= self.config.search_tolerance
+                if np.any(negative):
+                    removed = int(np.sum(negative))
+                    selected = [
+                        rule
+                        for index, rule in enumerate(selected)
+                        if not negative[index]
+                    ]
+                else:
+                    drop_index = min(
+                        range(len(selected)),
+                        key=lambda index: (conditional_net[index], selected[index]),
+                    )
+                    selected.pop(drop_index)
+                    removed = 1
+            with self._state_lock:
+                self.diagnostics.joint_block_pruned += removed
+        return None
+
+    def _restricted_add_score(
+        self, current: SupportRecord, rule: RuleIdentity
+    ) -> float:
+        """Exact fixed-current block-coordinate objective for one new rule."""
+        key = (current.support, rule)
+        cached = self._restricted_add_scores.get(key)
+        if cached is not None:
+            return cached
+        trial = current.support.add(rule)
+        old_closure = set(current.matrix.closure)
+        new_closure = tuple(sorted(set(hierarchy_closure(trial)) - old_closure))
+        specifications = [
+            (term.antecedent, term.window, 1.0) for term in new_closure
+        ]
+        specifications.append((rule.antecedent, rule.window, float(rule.sign)))
+        blocks = [
+            self.engine.block(self.context, antecedent, window)
+            for antecedent, window, _ in specifications
+        ]
+        nonempty = [block.rows for block in blocks if len(block.rows)]
+        if not nonempty:
+            self._restricted_add_scores[key] = -math.inf
+            return -math.inf
+        rows = np.unique(np.concatenate(nonempty))
+        dimension = len(specifications) * self.config.knot_count
+        design = np.zeros((len(rows), dimension), dtype=np.float64)
+        for index, (block, (_, _, sign)) in enumerate(
+            zip(blocks, specifications, strict=True)
+        ):
+            if not len(block.rows):
+                continue
+            positions = np.searchsorted(rows, block.rows)
+            left = index * self.config.knot_count
+            design[positions, left : left + self.config.knot_count] = (
+                sign * block.values
+            )
+        offset = self.engine.linear_predictor_at_rows(
+            self.context, current.matrix, current.fit.coefficients, rows
+        )
+        event = np.zeros(len(rows), dtype=np.float64)
+        if len(self.context.target_rows):
+            positions = np.searchsorted(self.context.target_rows, rows)
+            matched = positions < len(self.context.target_rows)
+            safe = np.minimum(positions, len(self.context.target_rows) - 1)
+            matched &= self.context.target_rows[safe] == rows
+            event[matched] = self.context.target_counts[positions[matched]]
+        exposure = np.full(
+            len(rows), self.engine.tick_exposure, dtype=np.float64
+        )
+        noevent = (
+            exposure - event
+            if self.context.dataset.likelihood == "first_event_cloglog"
+            else exposure.copy()
+        )
+        joint = np.concatenate((offset[:, None], design), axis=1)
+        joint, exposure, noevent, event = aggregate_design_rows(
+            joint,
+            exposure,
+            noevent,
+            event,
+            copy_input=False,
+        )
+        offset, design = joint[:, 0], joint[:, 1:]
+        old_values, _, _ = loss_rows(
+            offset,
+            likelihood=self.context.dataset.likelihood,
+            exposure_weight=exposure,
+            noevent_weight=noevent,
+            event_weight=event,
+        )
+        fit = fit_offset_design(
+            design,
+            offset,
+            exposure,
+            noevent,
+            event,
+            likelihood=self.context.dataset.likelihood,
+            free_dimension=len(new_closure) * self.config.knot_count,
+            tolerance=self.config.solver_tolerance,
+            max_iter=self.config.solver_max_iter,
+            device=(self.config.pricing_devices or ("cpu",))[0],
+        )
+        with self._state_lock:
+            self.diagnostics.restricted_block_fits += 1
+        score = -math.inf
+        if fit.converged:
+            restricted_nll = (
+                current.fit.nll + fit.nll - float(np.sum(old_values))
+            )
+            score = support_score(
+                baseline_nll=self.baseline_nll,
+                fit_nll=restricted_nll,
+                penalty=self.objective.structural_penalty(trial),
+            )
+        self._restricted_add_scores[key] = score
+        return score
+
+    def _standalone_profiled_atoms(
         self, empty: SupportRecord
     ) -> tuple[SupportRecord, ...]:
-        """Freeze every exact-positive atom whose joint block score is MDL-positive."""
-        ranked = self._rank_block_identities(empty, self.dictionary)
-        admissible = [
-            item
-            for item in ranked
-            if (not item[3]) or item[0] > self.config.search_tolerance
-        ]
+        """Exact-fit primitive roots and higher-order score-basin seeds."""
+        ranked = self._rank_profiled_identities(empty, self.dictionary)
+        admissible = self._score_basin_seeds(ranked)
         positives: dict[Support, SupportRecord] = {}
         for start in range(0, len(admissible), self.config.exact_workers):
             wave = admissible[start : start + self.config.exact_workers]
@@ -1843,205 +2353,49 @@ class SupportOptimizer:
             for support in sorted(positives, key=lambda item: item.rules)
         )
 
-    def _standalone_skeleton(
-        self, empty: SupportRecord, antecedent: Antecedent
-    ) -> tuple[SupportRecord, ...]:
-        identities = self._standalone_screen_cache.get(antecedent)
-        if identities is None:
-            all_identities = tuple(
-                rule for rule in self.dictionary if rule.antecedent == antecedent
-            )
-            identities = self._safe_identity_survivors(empty, all_identities, 0.0)
-        if not identities:
-            return ()
-        ranked = self._rank_identities(empty, identities)
-        positives: dict[Support, SupportRecord] = {}
-        survivors: list[tuple[float, Support]] = []
-        for price, rule in ranked:
-            trial = Support.of((rule,))
-            survivors.append((price, trial))
-        evaluated = self.bounds_many(empty, [trial for _, trial in survivors])
-        pending = [
-            (price, item) for (price, _), item in zip(survivors, evaluated, strict=True)
-        ]
-        pending.sort(
-            key=lambda item: (-item[1].upper_score, -item[0], item[1].support.rules)
-        )
-        admissible = []
-        for _, item in pending:
-            if item.upper_score <= self.config.search_tolerance:
-                self.diagnostics.dual_screens += 1
-            else:
-                admissible.append(item)
-        for start in range(0, len(admissible), self.config.exact_workers):
-            wave = admissible[start : start + self.config.exact_workers]
-            records = self.fit_many([item.support for item in wave], empty)
-            for record in records:
-                if record.score > 0:
-                    positives[record.support] = record
-        return tuple(positives.values())
+    def _best_profiled_move(self, current: SupportRecord) -> SupportRecord | None:
+        """Profiled score-basin audit with exact batch acceptance.
 
-    def _best_exact_proposal(
-        self, current: SupportRecord, proposals: list[Support]
-    ) -> SupportRecord | None:
-        unique = sorted(set(proposals), key=lambda support: support.rules)
-        survivors: list[Support] = []
-        for support in unique:
-            if support == current.support:
-                continue
-            upper = self.safe_upper_score(support)
-            if upper <= current.score + self.config.search_tolerance:
-                if upper < self.localized_upper_score(support) - 1.0e-12:
-                    self.diagnostics.directional_relaxation_screens += 1
-                else:
-                    self.diagnostics.relaxation_screens += 1
-                continue
-            survivors.append(support)
-        bounded = self.bounds_many(current, survivors)
-        bounded.sort(key=lambda item: (-item.upper_score, item.support.rules))
-        incumbent = None
-        incumbent_score = current.score
-        position = 0
-        while position < len(bounded):
-            if (
-                bounded[position].upper_score
-                <= incumbent_score + self.config.search_tolerance
-            ):
-                self.diagnostics.dual_screens += len(bounded) - position
-                break
-            wave: list[ProposalBounds] = []
-            while position < len(bounded) and len(wave) < self.config.exact_workers:
-                item = bounded[position]
-                position += 1
-                if item.upper_score > incumbent_score + self.config.search_tolerance:
-                    wave.append(item)
-                else:
-                    self.diagnostics.dual_screens += 1
-            records = self.fit_many([item.support for item in wave], current)
-            for record in records:
-                if record.score > incumbent_score + self.config.search_tolerance:
-                    incumbent, incumbent_score = record, record.score
-        return incumbent
-
-    def _splice_proposals(
-        self, current: SupportRecord, drops: list[tuple[RuleIdentity, SupportRecord]]
-    ) -> list[Support]:
-        existing = set(current.support.antecedents)
-        additions = [
-            item[1]
-            for item in sorted(
-                (
-                    item
-                    for antecedent, item in self._skeleton_witnesses.items()
-                    if antecedent not in existing
-                ),
-                key=lambda item: (-item[0], item[1]),
-            )
-        ]
-        if len(additions) < 2:
-            return []
-        proposals: set[Support] = set()
-        base = list(current.support.rules)
-        # Every prefix size is evaluated; there is no top-k or support-size cap.
-        for size in range(2, len(additions) + 1):
-            proposals.add(Support.of((*base, *additions[:size])))
-        ordered_drops = sorted(
-            drops,
-            key=lambda item: (current.score - item[1].score, item[0]),
+        This intentionally does not claim drop, swap, or W/sign-replacement
+        stationarity.  Those exact one-exchange audits require one large refit
+        per active rule and dominated terminal runtime.  Redundant reported
+        branches are instead rejected by the held-out hierarchy-preserving F2
+        test before any model can enter the ensemble.
+        """
+        # Delayed column generation prices only the finite basin working set
+        # during coordinate moves.  A complete outside-dictionary audit is
+        # compulsory whenever that restricted problem stalls, and every
+        # violating skeleton is activated at once.  Hence terminal states have
+        # still passed the complete dictionary audit without paying for it at
+        # every accepted move.
+        direct = self._best_profiled_addition(
+            current, antecedents=set(self._working_antecedents)
         )
-        for size in range(1, max(len(ordered_drops), len(additions)) + 1):
-            removed = {item[0] for item in ordered_drops[:size]}
-            added = additions[:size]
-            proposals.add(
-                Support.of(
-                    [rule for rule in current.support.rules if rule not in removed]
-                    + added
-                )
-            )
-        proposals.discard(current.support)
-        return sorted(proposals, key=lambda support: support.rules)
-
-    def _best_one_exchange(self, current: SupportRecord) -> SupportRecord | None:
-        incumbent: SupportRecord | None = None
-        incumbent_score = current.score
-        direct = self._best_addition(current)
-        if (
-            direct is not None
-            and direct.score > incumbent_score + self.config.search_tolerance
-        ):
-            incumbent, incumbent_score = direct, direct.score
-        reduced_records = self.fit_many(
-            [current.support.drop(removed) for removed in current.support.rules],
-            current,
-        )
-        drops: list[tuple[RuleIdentity, SupportRecord]] = []
-        for removed, reduced in zip(
-            current.support.rules, reduced_records, strict=True
-        ):
-            drops.append((removed, reduced))
-            if reduced.score > incumbent_score + self.config.search_tolerance:
-                incumbent, incumbent_score = reduced, reduced.score
-            # Adding any inactive identity to S\{r} exactly covers every
-            # identity replacement and every one-drop/one-add swap.
-            replacement = self._best_addition(reduced)
-            if (
-                replacement is not None
-                and replacement.support != current.support
-                and replacement.score > incumbent_score + self.config.search_tolerance
-            ):
-                incumbent, incumbent_score = replacement, replacement.score
-        if incumbent is not None:
-            return incumbent
-        # Joint splicing is an escape step only after the complete one-exchange
-        # audit found no move.  Any accepted splice is still an exact J increase.
-        joint = self._best_exact_proposal(
-            current, self._splice_proposals(current, drops)
-        )
-        if joint is None:
-            self.diagnostics.terminal_audits += 1
-        return joint
-
-    def _best_block_exchange(self, current: SupportRecord) -> SupportRecord | None:
-        """Block-score add/swap audit with exact drops and exact acceptance."""
-        direct = self._best_block_addition(current)
         if direct is not None:
             return direct
-        reduced_records = self.fit_many(
-            [current.support.drop(removed) for removed in current.support.rules],
-            current,
-        )
-        improving_drops = [
-            record
-            for record in reduced_records
-            if record.score > current.score + self.config.search_tolerance
-        ]
-        if improving_drops:
-            return sorted(
-                improving_drops,
-                key=lambda record: (-record.score, record.support.rules),
-            )[0]
-        # Scoring every reduced support covers W/sign replacement and
-        # one-drop/one-add swaps.  Promotions of an existing closure nuisance
-        # are nonnested and therefore always exact-audited.
-        for reduced in reduced_records:
-            replacement = self._best_block_addition(
-                reduced, minimum_score=current.score
+        if self._expand_working_set(current):
+            direct = self._best_profiled_addition(
+                current, antecedents=set(self._working_antecedents)
             )
-            if replacement is not None and replacement.support != current.support:
-                return replacement
+            if direct is not None:
+                return direct
         self.diagnostics.terminal_audits += 1
         return None
 
     def search(self) -> SearchResult:
         positive_atoms: dict[Support, SupportRecord] = {}
+        # One block-fixed-point multi-rule path is sufficient for the common-MDL
+        # model.  Every exact-positive singleton/pair/triplet basin root is
+        # frozen independently below and reaches F0--F2; alternative basins
+        # are represented by those atom models instead of launching a second
+        # expensive multi-rule ascent from every root.
         starts: list[Support] = [EMPTY_SUPPORT]
         empty = self.records[EMPTY_SUPPORT]
-        # One fused hierarchy-aware score pass replaces candidate-wise
-        # standalone dual/refit enumeration.  Every score-positive atom is
-        # still exact-fitted before it can seed a discovery basin.
-        for record in self._standalone_block_atoms(empty):
+        # Every positive skeleton ascends the finite add/drop score DAG to one
+        # of these local-maximum seeds.  Seeds must improve exact J before they
+        # initialize a discovery path; there is no restart or top-k budget.
+        for record in self._standalone_profiled_atoms(empty):
             positive_atoms[record.support] = record
-            starts.append(record.support)
         starts = sorted(set(starts), key=lambda support: support.rules)
         transition_cache: dict[Support, Support | None] = {}
         terminals: dict[Support, SupportRecord] = {}
@@ -2058,7 +2412,7 @@ class SupportOptimizer:
                         break
                     next_record = self.fit(next_support, current)
                 else:
-                    next_record = self._best_block_exchange(current)
+                    next_record = self._best_profiled_move(current)
                     transition_cache[current.support] = (
                         None if next_record is None else next_record.support
                     )
@@ -2087,7 +2441,12 @@ class SupportOptimizer:
                     "moves": moves,
                 }
             )
-        family_map = {**positive_atoms, **terminals}
+        # Every exact-positive atom and every terminal support is frozen for
+        # F0--F2.  In particular, higher-order atoms cannot be reported merely
+        # because their automatic closure fitted well: F2 must validate their
+        # hierarchy-preserving branch contribution on D_cert.
+        family_map = dict(positive_atoms)
+        family_map.update(terminals)
         return SearchResult(
             family=tuple(
                 family_map[key]

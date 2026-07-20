@@ -8,6 +8,7 @@ import numpy as np
 
 from .data import Dataset
 from .native import (
+    aggregate_design_rows_with_groups,
     accumulate_kernel,
     completion_events,
     future_rows,
@@ -109,6 +110,7 @@ class ModelMatrix:
     support: Support
     closure: tuple[ClosureTerm, ...]
     active_rows: np.ndarray
+    active_design_groups: np.ndarray
     active_age_bins: np.ndarray
     aggregate_bins: np.ndarray
 
@@ -124,6 +126,7 @@ class ModelMatrix:
             + self.noevent_weight.nbytes
             + self.event_weight.nbytes
             + self.active_rows.nbytes
+            + self.active_design_groups.nbytes
             + self.active_age_bins.nbytes
             + self.aggregate_bins.nbytes
         )
@@ -688,6 +691,99 @@ class ResponseEngine:
                 sign = float(support.rules[block_index - len(closure_blocks)].sign)
             left = baseline_dim + block_index * self.knot_count
             x_active[positions, left : left + self.knot_count] = sign * block.values
+        return self._finalize_model_matrix(
+            context,
+            support,
+            closure,
+            union,
+            age_bins,
+            x_active,
+        )
+
+    def extend_model_matrix(
+        self, context: Context, support: Support, source: ModelMatrix
+    ) -> ModelMatrix:
+        """Losslessly append rules/closure to a monotone support matrix."""
+        closure = hierarchy_closure(support)
+        if not set(source.support.rules).issubset(support.rules) or not set(
+            source.closure
+        ).issubset(closure):
+            return self.model_matrix(context, support)
+        new_closure = tuple(term for term in closure if term not in source.closure)
+        new_rules = tuple(rule for rule in support.rules if rule not in source.support.rules)
+        specifications = [
+            (term.antecedent, term.window, 1.0, "closure", term)
+            for term in new_closure
+        ] + [
+            (rule.antecedent, rule.window, float(rule.sign), "rule", rule)
+            for rule in new_rules
+        ]
+        blocks = [
+            self.block(context, antecedent, window)
+            for antecedent, window, _, _, _ in specifications
+        ]
+        active_parts = [source.active_rows]
+        active_parts.extend(block.rows for block in blocks if len(block.rows))
+        union = np.unique(np.concatenate(active_parts))
+        baseline_dim = source.free_dimension - source.closure_dimension
+        dimension = baseline_dim + self.knot_count * (
+            len(closure) + len(support.rules)
+        )
+        old_design = self.design_at_rows_with_context(context, source, union)
+        x_active = np.zeros((len(union), dimension), dtype=np.float64)
+        x_active[:, :baseline_dim] = old_design[:, :baseline_dim]
+        closure_index = {term: index for index, term in enumerate(closure)}
+        for old_index, term in enumerate(source.closure):
+            old_left = baseline_dim + old_index * self.knot_count
+            new_left = baseline_dim + closure_index[term] * self.knot_count
+            x_active[:, new_left : new_left + self.knot_count] = old_design[
+                :, old_left : old_left + self.knot_count
+            ]
+        new_free = baseline_dim + len(closure) * self.knot_count
+        rule_index = {rule: index for index, rule in enumerate(support.rules)}
+        for rule, old_slice in zip(
+            source.support.rules, source.rule_slices, strict=True
+        ):
+            new_left = new_free + rule_index[rule] * self.knot_count
+            x_active[:, new_left : new_left + self.knot_count] = old_design[
+                :, old_slice
+            ]
+        for block, (_, _, sign, kind, identity) in zip(
+            blocks, specifications, strict=True
+        ):
+            if not len(block.rows):
+                continue
+            positions = np.searchsorted(union, block.rows)
+            if kind == "closure":
+                left = baseline_dim + closure_index[identity] * self.knot_count
+            else:
+                left = new_free + rule_index[identity] * self.knot_count
+            x_active[positions, left : left + self.knot_count] = sign * block.values
+        local, times = context.rows_to_entity_time(union)
+        ages = context.baseline_origins[local] + times - context.starts[local]
+        age_bins = np.minimum(ages // self.lag, baseline_dim - 1).astype(np.int64)
+        return self._finalize_model_matrix(
+            context,
+            support,
+            closure,
+            union,
+            age_bins,
+            x_active,
+        )
+
+    def _finalize_model_matrix(
+        self,
+        context: Context,
+        support: Support,
+        closure: tuple[ClosureTerm, ...],
+        union: np.ndarray,
+        age_bins: np.ndarray,
+        x_active: np.ndarray,
+    ) -> ModelMatrix:
+        """Attach likelihood weights and losslessly aggregate an active design."""
+        age_count = self.baseline_dimension
+        baseline_dim = age_count
+        dimension = x_active.shape[1]
         # Aggregate all rows outside the active union exactly by baseline age bin.
         total_by_age = self._baseline_totals(context)
         active_by_age = np.bincount(age_bins, minlength=age_count).astype(np.float64)
@@ -726,13 +822,27 @@ class ResponseEngine:
             noevent_weight = exposure_weight - event_weight
         else:
             noevent_weight = exposure_weight.copy()
-        free_dimension = baseline_dim + len(closure_blocks) * self.knot_count
+        active_count = len(union)
+        (
+            x,
+            exposure_weight,
+            noevent_weight,
+            event_weight,
+            design_groups,
+        ) = aggregate_design_rows_with_groups(
+            x,
+            exposure_weight,
+            noevent_weight,
+            event_weight,
+            copy_input=False,
+        )
+        free_dimension = baseline_dim + len(closure) * self.knot_count
         rule_slices = tuple(
             slice(
                 free_dimension + index * self.knot_count,
                 free_dimension + (index + 1) * self.knot_count,
             )
-            for index in range(len(rule_blocks))
+            for index in range(len(support.rules))
         )
         return ModelMatrix(
             x=x,
@@ -740,11 +850,14 @@ class ResponseEngine:
             noevent_weight=noevent_weight,
             event_weight=event_weight,
             free_dimension=free_dimension,
-            closure_dimension=len(closure_blocks) * self.knot_count,
+            closure_dimension=len(closure) * self.knot_count,
             rule_slices=rule_slices,
             support=support,
             closure=closure,
             active_rows=union,
+            active_design_groups=np.ascontiguousarray(
+                design_groups[:active_count], dtype=np.int64
+            ),
             active_age_bins=age_bins,
             aggregate_bins=aggregate_bins,
         )
@@ -758,14 +871,17 @@ class ResponseEngine:
         coefficients = np.asarray(coefficients, dtype=np.float64)
         if coefficients.shape != (matrix.dimension,):
             raise ValueError("coefficient dimension mismatch")
-        rows = np.arange(context.n_grid, dtype=np.int64)
-        local, times = context.rows_to_entity_time(rows)
-        ages = context.baseline_origins[local] + times - context.starts[local]
         baseline_dimension = matrix.free_dimension - matrix.closure_dimension
-        age_bins = np.minimum(ages // self.lag, baseline_dimension - 1).astype(np.int64)
         eta = np.full(context.n_grid, coefficients[0], dtype=np.float64)
-        nonzero_age = age_bins > 0
-        eta[nonzero_age] += coefficients[age_bins[nonzero_age]]
+        if baseline_dimension > 1:
+            rows = np.arange(context.n_grid, dtype=np.int64)
+            local, times = context.rows_to_entity_time(rows)
+            ages = context.baseline_origins[local] + times - context.starts[local]
+            age_bins = np.minimum(ages // self.lag, baseline_dimension - 1).astype(
+                np.int64
+            )
+            nonzero_age = age_bins > 0
+            eta[nonzero_age] += coefficients[age_bins[nonzero_age]]
         left = baseline_dimension
         for index, term in enumerate(matrix.closure):
             block = self.block(context, term.antecedent, term.window)
@@ -790,14 +906,28 @@ class ResponseEngine:
         rows = np.asarray(rows, dtype=np.int64)
         if np.any(rows < 0) or np.any(rows >= context.n_grid):
             raise ValueError("grid row is outside the context")
-        local, times = context.rows_to_entity_time(rows)
         baseline_dimension = matrix.free_dimension - matrix.closure_dimension
-        ages = context.baseline_origins[local] + times - context.starts[local]
-        age_bins = np.minimum(ages // self.lag, baseline_dimension - 1).astype(np.int64)
         output = np.zeros((len(rows), matrix.dimension), dtype=np.float64)
         output[:, 0] = 1.0
-        nonzero = age_bins > 0
-        output[np.flatnonzero(nonzero), age_bins[nonzero]] = 1.0
+        if baseline_dimension == 1:
+            positions = np.searchsorted(matrix.active_rows, rows)
+            matched = positions < len(matrix.active_rows)
+            if len(matrix.active_rows):
+                safe = np.minimum(positions, len(matrix.active_rows) - 1)
+                matched &= matrix.active_rows[safe] == rows
+            if np.any(matched):
+                output[matched] = matrix.x[
+                    matrix.active_design_groups[positions[matched]]
+                ]
+            return output
+        if baseline_dimension > 1:
+            local, times = context.rows_to_entity_time(rows)
+            ages = context.baseline_origins[local] + times - context.starts[local]
+            age_bins = np.minimum(ages // self.lag, baseline_dimension - 1).astype(
+                np.int64
+            )
+            nonzero = age_bins > 0
+            output[np.flatnonzero(nonzero), age_bins[nonzero]] = 1.0
 
         def insert(block: SparseBlock, destination: slice, sign: float) -> None:
             if not len(block.rows) or not len(rows):

@@ -38,7 +38,11 @@ class FitResult:
 
 
 def _objective(
-    matrix: ModelMatrix, likelihood: str, beta: np.ndarray
+    matrix: ModelMatrix,
+    likelihood: str,
+    beta: np.ndarray,
+    *,
+    device: str = "cpu",
 ) -> tuple[float, np.ndarray, np.ndarray, np.ndarray]:
     eta = matrix.x @ beta
     rows, first, second = loss_rows(
@@ -48,7 +52,7 @@ def _objective(
         noevent_weight=matrix.noevent_weight,
         event_weight=matrix.event_weight,
     )
-    gradient, hessian = moments(matrix.x, first, second, device="cpu")
+    gradient, hessian = moments(matrix.x, first, second, device=device)
     return float(np.sum(rows)), gradient, hessian, eta
 
 
@@ -111,6 +115,7 @@ def fit_model_matrix(
     tolerance: float,
     max_iter: int,
     warm_start: np.ndarray | None = None,
+    device: str = "cpu",
 ) -> FitResult:
     dimension = matrix.dimension
     beta = np.zeros(dimension, dtype=np.float64)
@@ -140,7 +145,9 @@ def fit_model_matrix(
     previous = math.inf
     rank = 0
     for iteration in range(1, int(max_iter) + 1):
-        nll, gradient, hessian, _ = _objective(matrix, likelihood, beta)
+        nll, gradient, hessian, _ = _objective(
+            matrix, likelihood, beta, device=device
+        )
         if (
             not math.isfinite(nll)
             or not np.all(np.isfinite(gradient))
@@ -221,7 +228,7 @@ def fit_model_matrix(
             )
         if abs(previous - trial_nll) <= tolerance * max(1.0, abs(previous)):
             final_nll, final_gradient, final_hessian, _ = _objective(
-                matrix, likelihood, beta
+                matrix, likelihood, beta, device=device
             )
             final_kkt = projected_kkt(beta, final_gradient, matrix.free_dimension)
             if final_kkt <= 10.0 * tolerance:
@@ -247,7 +254,9 @@ def fit_model_matrix(
                     False,
                     "converged by objective and KKT",
                 )
-    nll, gradient, hessian, _ = _objective(matrix, likelihood, beta)
+    nll, gradient, hessian, _ = _objective(
+        matrix, likelihood, beta, device=device
+    )
     return FitResult(
         beta,
         nll,
@@ -260,6 +269,184 @@ def fit_model_matrix(
     )
 
 
+def fit_offset_design(
+    x: np.ndarray,
+    offset: np.ndarray,
+    exposure_weight: np.ndarray,
+    noevent_weight: np.ndarray,
+    event_weight: np.ndarray,
+    *,
+    likelihood: str,
+    free_dimension: int,
+    tolerance: float,
+    max_iter: int,
+    device: str = "cpu",
+) -> FitResult:
+    """Exactly optimize a small new block around a frozen linear predictor."""
+    x = np.ascontiguousarray(x, dtype=np.float64)
+    offset = np.ascontiguousarray(offset, dtype=np.float64)
+    exposure_weight = np.ascontiguousarray(exposure_weight, dtype=np.float64)
+    noevent_weight = np.ascontiguousarray(noevent_weight, dtype=np.float64)
+    event_weight = np.ascontiguousarray(event_weight, dtype=np.float64)
+    rows, dimension = x.shape
+    if any(
+        value.shape != (rows,)
+        for value in (offset, exposure_weight, noevent_weight, event_weight)
+    ) or not 0 <= free_dimension <= dimension:
+        raise ValueError("offset block design shape mismatch")
+    beta = np.zeros(dimension, dtype=np.float64)
+    # Recession directions depend only on design signs and event/no-event
+    # support; the finite frozen offset does not change them.
+    for index in range(dimension):
+        signs = (-1.0, 1.0) if index < free_dimension else (1.0,)
+        for sign in signs:
+            direction = sign * x[:, index]
+            if not np.any(direction):
+                continue
+            event = event_weight > 0
+            if likelihood == "poisson":
+                valid = np.all(direction <= 1.0e-14) and np.all(
+                    np.abs(direction[event]) <= 1.0e-14
+                )
+                strict = np.any(direction < -1.0e-14)
+            else:
+                noevent = noevent_weight > 0
+                valid = np.all(direction[noevent] <= 1.0e-14) and np.all(
+                    direction[event] >= -1.0e-14
+                )
+                strict = np.any(direction[noevent] < -1.0e-14) or np.any(
+                    direction[event] > 1.0e-14
+                )
+            if valid and strict:
+                return FitResult(
+                    beta,
+                    math.inf,
+                    False,
+                    0,
+                    math.inf,
+                    0,
+                    True,
+                    "nonattained offset-block recession direction",
+                )
+
+    previous = math.inf
+    rank = 0
+    for iteration in range(1, int(max_iter) + 1):
+        eta = offset + x @ beta
+        values, first, second = loss_rows(
+            eta,
+            likelihood=likelihood,
+            exposure_weight=exposure_weight,
+            noevent_weight=noevent_weight,
+            event_weight=event_weight,
+        )
+        nll = float(np.sum(values))
+        gradient, hessian = moments(x, first, second, device=device)
+        if not (
+            math.isfinite(nll)
+            and np.all(np.isfinite(gradient))
+            and np.all(np.isfinite(hessian))
+        ):
+            return FitResult(
+                beta,
+                nll,
+                False,
+                iteration,
+                math.inf,
+                rank,
+                False,
+                "nonfinite offset-block derivatives",
+            )
+        kkt = projected_kkt(beta, gradient, free_dimension)
+        if kkt <= tolerance:
+            rank = _checked_rank(hessian)
+            return FitResult(
+                beta,
+                nll,
+                rank == dimension,
+                iteration,
+                kkt,
+                rank,
+                False,
+                "converged" if rank == dimension else "rank-deficient offset block",
+            )
+        active = np.arange(dimension) < free_dimension
+        active |= (beta > 1.0e-12) | (gradient < 0.0)
+        indices = np.flatnonzero(active)
+        sub_hessian = hessian[np.ix_(indices, indices)]
+        rank = _checked_rank(sub_hessian)
+        try:
+            step_active = np.linalg.solve(sub_hessian, -gradient[indices])
+        except np.linalg.LinAlgError:
+            step_active = np.linalg.lstsq(
+                sub_hessian, -gradient[indices], rcond=None
+            )[0]
+        direction = np.zeros(dimension, dtype=np.float64)
+        direction[indices] = step_active
+        if float(gradient @ direction) >= 0:
+            direction = -gradient
+            direction[free_dimension:] = np.where(
+                (beta[free_dimension:] <= 1.0e-12)
+                & (direction[free_dimension:] < 0),
+                0.0,
+                direction[free_dimension:],
+            )
+        accepted = False
+        for _ in range(60):
+            trial = beta + direction
+            trial[free_dimension:] = np.maximum(trial[free_dimension:], 0.0)
+            trial_values, _, _ = loss_rows(
+                offset + x @ trial,
+                likelihood=likelihood,
+                exposure_weight=exposure_weight,
+                noevent_weight=noevent_weight,
+                event_weight=event_weight,
+            )
+            trial_nll = float(np.sum(trial_values))
+            if math.isfinite(trial_nll) and trial_nll <= nll + 1.0e-4 * float(
+                gradient @ (trial - beta)
+            ):
+                beta = trial
+                previous = nll
+                accepted = True
+                break
+            direction *= 0.5
+        if not accepted:
+            return FitResult(
+                beta,
+                nll,
+                False,
+                iteration,
+                kkt,
+                rank,
+                False,
+                "offset-block line search failed",
+            )
+        if abs(previous - trial_nll) <= tolerance * max(1.0, abs(previous)):
+            # Let the next iteration perform the definitive projected-KKT and
+            # rank checks; no approximate early acceptance is used.
+            continue
+    eta = offset + x @ beta
+    values, first, second = loss_rows(
+        eta,
+        likelihood=likelihood,
+        exposure_weight=exposure_weight,
+        noevent_weight=noevent_weight,
+        event_weight=event_weight,
+    )
+    gradient, hessian = moments(x, first, second, device=device)
+    return FitResult(
+        beta,
+        float(np.sum(values)),
+        False,
+        int(max_iter),
+        projected_kkt(beta, gradient, free_dimension),
+        _checked_rank(hessian),
+        False,
+        "offset-block maximum iterations reached",
+    )
+
+
 def fit_model_matrices(
     matrices: list[ModelMatrix] | tuple[ModelMatrix, ...],
     *,
@@ -269,6 +456,7 @@ def fit_model_matrices(
     workers: int,
     cpu_threads_per_worker: int,
     warm_starts: list[np.ndarray | None] | tuple[np.ndarray | None, ...] | None = None,
+    devices: tuple[str, ...] = ("cpu",),
 ) -> list[FitResult]:
     """Deterministic concurrent wrapper around the exact fixed-model solver."""
     ordered = list(matrices)
@@ -276,18 +464,27 @@ def fit_model_matrices(
     if len(starts) != len(ordered):
         raise ValueError("warm-start batch length mismatch")
 
-    def solve(item: tuple[ModelMatrix, np.ndarray | None]) -> FitResult:
+    if not devices:
+        devices = ("cpu",)
+
+    def solve(
+        item: tuple[int, ModelMatrix, np.ndarray | None]
+    ) -> FitResult:
         configure_cpu_threads(max(1, int(cpu_threads_per_worker)))
-        matrix, warm = item
+        index, matrix, warm = item
         return fit_model_matrix(
             matrix,
             likelihood=likelihood,
             tolerance=tolerance,
             max_iter=max_iter,
             warm_start=warm,
+            device=devices[index % len(devices)],
         )
 
-    jobs = list(zip(ordered, starts, strict=True))
+    jobs = [
+        (index, matrix, warm)
+        for index, (matrix, warm) in enumerate(zip(ordered, starts, strict=True))
+    ]
     if len(jobs) <= 1 or workers <= 1:
         return [solve(job) for job in jobs]
     with ThreadPoolExecutor(

@@ -33,6 +33,83 @@ def configure_cpu_threads(count: int) -> None:
         _mkl.set_num_threads_local(int(count))
 
 
+def aggregate_design_rows(
+    x: np.ndarray,
+    exposure_weight: np.ndarray,
+    noevent_weight: np.ndarray,
+    event_weight: np.ndarray,
+    *,
+    copy_input: bool = True,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Sum likelihood weights for identical design rows without approximation."""
+    x = np.array(x, dtype=np.float64, order="C", copy=copy_input)
+    exposure = np.array(exposure_weight, dtype=np.float64, order="C", copy=copy_input)
+    noevent = np.array(noevent_weight, dtype=np.float64, order="C", copy=copy_input)
+    event = np.array(event_weight, dtype=np.float64, order="C", copy=copy_input)
+    if x.ndim != 2 or any(
+        weight.shape != (x.shape[0],) for weight in (exposure, noevent, event)
+    ):
+        raise ValueError("design aggregation shape mismatch")
+    if _cpu_native is not None and hasattr(_cpu_native, "aggregate_design_rows"):
+        count = int(_cpu_native.aggregate_design_rows(x, exposure, noevent, event))
+        return (
+            x[:count].copy(),
+            exposure[:count].copy(),
+            noevent[:count].copy(),
+            event[:count].copy(),
+        )
+    unique, inverse = np.unique(x, axis=0, return_inverse=True)
+    return (
+        unique,
+        np.bincount(inverse, weights=exposure, minlength=len(unique)),
+        np.bincount(inverse, weights=noevent, minlength=len(unique)),
+        np.bincount(inverse, weights=event, minlength=len(unique)),
+    )
+
+
+def aggregate_design_rows_with_groups(
+    x: np.ndarray,
+    exposure_weight: np.ndarray,
+    noevent_weight: np.ndarray,
+    event_weight: np.ndarray,
+    *,
+    copy_input: bool = True,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Aggregate rows and retain each input row's exact output-group index."""
+    x = np.array(x, dtype=np.float64, order="C", copy=copy_input)
+    exposure = np.array(
+        exposure_weight, dtype=np.float64, order="C", copy=copy_input
+    )
+    noevent = np.array(noevent_weight, dtype=np.float64, order="C", copy=copy_input)
+    event = np.array(event_weight, dtype=np.float64, order="C", copy=copy_input)
+    if x.ndim != 2 or any(
+        weight.shape != (x.shape[0],) for weight in (exposure, noevent, event)
+    ):
+        raise ValueError("design aggregation shape mismatch")
+    if _cpu_native is not None and hasattr(_cpu_native, "aggregate_design_rows"):
+        groups = np.empty(x.shape[0], dtype=np.int64)
+        count = int(
+            _cpu_native.aggregate_design_rows(
+                x, exposure, noevent, event, groups
+            )
+        )
+        return (
+            x[:count].copy(),
+            exposure[:count].copy(),
+            noevent[:count].copy(),
+            event[:count].copy(),
+            groups,
+        )
+    unique, inverse = np.unique(x, axis=0, return_inverse=True)
+    return (
+        unique,
+        np.bincount(inverse, weights=exposure, minlength=len(unique)),
+        np.bincount(inverse, weights=noevent, minlength=len(unique)),
+        np.bincount(inverse, weights=event, minlength=len(unique)),
+        inverse.astype(np.int64, copy=False),
+    )
+
+
 def _cuda_library():
     global _CUDA
     if _CUDA is False:
@@ -92,7 +169,13 @@ def moments(
         pointer = ctypes.POINTER(ctypes.c_double)
         gradient.fill(0.0)
         hessian.fill(0.0)
-        tile_rows = max(1, min(262_144, 128 * 1024**2 // max(8, 8 * x.shape[1])))
+        # cuBLAS reuses each tile across all Hessian columns.  Larger tiles
+        # amortize allocation/transfer/handle overhead while x+weighted-x stay
+        # below roughly 1 GiB on each 24 GiB device.
+        tile_rows = max(
+            1,
+            min(1_048_576, 512 * 1024**2 // max(8, 8 * x.shape[1])),
+        )
         status = 0
         for start in range(0, x.shape[0], tile_rows):
             end = min(x.shape[0], start + tile_rows)
@@ -117,10 +200,22 @@ def moments(
             hessian += tile_hessian
         if status == 0:
             return gradient, hessian
-    if _cpu_native is not None:
-        _cpu_native.moments(x, first, second, gradient, hessian)
-        return gradient, hessian
-    return x.T @ first, x.T @ (second[:, None] * x)
+    # Host-resident exact-fit matrices are substantially faster through the
+    # installed MKL/OpenBLAS DGEMM than through a scalar d^2 row scan.  Tiling
+    # bounds the temporary weighted-design buffer without changing any sums
+    # or the optimization problem.
+    gradient.fill(0.0)
+    hessian.fill(0.0)
+    tile_rows = max(
+        1,
+        min(x.shape[0], 512 * 1024**2 // max(8, 8 * x.shape[1])),
+    )
+    for start in range(0, x.shape[0], tile_rows):
+        end = min(x.shape[0], start + tile_rows)
+        tile = x[start:end]
+        gradient += tile.T @ first[start:end]
+        hessian += tile.T @ (second[start:end, None] * tile)
+    return gradient, hessian
 
 
 def moments_batch(
@@ -153,6 +248,27 @@ def moments_batch(
     for index in range(x.shape[0]):
         gradient[index], hessian[index] = moments(x[index], first, second, device="cpu")
     return gradient, hessian
+
+
+def nonnegative_quadratic_gains(
+    gradients: np.ndarray, hessians: np.ndarray
+) -> np.ndarray | None:
+    """Exact active-set gains for a batch of tiny nonnegative quadratics."""
+    gradients = np.ascontiguousarray(gradients, dtype=np.float64)
+    hessians = np.ascontiguousarray(hessians, dtype=np.float64)
+    if (
+        gradients.ndim != 2
+        or hessians.shape
+        != (gradients.shape[0], gradients.shape[1], gradients.shape[1])
+    ):
+        raise ValueError("quadratic gain batch shape mismatch")
+    if _cpu_native is None or not hasattr(
+        _cpu_native, "nonnegative_quadratic_gains"
+    ):
+        return None
+    output = np.empty(gradients.shape[0], dtype=np.float64)
+    _cpu_native.nonnegative_quadratic_gains(gradients, hessians, output)
+    return output
 
 
 def kernel_contributions(

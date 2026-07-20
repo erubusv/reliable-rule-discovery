@@ -30,6 +30,7 @@ class BuildExt(_build_ext):
             "-gencode",
             "arch=compute_89,code=[sm_89,compute_89]",
             str(Path("native") / "pricing_cuda.cu"),
+            "-lcublas",
             "-o",
             str(output_dir / "libcrbstpp_cuda.so"),
         ]

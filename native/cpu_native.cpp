@@ -7,6 +7,7 @@
 #include <cstring>
 #include <limits>
 #include <omp.h>
+#include <unordered_map>
 #include <vector>
 
 namespace {
@@ -34,6 +35,124 @@ bool int64_buffer(PyObject* object, Py_buffer* view, int dimensions, bool writab
         return false;
     }
     return true;
+}
+
+std::uint64_t row_hash(const double* row, std::int64_t columns) {
+    // FNV-1a over canonical IEEE-754 words.  Signed zero is canonicalized
+    // because +0 and -0 define the same design row.  Hash collisions are
+    // always resolved by an exact elementwise comparison below.
+    std::uint64_t hash = 1469598103934665603ULL;
+    for (std::int64_t column = 0; column < columns; ++column) {
+        std::uint64_t bits = 0;
+        if (row[column] != 0.0) std::memcpy(&bits, row + column, sizeof(bits));
+        hash ^= bits;
+        hash *= 1099511628211ULL;
+        hash ^= hash >> 32;
+    }
+    return hash;
+}
+
+bool equal_row(const double* left, const double* right, std::int64_t columns) {
+    for (std::int64_t column = 0; column < columns; ++column) {
+        if (left[column] != right[column]) return false;
+    }
+    return true;
+}
+
+PyObject* aggregate_design_rows(PyObject*, PyObject* args) {
+    PyObject *x_obj, *exposure_obj, *noevent_obj, *event_obj;
+    PyObject* groups_obj = Py_None;
+    if (!PyArg_ParseTuple(args, "OOOO|O", &x_obj, &exposure_obj, &noevent_obj,
+                          &event_obj, &groups_obj)) {
+        return nullptr;
+    }
+    Py_buffer x{}, exposure{}, noevent{}, event{};
+    Py_buffer groups{};
+    if (!double_buffer(x_obj, &x, 2, true)) return nullptr;
+    if (!double_buffer(exposure_obj, &exposure, 1, true)) {
+        PyBuffer_Release(&x);
+        return nullptr;
+    }
+    if (!double_buffer(noevent_obj, &noevent, 1, true)) {
+        PyBuffer_Release(&x);
+        PyBuffer_Release(&exposure);
+        return nullptr;
+    }
+    if (!double_buffer(event_obj, &event, 1, true)) {
+        PyBuffer_Release(&x);
+        PyBuffer_Release(&exposure);
+        PyBuffer_Release(&noevent);
+        return nullptr;
+    }
+    const bool retain_groups = groups_obj != Py_None;
+    if (retain_groups && !int64_buffer(groups_obj, &groups, 1, true)) {
+        PyBuffer_Release(&x);
+        PyBuffer_Release(&exposure);
+        PyBuffer_Release(&noevent);
+        PyBuffer_Release(&event);
+        return nullptr;
+    }
+    const std::int64_t rows = x.shape[0], columns = x.shape[1];
+    if (exposure.shape[0] != rows || noevent.shape[0] != rows ||
+        event.shape[0] != rows || (retain_groups && groups.shape[0] != rows)) {
+        PyErr_SetString(PyExc_ValueError, "design aggregation weight shape mismatch");
+        PyBuffer_Release(&x);
+        PyBuffer_Release(&exposure);
+        PyBuffer_Release(&noevent);
+        PyBuffer_Release(&event);
+        if (retain_groups) PyBuffer_Release(&groups);
+        return nullptr;
+    }
+    auto* xp = static_cast<double*>(x.buf);
+    auto* ep = static_cast<double*>(exposure.buf);
+    auto* np = static_cast<double*>(noevent.buf);
+    auto* yp = static_cast<double*>(event.buf);
+    auto* group = retain_groups ? static_cast<std::int64_t*>(groups.buf) : nullptr;
+    std::int64_t output = 0;
+    bool allocation_failed = false;
+    Py_BEGIN_ALLOW_THREADS
+    try {
+        std::unordered_map<std::uint64_t, std::vector<std::int64_t>> buckets;
+        buckets.reserve(static_cast<std::size_t>(std::min<std::int64_t>(rows, 262144)));
+        for (std::int64_t input = 0; input < rows; ++input) {
+            const double* row = xp + input * columns;
+            auto& representatives = buckets[row_hash(row, columns)];
+            std::int64_t matched = -1;
+            for (const auto candidate : representatives) {
+                if (equal_row(row, xp + candidate * columns, columns)) {
+                    matched = candidate;
+                    break;
+                }
+            }
+            if (matched >= 0) {
+                if (group != nullptr) group[input] = matched;
+                ep[matched] += ep[input];
+                np[matched] += np[input];
+                yp[matched] += yp[input];
+                continue;
+            }
+            if (group != nullptr) group[input] = output;
+            if (output != input) {
+                std::memmove(xp + output * columns, row,
+                             static_cast<std::size_t>(columns) * sizeof(double));
+                ep[output] = ep[input];
+                np[output] = np[input];
+                yp[output] = yp[input];
+            }
+            representatives.push_back(output);
+            ++output;
+        }
+    } catch (const std::bad_alloc&) {
+        allocation_failed = true;
+    }
+    Py_END_ALLOW_THREADS
+    PyBuffer_Release(&x);
+    PyBuffer_Release(&exposure);
+    PyBuffer_Release(&noevent);
+    PyBuffer_Release(&event);
+    if (retain_groups) PyBuffer_Release(&groups);
+    if (allocation_failed) return PyErr_NoMemory();
+    return PyLong_FromLongLong(output);
 }
 
 PyObject* moments(PyObject*, PyObject* args) {
@@ -84,6 +203,127 @@ PyObject* moments(PyObject*, PyObject* args) {
     Py_END_ALLOW_THREADS
     PyBuffer_Release(&x); PyBuffer_Release(&first); PyBuffer_Release(&second);
     PyBuffer_Release(&gradient); PyBuffer_Release(&hessian);
+    Py_RETURN_NONE;
+}
+
+PyObject* nonnegative_quadratic_gains(PyObject*, PyObject* args) {
+    PyObject *gradient_obj, *hessian_obj, *output_obj;
+    if (!PyArg_ParseTuple(args, "OOO", &gradient_obj, &hessian_obj, &output_obj)) {
+        return nullptr;
+    }
+    Py_buffer gradient{}, hessian{}, output{};
+    if (!double_buffer(gradient_obj, &gradient, 2, false)) return nullptr;
+    if (!double_buffer(hessian_obj, &hessian, 3, false)) {
+        PyBuffer_Release(&gradient);
+        return nullptr;
+    }
+    if (!double_buffer(output_obj, &output, 1, true)) {
+        PyBuffer_Release(&gradient);
+        PyBuffer_Release(&hessian);
+        return nullptr;
+    }
+    const std::int64_t batches = gradient.shape[0], dimension = gradient.shape[1];
+    const bool valid = hessian.shape[0] == batches &&
+                       hessian.shape[1] == dimension &&
+                       hessian.shape[2] == dimension &&
+                       output.shape[0] == batches && dimension >= 1 && dimension <= 16;
+    if (!valid) {
+        PyErr_SetString(PyExc_ValueError, "quadratic gain buffer shape mismatch");
+        PyBuffer_Release(&gradient);
+        PyBuffer_Release(&hessian);
+        PyBuffer_Release(&output);
+        return nullptr;
+    }
+    const auto* gp = static_cast<const double*>(gradient.buf);
+    const auto* hp = static_cast<const double*>(hessian.buf);
+    auto* op = static_cast<double*>(output.buf);
+    Py_BEGIN_ALLOW_THREADS
+    #pragma omp parallel for schedule(static)
+    for (std::int64_t batch = 0; batch < batches; ++batch) {
+        const double* g = gp + batch * dimension;
+        const double* h = hp + batch * dimension * dimension;
+        double best = 0.0;
+        const std::uint64_t limit = 1ULL << dimension;
+        for (std::uint64_t mask = 1; mask < limit; ++mask) {
+            int active[16];
+            int count = 0;
+            for (int index = 0; index < dimension; ++index) {
+                if (mask & (1ULL << index)) active[count++] = index;
+            }
+            double system[16][17]{};
+            for (int row = 0; row < count; ++row) {
+                for (int column = 0; column < count; ++column) {
+                    system[row][column] =
+                        0.5 * (h[active[row] * dimension + active[column]] +
+                               h[active[column] * dimension + active[row]]);
+                }
+                system[row][count] = -g[active[row]];
+            }
+            bool nonsingular = true;
+            for (int pivot = 0; pivot < count; ++pivot) {
+                int selected = pivot;
+                for (int row = pivot + 1; row < count; ++row) {
+                    if (std::abs(system[row][pivot]) >
+                        std::abs(system[selected][pivot])) selected = row;
+                }
+                if (std::abs(system[selected][pivot]) <= 1.0e-18) {
+                    nonsingular = false;
+                    break;
+                }
+                if (selected != pivot) {
+                    for (int column = pivot; column <= count; ++column) {
+                        std::swap(system[pivot][column], system[selected][column]);
+                    }
+                }
+                const double scale = system[pivot][pivot];
+                for (int column = pivot; column <= count; ++column) {
+                    system[pivot][column] /= scale;
+                }
+                for (int row = 0; row < count; ++row) {
+                    if (row == pivot) continue;
+                    const double factor = system[row][pivot];
+                    for (int column = pivot; column <= count; ++column) {
+                        system[row][column] -= factor * system[pivot][column];
+                    }
+                }
+            }
+            if (!nonsingular) continue;
+            double delta[16]{};
+            bool feasible = true;
+            for (int row = 0; row < count; ++row) {
+                const double value = system[row][count];
+                if (value < -1.0e-10) {
+                    feasible = false;
+                    break;
+                }
+                delta[active[row]] = std::max(0.0, value);
+            }
+            if (!feasible) continue;
+            for (int index = 0; index < dimension && feasible; ++index) {
+                if (mask & (1ULL << index)) continue;
+                double stationarity = g[index];
+                for (int column = 0; column < dimension; ++column) {
+                    stationarity += h[index * dimension + column] * delta[column];
+                }
+                if (stationarity < -1.0e-8) feasible = false;
+            }
+            if (!feasible) continue;
+            double linear = 0.0, quadratic = 0.0;
+            for (int row = 0; row < dimension; ++row) {
+                linear += g[row] * delta[row];
+                for (int column = 0; column < dimension; ++column) {
+                    quadratic += delta[row] * h[row * dimension + column] *
+                                 delta[column];
+                }
+            }
+            best = std::max(best, -linear - 0.5 * quadratic);
+        }
+        op[batch] = best;
+    }
+    Py_END_ALLOW_THREADS
+    PyBuffer_Release(&gradient);
+    PyBuffer_Release(&hessian);
+    PyBuffer_Release(&output);
     Py_RETURN_NONE;
 }
 
@@ -333,6 +573,7 @@ PyObject* kernel_contributions(PyObject*, PyObject* args) {
             }
         }
         std::int64_t output = 0;
+        Py_BEGIN_ALLOW_THREADS
         for (std::int64_t i = 0; i < count; ++i) {
             if (sp[i] > window) continue;
             const auto entity = ep[i];
@@ -344,6 +585,7 @@ PyObject* kernel_contributions(PyObject*, PyObject* args) {
                 ++output;
             }
         }
+        Py_END_ALLOW_THREADS
         PyBuffer_Release(&entities); PyBuffer_Release(&times); PyBuffer_Release(&spans);
         PyBuffer_Release(&starts); PyBuffer_Release(&ends); PyBuffer_Release(&offsets);
         PyBuffer_Release(&basis); PyBuffer_Release(&rows); PyBuffer_Release(&values);
@@ -408,6 +650,7 @@ PyObject* completion_events(PyObject*, PyObject* args) {
             end[source] = op[source + 1];
         }
         std::int64_t output = 0;
+        Py_BEGIN_ALLOW_THREADS
         while (true) {
             bool exhausted = false;
             std::int64_t candidate_entity = std::numeric_limits<std::int64_t>::min();
@@ -461,6 +704,7 @@ PyObject* completion_events(PyObject*, PyObject* args) {
             }
             position = group_end;
         }
+        Py_END_ALLOW_THREADS
         PyBuffer_Release(&entities); PyBuffer_Release(&times); PyBuffer_Release(&offsets);
         PyBuffer_Release(&output_entities); PyBuffer_Release(&output_times); PyBuffer_Release(&output_spans);
         return PyLong_FromLongLong(output);
@@ -473,6 +717,8 @@ completion_fail:
 
 PyMethodDef methods[] = {
     {"moments", moments, METH_VARARGS, "Deterministic gradient/Fisher moments."},
+    {"nonnegative_quadratic_gains", nonnegative_quadratic_gains, METH_VARARGS, "Exact batched nonnegative quadratic gains."},
+    {"aggregate_design_rows", aggregate_design_rows, METH_VARARGS, "Losslessly aggregate identical design rows."},
     {"set_num_threads", set_num_threads, METH_VARARGS, "Set deterministic OpenMP worker count."},
     {"future_rows", future_rows, METH_VARARGS, "Strict-future footprint rows."},
     {"accumulate_kernel", accumulate_kernel, METH_VARARGS, "Accumulate newly admitted kernel completions."},

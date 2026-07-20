@@ -1,4 +1,5 @@
 #include <cuda_runtime.h>
+#include <cublas_v2.h>
 #include <cstdint>
 
 namespace {
@@ -38,6 +39,15 @@ __global__ void hessian_kernel(
         __syncthreads();
     }
     if (threadIdx.x == 0) hessian[flat] = partial[0];
+}
+
+__global__ void weight_design_kernel(
+    const double* x, const double* second, std::int64_t rows,
+    std::int64_t columns, double* weighted) {
+    const std::int64_t index =
+        static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const std::int64_t count = rows * columns;
+    if (index < count) weighted[index] = x[index] * second[index / columns];
 }
 
 __global__ void gradient_batch_kernel(
@@ -91,29 +101,56 @@ extern "C" int crbstpp_cuda_moments(
     const double* host_second, std::int64_t rows, std::int64_t columns,
     double* host_gradient, double* host_hessian) {
     if (cudaSetDevice(device) != cudaSuccess) return 1;
-    double *x = nullptr, *first = nullptr, *second = nullptr, *gradient = nullptr, *hessian = nullptr;
+    double *x = nullptr, *weighted = nullptr, *first = nullptr, *second = nullptr,
+           *gradient = nullptr, *hessian = nullptr;
+    cublasHandle_t handle = nullptr;
     const int threads = 256;
     const std::size_t x_bytes = sizeof(double) * rows * columns;
     const std::size_t row_bytes = sizeof(double) * rows;
     const std::size_t gradient_bytes = sizeof(double) * columns;
     const std::size_t hessian_bytes = sizeof(double) * columns * columns;
-    if (cudaMalloc(&x, x_bytes) != cudaSuccess || cudaMalloc(&first, row_bytes) != cudaSuccess ||
+    if (cudaMalloc(&x, x_bytes) != cudaSuccess ||
+        cudaMalloc(&weighted, x_bytes) != cudaSuccess ||
+        cudaMalloc(&first, row_bytes) != cudaSuccess ||
         cudaMalloc(&second, row_bytes) != cudaSuccess || cudaMalloc(&gradient, gradient_bytes) != cudaSuccess ||
         cudaMalloc(&hessian, hessian_bytes) != cudaSuccess) goto fail;
     if (cudaMemcpy(x, host_x, x_bytes, cudaMemcpyHostToDevice) != cudaSuccess ||
         cudaMemcpy(first, host_first, row_bytes, cudaMemcpyHostToDevice) != cudaSuccess ||
         cudaMemcpy(second, host_second, row_bytes, cudaMemcpyHostToDevice) != cudaSuccess) goto fail;
-    gradient_kernel<<<columns, threads, threads * sizeof(double)>>>(
-        x, first, rows, columns, gradient);
-    hessian_kernel<<<columns * columns, threads, threads * sizeof(double)>>>(
-        x, second, rows, columns, hessian);
+    {
+        const std::int64_t count = rows * columns;
+        const int blocks = static_cast<int>((count + threads - 1) / threads);
+        weight_design_kernel<<<blocks, threads>>>(
+            x, second, rows, columns, weighted);
+    }
+    if (cudaGetLastError() != cudaSuccess ||
+        cublasCreate(&handle) != CUBLAS_STATUS_SUCCESS) goto fail;
+    {
+        const double one = 1.0, zero = 0.0;
+        // Row-major n x d buffers are column-major d x n views.  Therefore
+        // GEMV(N) is X^T f and GEMM(N,T) is X^T diag(w) X.
+        if (cublasDgemv(
+                handle, CUBLAS_OP_N, static_cast<int>(columns),
+                static_cast<int>(rows), &one, x, static_cast<int>(columns),
+                first, 1, &zero, gradient, 1) != CUBLAS_STATUS_SUCCESS ||
+            cublasDgemm(
+                handle, CUBLAS_OP_N, CUBLAS_OP_T,
+                static_cast<int>(columns), static_cast<int>(columns),
+                static_cast<int>(rows), &one, x, static_cast<int>(columns),
+                weighted, static_cast<int>(columns), &zero, hessian,
+                static_cast<int>(columns)) != CUBLAS_STATUS_SUCCESS) goto fail;
+    }
     if (cudaDeviceSynchronize() != cudaSuccess ||
         cudaMemcpy(host_gradient, gradient, gradient_bytes, cudaMemcpyDeviceToHost) != cudaSuccess ||
         cudaMemcpy(host_hessian, hessian, hessian_bytes, cudaMemcpyDeviceToHost) != cudaSuccess) goto fail;
-    cudaFree(x); cudaFree(first); cudaFree(second); cudaFree(gradient); cudaFree(hessian);
+    cublasDestroy(handle);
+    cudaFree(x); cudaFree(weighted); cudaFree(first); cudaFree(second);
+    cudaFree(gradient); cudaFree(hessian);
     return 0;
 fail:
-    if (x) cudaFree(x); if (first) cudaFree(first); if (second) cudaFree(second);
+    if (handle) cublasDestroy(handle);
+    if (x) cudaFree(x); if (weighted) cudaFree(weighted);
+    if (first) cudaFree(first); if (second) cudaFree(second);
     if (gradient) cudaFree(gradient); if (hessian) cudaFree(hessian);
     return 2;
 }

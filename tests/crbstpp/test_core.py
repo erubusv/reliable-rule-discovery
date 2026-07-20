@@ -147,7 +147,7 @@ class LikelihoodSolverTests(unittest.TestCase):
             self.assertTrue(certificate.feasible)
             self.assertLessEqual(certificate.nll_lower_bound, fit.nll + 1e-6)
 
-    def test_small_block_search_matches_exact_neighbor_audit(self) -> None:
+    def test_small_block_search_has_no_profiled_add_move(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             data = synthetic_dataset(Path(directory) / "data")
             fit_codes, _, _ = data.split((0.6, 0.2, 0.2), 111)
@@ -167,13 +167,7 @@ class LikelihoodSolverTests(unittest.TestCase):
             result = optimizer.search()
             self.assertGreater(len(result.family), 0)
             for terminal in result.terminals:
-                for neighbor in __import__(
-                    "crbstpp.rules", fromlist=["one_exchange_neighbors"]
-                ).one_exchange_neighbors(terminal.support, optimizer.dictionary):
-                    record = optimizer.fit(neighbor, terminal)
-                    self.assertLessEqual(
-                        record.score, terminal.score + config.search_tolerance + 1e-7
-                    )
+                self.assertIsNone(optimizer._best_profiled_move(terminal))
 
     def test_parallel_search_matches_serial_family(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

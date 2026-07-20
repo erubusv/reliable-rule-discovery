@@ -199,6 +199,7 @@ def fit_ensemble(
             cpu_threads_per_worker=max(
                 1, config.pricing_workers // config.exact_workers
             ),
+            devices=config.pricing_devices or ("cpu",),
         )
         for matrix, fit in zip(matrix_wave, fit_wave, strict=True):
             if fit.converged:
@@ -255,6 +256,7 @@ def fit_ensemble(
             likelihood=dataset_context.dataset.likelihood,
             tolerance=config.solver_tolerance,
             max_iter=config.solver_max_iter,
+            device=(config.pricing_devices or ("cpu",))[0],
         )
         if baseline_fit.converged:
             baseline_test_matrix = test_engine.model_matrix(test_context, EMPTY_SUPPORT)
