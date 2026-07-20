@@ -26,9 +26,14 @@ from crbstpp.native import (
 from crbstpp.response import Context, ResponseEngine
 from crbstpp.config import RunConfig
 from crbstpp.data import Dataset, write_dataset
+from crbstpp.dual import offset_dual_certificate
 from crbstpp.rules import RuleIdentity, Support
-from crbstpp.search import SupportOptimizer, _nonnegative_quadratic_gain
-from crbstpp.solver import _objective, fit_model_matrix
+from crbstpp.search import (
+    SupportOptimizer,
+    _RestrictedAddBounds,
+    _nonnegative_quadratic_gain,
+)
+from crbstpp.solver import _objective, fit_model_matrix, fit_offset_design
 
 from tests.crbstpp.test_core import synthetic_dataset
 
@@ -135,6 +140,199 @@ class NumericalParityTests(unittest.TestCase):
                 optimizer.diagnostics.restricted_problem_hits,
                 len(optimizer.dictionary) - len(unsigned),
             )
+
+    def test_offset_dual_certificate_contains_exact_restricted_optimum(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            data = synthetic_dataset(Path(directory) / "data", 120)
+            fit_codes, _, _ = data.split((0.6, 0.2, 0.2), 111)
+            config = RunConfig(
+                dataset=str(data.root),
+                q_max=2,
+                impact_lag=3,
+                knot_count=2,
+                formation_windows=(0, 1, 2),
+                solver_tolerance=1e-8,
+                solver_max_iter=150,
+                cache_bytes=32 * 1024**2,
+                early_warning_horizon=3,
+                pricing_devices=(),
+            )
+            optimizer = SupportOptimizer(Context.make(data, fit_codes), config)
+            empty = optimizer.records[Support(())]
+            certified = 0
+            for rule in optimizer.dictionary:
+                problem = optimizer._restricted_add_problem(empty, rule)
+                if problem is None:
+                    continue
+                design = problem.unsigned_design.copy()
+                if rule.sign < 0:
+                    design[:, -config.knot_count :] *= -1.0
+                exact = fit_offset_design(
+                    design,
+                    problem.offset,
+                    problem.exposure,
+                    problem.noevent,
+                    problem.event,
+                    likelihood=data.likelihood,
+                    free_dimension=problem.free_dimension,
+                    tolerance=config.solver_tolerance,
+                    max_iter=config.solver_max_iter,
+                )
+                if not exact.converged:
+                    continue
+                certificate = offset_dual_certificate(
+                    design,
+                    problem.offset,
+                    problem.exposure,
+                    problem.noevent,
+                    problem.event,
+                    likelihood=data.likelihood,
+                    beta=exact.coefficients,
+                    free_dimension=problem.free_dimension,
+                    tolerance=1e-7,
+                    max_iter=500,
+                )
+                if not certificate.feasible:
+                    continue
+                self.assertLessEqual(
+                    certificate.nll_lower_bound,
+                    exact.nll + 1e-7 * max(1.0, abs(exact.nll)),
+                )
+                self.assertAlmostEqual(
+                    certificate.nll_lower_bound, exact.nll, places=5
+                )
+                certified += 1
+                if certified == 4:
+                    break
+            self.assertGreater(certified, 0)
+
+    def test_poisson_offset_dual_certificate_matches_exact_optimum(self) -> None:
+        rows = 60
+        index = np.arange(rows)
+        design = np.column_stack(
+            (
+                np.where(index % 2 == 0, 1.0, -1.0),
+                0.2 + (index % 5) / 5.0,
+            )
+        )
+        offset = -2.5 + 0.01 * index
+        event = np.zeros(rows, dtype=np.float64)
+        event[[1, 5, 8, 13, 21, 34, 55]] = 1.0
+        exposure = np.ones(rows, dtype=np.float64)
+        exact = fit_offset_design(
+            design,
+            offset,
+            exposure,
+            exposure,
+            event,
+            likelihood="poisson",
+            free_dimension=1,
+            tolerance=1e-8,
+            max_iter=200,
+        )
+        self.assertTrue(exact.converged, exact.message)
+        certificate = offset_dual_certificate(
+            design,
+            offset,
+            exposure,
+            exposure,
+            event,
+            likelihood="poisson",
+            beta=exact.coefficients,
+            free_dimension=1,
+            tolerance=1e-7,
+            max_iter=500,
+        )
+        self.assertTrue(certificate.feasible)
+        self.assertLessEqual(certificate.nll_lower_bound, exact.nll + 1e-7)
+        self.assertAlmostEqual(certificate.nll_lower_bound, exact.nll, places=6)
+
+    def test_restricted_add_bound_contains_exact_block_score(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            data = synthetic_dataset(Path(directory) / "data", 120)
+            fit_codes, _, _ = data.split((0.6, 0.2, 0.2), 111)
+            config = RunConfig(
+                dataset=str(data.root),
+                q_max=2,
+                impact_lag=3,
+                knot_count=2,
+                formation_windows=(0, 1, 2),
+                solver_tolerance=1e-8,
+                solver_max_iter=150,
+                cache_bytes=32 * 1024**2,
+                early_warning_horizon=3,
+                pricing_devices=(),
+            )
+            optimizer = SupportOptimizer(Context.make(data, fit_codes), config)
+            empty = optimizer.records[Support(())]
+            checked = 0
+            for rule in optimizer.dictionary:
+                bound = optimizer._restricted_add_bound(empty, rule)
+                exact = optimizer._restricted_add_score(empty, rule)
+                if not np.isfinite(exact):
+                    continue
+                slack = 1e-7 * max(1.0, abs(exact))
+                self.assertLessEqual(bound.lower_score, exact + slack)
+                self.assertLessEqual(exact, bound.upper_score + slack)
+                checked += 1
+            self.assertGreater(checked, 0)
+
+    def test_lazy_add_stops_after_incumbent_dominates_remaining_bounds(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            data = synthetic_dataset(Path(directory) / "data", 90)
+            fit_codes, _, _ = data.split((0.6, 0.2, 0.2), 111)
+            config = RunConfig(
+                dataset=str(data.root),
+                q_max=1,
+                impact_lag=3,
+                knot_count=2,
+                formation_windows=(0,),
+                solver_tolerance=1e-8,
+                solver_max_iter=150,
+                cache_bytes=16 * 1024**2,
+                early_warning_horizon=3,
+                pricing_devices=(),
+            )
+            optimizer = SupportOptimizer(Context.make(data, fit_codes), config)
+            empty = optimizer.records[Support(())]
+            rules = optimizer.dictionary[:2]
+            ranked = [(9.0, 5.0, rules[0]), (8.0, 4.0, rules[1])]
+            bounds = {
+                rules[0]: _RestrictedAddBounds(rules[0], -1.0, 7.0, -1.0, 7.0, None),
+                rules[1]: _RestrictedAddBounds(rules[1], -1.0, 5.0, -1.0, 5.0, None),
+            }
+
+            def fitted(support: Support, source: object) -> object:
+                return type(empty)(support, empty.matrix, empty.fit, empty.penalty, 6.0)
+
+            with (
+                mock.patch.object(
+                    optimizer, "_rank_profiled_identities", return_value=ranked
+                ),
+                mock.patch.object(
+                    optimizer, "_safe_identity_survivors", return_value=rules
+                ),
+                mock.patch.object(
+                    optimizer,
+                    "_restricted_add_bound",
+                    side_effect=lambda current, rule: bounds[rule],
+                ),
+                mock.patch.object(
+                    optimizer,
+                    "_restricted_add_score",
+                    side_effect=lambda current, rule, device=None: 6.0
+                    if rule == rules[0]
+                    else 4.0,
+                ) as exact,
+                mock.patch.object(optimizer, "fit", side_effect=fitted),
+            ):
+                result = optimizer._best_restricted_addition(
+                    empty, antecedents=set(optimizer.skeletons)
+                )
+            self.assertIsNotNone(result)
+            self.assertEqual(result.support, empty.support.add(rules[0]))
+            self.assertEqual(exact.call_count, 1)
+            self.assertEqual(optimizer.diagnostics.lazy_exact_refits_avoided, 1)
 
     def test_restricted_add_audits_one_identity_per_skeleton(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

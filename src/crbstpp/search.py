@@ -10,7 +10,13 @@ from itertools import combinations
 import numpy as np
 
 from .config import RunConfig
-from .dual import DualCertificate, DualGeometry, dual_certificate, dual_geometry
+from .dual import (
+    DualCertificate,
+    DualGeometry,
+    dual_certificate,
+    dual_geometry,
+    offset_dual_certificate,
+)
 from .likelihood import loss_grid_sparse_event_derivatives, loss_rows
 from .native import (
     aggregate_design_rows,
@@ -42,6 +48,16 @@ class ProposalBounds:
     upper_gain: float
     dual: DualCertificate | None
     warm_coefficients: np.ndarray
+
+
+@dataclass(frozen=True)
+class _RestrictedAddBounds:
+    rule: RuleIdentity
+    lower_score: float
+    upper_score: float
+    lower_gain: float
+    upper_gain: float
+    dual: DualCertificate | None
 
 
 @dataclass
@@ -91,6 +107,12 @@ class SearchDiagnostics:
     standalone_branch_rejections: int = 0
     multi_source_roots: int = 0
     path_compression_hits: int = 0
+    restricted_bound_evaluations: int = 0
+    restricted_dual_screens: int = 0
+    restricted_dual_fail_open: int = 0
+    restricted_relaxation_screens: int = 0
+    lazy_exact_refits_avoided: int = 0
+    lazy_bound_stops: int = 0
 
 
 @dataclass(frozen=True)
@@ -156,12 +178,12 @@ class SupportOptimizer:
     Each antecedent skeleton owns exactly one W/sign identity profiled once at
     the D_fit baseline.  Empty and every objective-admissible single-skeleton
     root then ascend a shared support DAG over that frozen dictionary.  Every
-    score-positive inactive identity and every active drop receives a restricted
-    exact audit before termination.  Every accepted move improves the fully
-    refitted MDL objective.  Positive atoms and all unique terminals reach
-    certification.  The terminal claim is frozen-dictionary block-score
-    restricted add/drop stationarity, not all-identity one-exchange stationarity
-    or a global optimum.
+    score-positive inactive identity is either removed by a verified upper bound
+    or receives a restricted exact audit; every active drop is audited exactly.
+    Every accepted move improves the fully refitted MDL objective.  Positive
+    atoms and all unique terminals reach certification.  The terminal claim is
+    frozen-dictionary block-score restricted add/drop stationarity, not
+    all-identity one-exchange stationarity or a global optimum.
     """
 
     def __init__(self, context: Context, config: RunConfig):
@@ -224,6 +246,9 @@ class SupportOptimizer:
         self._restricted_add_scores: dict[
             Support, dict[RuleIdentity, float]
         ] = {}
+        self._restricted_add_bounds: dict[
+            Support, dict[RuleIdentity, _RestrictedAddBounds]
+        ] = {}
         self._restricted_drop_scores: dict[Support, dict[Support, float]] = {}
         self._restricted_add_problems: dict[
             Support,
@@ -283,6 +308,7 @@ class SupportOptimizer:
         self._directional_upper_cache.clear()
         self._block_price_cache.clear()
         self._restricted_add_scores.clear()
+        self._restricted_add_bounds.clear()
         self._restricted_drop_scores.clear()
         self._restricted_add_problems.clear()
         self._restricted_add_events.clear()
@@ -2095,83 +2121,182 @@ class SupportOptimizer:
         *,
         antecedents: set[Antecedent],
     ) -> SupportRecord | None:
-        """Exactly audit the score-profiled W/sign of every skeleton."""
+        """Return the certified best score-admissible restricted add block.
+
+        A hierarchy-aware saturated relaxation first removes whole skeletons
+        whose *fully reoptimized* support cannot beat the incumbent.  A
+        support-conditioned Fenchel certificate then upper-bounds each remaining
+        frozen-current block optimum.  Exact block fits are performed lazily in
+        decreasing upper-bound order and stop as soon as the exact incumbent is
+        no worse than every unvisited bound.  Certificate failure always leaves
+        the candidate alive.
+        """
         acceptance = current.score
         identities = self._inactive_identities(current.support, antecedents)
         ranked = self._rank_profiled_identities(current, identities)
         admissible = [
             item for item in ranked if item[0] > self.config.search_tolerance
         ]
-        devices = self.config.pricing_devices
-        wave_size = max(
-            1,
-            min(
-                self.config.exact_workers,
-                len(devices) if devices else self.config.exact_workers,
-            ),
-        )
-        threads_per_audit = max(1, self.config.pricing_workers // wave_size)
+        if not admissible:
+            return None
 
-        def audit(
-            indexed: tuple[int, tuple[float, float, RuleIdentity]],
-        ) -> tuple[float, RuleIdentity]:
-            index, (_, _, rule) = indexed
-            configure_cpu_threads(threads_per_audit)
-            device = devices[index % len(devices)] if devices else "cpu"
-            return self._restricted_add_score(
-                current, rule, device=device
-            ), rule
+        rules = tuple(item[2] for item in admissible)
+        safe = set(self._safe_identity_survivors(current, rules, acceptance))
+        with self._state_lock:
+            self.diagnostics.restricted_relaxation_screens += len(rules) - len(safe)
+        admissible = [item for item in admissible if item[2] in safe]
+        if not admissible:
+            return None
 
-        def prepare(
-            indexed: tuple[int, tuple[float, float, RuleIdentity]],
-        ) -> None:
-            configure_cpu_threads(threads_per_audit)
-            _, (_, _, rule) = indexed
-            self._restricted_add_problem(current, rule)
+        # Candidate bounds are much cheaper than the iterative exact block
+        # solves, but still operate on disjoint compressed sparse problems.  A
+        # small deterministic worker wave shares the available physical cores
+        # without changing any certificate or decision.
+        worker_count = max(1, min(self.config.exact_workers, len(admissible)))
+        threads_per_bound = max(1, self.config.pricing_workers // worker_count)
 
-        executor = (
-            ThreadPoolExecutor(
-                max_workers=wave_size,
-                thread_name_prefix="crbstpp-restricted-add",
-            )
-            if wave_size > 1
-            else None
-        )
-        try:
-            for start in range(0, len(admissible), wave_size):
-                wave = admissible[start : start + wave_size]
-                # Materialize every distinct unsigned (antecedent, W) problem
-                # before launching the sign-specific Newton solves.  Without
-                # this one worker builds the sparse problem while its paired
-                # device waits on the single-flight event.
-                indexed = list(enumerate(wave, start=start))
-                if executor is not None and len(indexed) > 1:
-                    list(executor.map(prepare, indexed))
-                    audited = list(executor.map(audit, indexed))
-                else:
-                    if indexed:
-                        prepare(indexed[0])
-                    audited = [audit(indexed[0])] if indexed else []
+        def certify(
+            item: tuple[float, float, RuleIdentity],
+        ) -> tuple[float, float, RuleIdentity, _RestrictedAddBounds]:
+            configure_cpu_threads(threads_per_bound)
+            net, gain, rule = item
+            return net, gain, rule, self._restricted_add_bound(current, rule)
+
+        if worker_count > 1:
+            with ThreadPoolExecutor(
+                max_workers=worker_count,
+                thread_name_prefix="crbstpp-restricted-bound",
+            ) as executor:
+                bounded = list(executor.map(certify, admissible))
+        else:
+            bounded = [certify(item) for item in admissible]
+
+        viable = []
+        for net, gain, rule, bound in bounded:
+            if bound.upper_score <= acceptance + self.config.search_tolerance:
                 with self._state_lock:
-                    self.diagnostics.restricted_add_audits += len(audited)
-                improving = [
-                    item
-                    for item in audited
-                    if item[0] > acceptance + self.config.search_tolerance
-                ]
-                if not improving:
-                    continue
-                _, rule = sorted(improving, key=lambda item: (-item[0], item[1]))[0]
-                record = self.fit(current.support.add(rule), current)
-                if record.score <= acceptance + self.config.search_tolerance:
-                    raise AssertionError(
-                        "full refit degraded an improving restricted add block"
-                    )
-                return record
-        finally:
-            if executor is not None:
-                executor.shutdown(wait=True)
-        return None
+                    if bound.dual is None:
+                        self.diagnostics.restricted_relaxation_screens += 1
+                    else:
+                        self.diagnostics.restricted_dual_screens += 1
+                continue
+            viable.append((bound.upper_score, net, gain, rule))
+        viable.sort(key=lambda item: (-item[0], -item[1], item[3]))
+        if not viable:
+            return None
+
+        devices = self.config.pricing_devices or ("cpu",)
+        best_score = acceptance
+        best_rule: RuleIdentity | None = None
+        audited = 0
+        for index, (upper_score, _, _, rule) in enumerate(viable):
+            if upper_score <= best_score + self.config.search_tolerance:
+                with self._state_lock:
+                    self.diagnostics.lazy_exact_refits_avoided += len(viable) - index
+                    self.diagnostics.lazy_bound_stops += 1
+                break
+            score = self._restricted_add_score(
+                current, rule, device=devices[index % len(devices)]
+            )
+            audited += 1
+            if score > best_score + self.config.search_tolerance or (
+                best_rule is not None
+                and abs(score - best_score) <= self.config.search_tolerance
+                and rule < best_rule
+            ):
+                best_score = score
+                best_rule = rule
+        with self._state_lock:
+            self.diagnostics.restricted_add_audits += audited
+        if best_rule is None:
+            return None
+        record = self.fit(current.support.add(best_rule), current)
+        if record.score <= acceptance + self.config.search_tolerance:
+            raise AssertionError(
+                "full refit degraded an improving restricted add block"
+            )
+        return record
+
+    def _restricted_add_bound(
+        self, current: SupportRecord, rule: RuleIdentity
+    ) -> _RestrictedAddBounds:
+        """Certified score sandwich for one frozen-current add problem."""
+        with self._state_lock:
+            cached = self._restricted_add_bounds.get(current.support, {}).get(rule)
+            if cached is not None:
+                return cached
+            self.diagnostics.restricted_bound_evaluations += 1
+
+        trial = current.support.add(rule)
+        penalty = self.objective.structural_penalty(trial)
+        lower_score = support_score(
+            baseline_nll=self.baseline_nll,
+            fit_nll=current.fit.nll,
+            penalty=penalty,
+        )
+        problem = self._restricted_add_problem(current, rule)
+        certificate: DualCertificate | None = None
+        upper_score = self.safe_upper_score(trial)
+        if problem is not None:
+            design = problem.unsigned_design
+            if rule.sign < 0:
+                design = design.copy()
+                design[:, -self.config.knot_count :] *= -1.0
+            certificate = offset_dual_certificate(
+                design,
+                problem.offset,
+                problem.exposure,
+                problem.noevent,
+                problem.event,
+                likelihood=self.context.dataset.likelihood,
+                beta=np.zeros(design.shape[1], dtype=np.float64),
+                free_dimension=problem.free_dimension,
+                tolerance=min(1.0e-9, self.config.solver_tolerance * 0.01),
+                max_iter=min(64, self.config.solver_max_iter),
+            )
+            valid = (
+                certificate.feasible
+                and certificate.nll_lower_bound
+                <= problem.old_nll
+                + 1.0e-7 * max(1.0, abs(problem.old_nll))
+            )
+            if valid:
+                restricted_lower_nll = (
+                    current.fit.nll
+                    + certificate.nll_lower_bound
+                    - problem.old_nll
+                )
+                dual_upper = support_score(
+                    baseline_nll=self.baseline_nll,
+                    fit_nll=restricted_lower_nll,
+                    penalty=penalty,
+                )
+                upper_score = min(upper_score, dual_upper)
+            else:
+                certificate = None
+                with self._state_lock:
+                    self.diagnostics.restricted_dual_fail_open += 1
+        if upper_score + 1.0e-7 * max(1.0, abs(upper_score)) < lower_score:
+            # A numerical certificate is never allowed to remove work if its
+            # primal/dual sandwich is inconsistent.  The analytic relaxation is
+            # independent and remains the fail-open bound.
+            certificate = None
+            upper_score = self.safe_upper_score(trial)
+            with self._state_lock:
+                self.diagnostics.restricted_dual_fail_open += 1
+        result = _RestrictedAddBounds(
+            rule=rule,
+            lower_score=lower_score,
+            upper_score=upper_score,
+            lower_gain=lower_score - current.score,
+            upper_gain=upper_score - current.score,
+            dual=certificate,
+        )
+        with self._state_lock:
+            incumbent = self._restricted_add_bounds.setdefault(
+                current.support, {}
+            ).setdefault(rule, result)
+        return incumbent
 
     def _restricted_add_problem(
         self, current: SupportRecord, rule: RuleIdentity
@@ -2502,6 +2627,13 @@ class SupportOptimizer:
         if len(self._profiled_dictionary) != len(self.skeletons):
             raise AssertionError("baseline W/sign profile did not cover every skeleton")
         admissible = self._objective_root_candidates(ranked)
+        if admissible:
+            safe_rules = set(
+                self._safe_identity_survivors(
+                    empty, tuple(item[2] for item in admissible), 0.0
+                )
+            )
+            admissible = [item for item in admissible if item[2] in safe_rules]
         standalone: dict[Support, SupportRecord] = {}
         for start in range(0, len(admissible), self.config.exact_workers):
             wave = admissible[start : start + self.config.exact_workers]
@@ -2555,11 +2687,11 @@ class SupportOptimizer:
         """Audit score-admissible adds and every active drop.
 
         Each inactive skeleton selects one W/sign under the conditional-Fisher
-        block score.  Every positive profiled identity and every active drop is
-        then audited with common effects frozen.  Terminal states are profiled
-        block-score restricted add/drop fixed points, not exact one-exchange
-        optima: an unprofiled identity or later W/sign replacement is not
-        certified.
+        block score.  Every positive profiled identity is then either safely
+        bounded below the incumbent or audited with common effects frozen; every
+        active drop is audited.  Terminal states are profiled block-score
+        restricted add/drop fixed points, not exact one-exchange optima: an
+        unprofiled identity or later W/sign replacement is not certified.
         """
         # Delayed column generation prices only the finite basin working set
         # during coordinate moves.  A complete outside-dictionary audit is
@@ -2641,6 +2773,7 @@ class SupportOptimizer:
                     # This exact transition is now immutable in the shared DAG;
                     # per-identity audit values for the state can be released.
                     self._restricted_add_scores.pop(current.support, None)
+                    self._restricted_add_bounds.pop(current.support, None)
                     self._restricted_drop_scores.pop(current.support, None)
                     self._restricted_add_problems.pop(current.support, None)
                     if next_record is None:
