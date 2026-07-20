@@ -2167,13 +2167,15 @@ class SupportOptimizer:
         ]
         devices = self.config.pricing_devices
         if devices:
-            # Dense response footprints are now generated through a bounded
-            # bitmap rather than O(completions * lag) temporary arrays.  It is
-            # therefore safe to keep every physical pricing core occupied:
-            # two workers feed the GPUs while the remaining workers execute
-            # the identical CPU moments path.  Scheduling changes neither the
+            # Each full-W hierarchy task retains exact nested block snapshots.
+            # Bound producer concurrency to half the physical cores so those
+            # snapshots cannot exhaust RAM; the remaining cores are available
+            # to BLAS/native work.  This scheduling bound changes neither the
             # candidate family nor any accumulated float64 objective.
-            worker_count = self.config.pricing_workers
+            worker_count = min(
+                self.config.pricing_workers,
+                max(len(devices), self.config.pricing_workers // 2),
+            )
             device_schedule = (
                 *devices,
                 *("cpu",) * max(0, worker_count - len(devices)),
@@ -2197,8 +2199,8 @@ class SupportOptimizer:
 
         if len(groups) > 1:
             with ThreadPoolExecutor(
-                # Each producer is single-threaded; the bounded response
-                # representation keeps this at physical-core concurrency.
+                # Two GPU feeders plus bounded CPU producers keep both devices
+                # busy without retaining a full W family on every core.
                 max_workers=min(worker_count, len(groups)),
                 thread_name_prefix="crbstpp-block-score",
             ) as executor:
