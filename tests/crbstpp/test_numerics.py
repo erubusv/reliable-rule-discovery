@@ -320,7 +320,7 @@ class NumericalParityTests(unittest.TestCase):
                 positions = np.searchsorted(rows, block.rows)
                 left = block_index * config.knot_count
                 design[positions, left : left + config.knot_count] = block.values
-            offset = optimizer._raw_pricing_components(empty)[0][rows]
+            offset = optimizer._pricing_rows(empty, rows)[0]
             event = np.zeros(len(rows), dtype=np.float64)
             positions = np.searchsorted(optimizer.context.target_rows, rows)
             matched = positions < len(optimizer.context.target_rows)

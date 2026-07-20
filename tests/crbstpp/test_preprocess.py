@@ -44,6 +44,18 @@ class PreprocessingTests(unittest.TestCase):
                 header=False,
                 index=False,
             )
+            origination = []
+            for loan in range(6):
+                values = [""] * 20
+                values[1] = f"2023{loan + 1:02d}"
+                values[19] = f"L{loan}"
+                origination.append(values)
+            pd.DataFrame(origination).to_csv(
+                raw / "historical_data_2023Q1.txt",
+                sep="|",
+                header=False,
+                index=False,
+            )
             output = preprocess_freddie(
                 root / "raw", root / "processed", vintages=("2023Q1",)
             )

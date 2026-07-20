@@ -4,6 +4,7 @@ import math
 from dataclasses import dataclass
 
 import numpy as np
+from scipy.optimize import minimize
 
 from .config import RunConfig
 from .likelihood import cloglog_event_terms
@@ -17,6 +18,8 @@ class EnsembleResult:
     supports: tuple[Support, ...]
     fits: tuple[FitResult, ...]
     weights: np.ndarray
+    baseline_weight: float
+    baseline_fit: FitResult | None
     train_nll: float
     test_nll: float | None
     baseline_test_nll: float | None
@@ -26,6 +29,7 @@ class EnsembleResult:
         return {
             "support_count": len(self.supports),
             "weights": self.weights.tolist(),
+            "baseline_weight": self.baseline_weight,
             "train_nll": self.train_nll,
             "test_nll": self.test_nll,
             "baseline_test_nll": self.baseline_test_nll,
@@ -54,6 +58,28 @@ def _simplex_projection(values: np.ndarray) -> np.ndarray:
     rho = np.flatnonzero(valid)[-1]
     threshold = cumulative[rho] / (rho + 1)
     return np.maximum(values - threshold, 0.0)
+
+
+def _simplex_kkt(
+    weights: np.ndarray, gradient: np.ndarray, objective: float
+) -> float:
+    """Scale-free KKT residual for minimization on the probability simplex."""
+    active = weights > 1.0e-10
+    if not np.any(active):
+        return math.inf
+    multiplier = float(np.mean(gradient[active]))
+    active_residual = float(np.max(np.abs(gradient[active] - multiplier)))
+    inactive = ~active
+    inactive_residual = (
+        float(np.max(np.maximum(multiplier - gradient[inactive], 0.0)))
+        if np.any(inactive)
+        else 0.0
+    )
+    feasibility = max(
+        abs(float(np.sum(weights)) - 1.0),
+        max(0.0, -float(np.min(weights))),
+    )
+    return max(active_residual, inactive_residual) / max(1.0, abs(objective), feasibility)
 
 
 def _events_at_rows(context: Context, rows: np.ndarray) -> np.ndarray:
@@ -175,16 +201,26 @@ def fit_ensemble(
     supports: tuple[Support, ...],
     config: RunConfig,
 ) -> EnsembleResult:
-    if not supports:
-        return EnsembleResult((), (), np.zeros(0), math.inf, None, None, False)
     engine = ResponseEngine(
         dataset_context.dataset,
         lag=config.impact_lag,
         knot_count=config.knot_count,
         cache_bytes=config.cache_bytes,
     )
-    fits: list[FitResult] = []
-    matrices: list[ModelMatrix] = []
+    baseline_matrix = engine.model_matrix(dataset_context, EMPTY_SUPPORT)
+    baseline_fit = fit_model_matrix(
+        baseline_matrix,
+        likelihood=dataset_context.dataset.likelihood,
+        tolerance=config.solver_tolerance,
+        max_iter=config.solver_max_iter,
+        device=(config.pricing_devices or ("cpu",))[0],
+    )
+    if not baseline_fit.converged:
+        return EnsembleResult(
+            (), (), np.zeros(0), 0.0, baseline_fit, math.inf, None, None, False
+        )
+    support_fits: list[FitResult] = []
+    support_matrices: list[ModelMatrix] = []
     for start in range(0, len(supports), config.exact_workers):
         support_wave = supports[start : start + config.exact_workers]
         matrix_wave = [
@@ -203,15 +239,42 @@ def fit_ensemble(
         )
         for matrix, fit in zip(matrix_wave, fit_wave, strict=True):
             if fit.converged:
-                fits.append(fit)
-                matrices.append(matrix)
-    if not fits:
-        return EnsembleResult((), (), np.zeros(0), math.inf, None, None, False)
+                support_fits.append(fit)
+                support_matrices.append(matrix)
+    matrices = [baseline_matrix, *support_matrices]
+    fits = [baseline_fit, *support_fits]
     components = _sparse_components(engine, dataset_context, matrices, fits)
     weights = np.full(len(fits), 1.0 / len(fits), dtype=np.float64)
-    converged = False
-    for _ in range(500):
+    result = minimize(
+        lambda value: _mixture_nll_gradient(components, value),
+        weights,
+        jac=True,
+        bounds=[(0.0, 1.0)] * len(weights),
+        constraints={
+            "type": "eq",
+            "fun": lambda value: float(np.sum(value) - 1.0),
+            "jac": lambda value: np.ones_like(value),
+        },
+        method="SLSQP",
+        options={
+            "ftol": config.solver_tolerance,
+            "maxiter": 2_000,
+            "disp": False,
+        },
+    )
+    if result.x is not None and np.all(np.isfinite(result.x)):
+        weights = _simplex_projection(np.asarray(result.x, dtype=np.float64))
+    nll, gradient = _mixture_nll_gradient(components, weights)
+    converged = _simplex_kkt(weights, gradient, nll) <= (
+        10.0 * config.solver_tolerance
+    )
+    # SLSQP is normally definitive, but retain a deterministic projected-
+    # gradient fallback and accept only an explicitly verified simplex KKT.
+    for _ in range(0 if converged else 2_000):
         nll, gradient = _mixture_nll_gradient(components, weights)
+        if _simplex_kkt(weights, gradient, nll) <= 10.0 * config.solver_tolerance:
+            converged = True
+            break
         step = 1.0 / max(1.0, float(np.linalg.norm(gradient)))
         accepted = False
         trial_nll = nll
@@ -224,12 +287,14 @@ def fit_ensemble(
                 break
             step *= 0.5
         if not accepted:
-            projected = _simplex_projection(weights - gradient) - weights
-            converged = (
-                float(np.max(np.abs(projected))) <= 10.0 * config.solver_tolerance
+            converged = _simplex_kkt(weights, gradient, nll) <= (
+                10.0 * config.solver_tolerance
             )
             break
-        if abs(nll - trial_nll) <= config.solver_tolerance * max(1.0, abs(nll)):
+        _, trial_gradient = _mixture_nll_gradient(components, weights)
+        if _simplex_kkt(weights, trial_gradient, trial_nll) <= (
+            10.0 * config.solver_tolerance
+        ):
             converged = True
             break
     train_nll, _ = _mixture_nll_gradient(components, weights)
@@ -250,28 +315,21 @@ def fit_ensemble(
         test_nll = _evaluate_mixture(
             test_engine, test_context, test_matrices, fits, weights
         )
-        baseline_matrix = engine.model_matrix(dataset_context, EMPTY_SUPPORT)
-        baseline_fit = fit_model_matrix(
-            baseline_matrix,
-            likelihood=dataset_context.dataset.likelihood,
-            tolerance=config.solver_tolerance,
-            max_iter=config.solver_max_iter,
-            device=(config.pricing_devices or ("cpu",))[0],
+        baseline_test_matrix = test_engine.model_matrix(test_context, EMPTY_SUPPORT)
+        baseline_test_nll = _evaluate_mixture(
+            test_engine,
+            test_context,
+            [baseline_test_matrix],
+            [baseline_fit],
+            np.ones(1, dtype=np.float64),
         )
-        if baseline_fit.converged:
-            baseline_test_matrix = test_engine.model_matrix(test_context, EMPTY_SUPPORT)
-            baseline_test_nll = _evaluate_mixture(
-                test_engine,
-                test_context,
-                [baseline_test_matrix],
-                [baseline_fit],
-                np.ones(1, dtype=np.float64),
-            )
-    retained_supports = tuple(matrix.support for matrix in matrices)
+    retained_supports = tuple(matrix.support for matrix in support_matrices)
     return EnsembleResult(
         retained_supports,
-        tuple(fits),
-        weights,
+        tuple(support_fits),
+        weights[1:],
+        float(weights[0]),
+        baseline_fit,
         train_nll,
         test_nll,
         baseline_test_nll,

@@ -16,8 +16,8 @@ from crbstpp.certification import (
 )
 from crbstpp.config import RunConfig
 from crbstpp.data import Dataset
+from crbstpp.checkpoint import RESULT_SCHEMA, load_checkpoint
 from crbstpp.pipeline import run
-from crbstpp.checkpoint import load_checkpoint
 from crbstpp.response import Context, ResponseEngine
 from crbstpp.rules import EMPTY_SUPPORT, RuleIdentity, Support
 from crbstpp.solver import fit_model_matrix
@@ -106,7 +106,7 @@ class PipelineContractTests(unittest.TestCase):
             )
             run_dir = root / "run"
             report = run(config, run_dir=run_dir)
-            self.assertEqual(report.schema, "crbstpp.result.v2")
+            self.assertEqual(report.schema, RESULT_SCHEMA)
             self.assertIn("f0", report.result["certification"]["all"][0]["certificate"])
             self.assertIn("f3", report.result["certification"]["all"][0]["certificate"])
             resumed = run(config, run_dir=run_dir, resume=True)

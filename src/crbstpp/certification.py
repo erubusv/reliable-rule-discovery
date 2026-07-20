@@ -10,7 +10,7 @@ from .likelihood import loss_rows
 from .objective import SupportRecord
 from .report import Certificate
 from .reliability import (
-    environment_robust_mean as _environment_robust_mean,
+    environment_robust_lcb as _environment_robust_lcb,
     environment_spec as _environment_spec,
     multinomial_l1_radius,
     worst_case_total_variation_mean,
@@ -233,7 +233,17 @@ def certify_family(
         knot_count=config.knot_count,
         cache_bytes=config.cache_bytes // 4,
     )
-    environments = _environment_spec(certification_context, config)
+    # Split the declared family error budget between ordinary F1/F2 tests and
+    # simultaneous F3 confidence bounds.  F3 then divides its mean-bound half
+    # over every support/branch functional in the frozen family; the BHC
+    # mixture-weight event is shared and paid only once.
+    test_alpha = config.alpha / 2.0
+    f3_alpha = config.alpha / 2.0
+    environments = _environment_spec(
+        certification_context, config, alpha=f3_alpha
+    )
+    robust_metric_count = sum(1 + 2 * len(record.support.rules) for record in family)
+    robust_metric_alpha = f3_alpha / max(1, robust_metric_count)
     interim: list[tuple[SupportRecord, float, dict[str, object], tuple[str, ...]]] = []
     for record in family:
         reasons: list[str] = []
@@ -256,13 +266,22 @@ def certify_family(
         diagnostics["f1"] = f1.__dict__
         if not f1.testable:
             reasons.append("f1_not_testable")
-        support_robust_gain, support_environment_gains = _environment_robust_mean(
-            null_entity - full_entity, environments
+        (
+            support_robust_gain,
+            support_environment_gains,
+            support_environment_lcbs,
+        ) = _environment_robust_lcb(
+            null_entity - full_entity,
+            environments,
+            alpha=robust_metric_alpha,
         )
         support_dimension = max(0, full_matrix.dimension - null_cert_matrix.dimension)
         support_mdl_threshold = (
-            support_dimension
-            * math.log(max(2, len(certification_context.entity_codes)))
+            optimizer.objective.reported_branch_penalty(
+                record.support,
+                support_dimension,
+                n_entities=len(certification_context.entity_codes),
+            )
             / (2.0 * len(certification_context.entity_codes))
         )
         distribution_shift_testable = len(environments.labels) > 1
@@ -361,11 +380,25 @@ def certify_family(
             probability_test = one_sided_mean_test(
                 probability_difference, config.probability_materiality
             )
-            robust_global_gain, global_environment_gains = _environment_robust_mean(
-                drop_entity - full_entity, environments
+            (
+                robust_global_gain,
+                global_environment_gains,
+                global_environment_lcbs,
+            ) = _environment_robust_lcb(
+                drop_entity - full_entity,
+                environments,
+                alpha=robust_metric_alpha,
             )
-            robust_probability, probability_environment_gains = (
-                _environment_robust_mean(probability_difference, environments)
+            (
+                robust_probability,
+                probability_environment_gains,
+                probability_environment_lcbs,
+            ) = (
+                _environment_robust_lcb(
+                    probability_difference,
+                    environments,
+                    alpha=robust_metric_alpha,
+                )
             )
             rule_f3_passed = bool(
                 robust_global_gain > 0.0
@@ -394,11 +427,17 @@ def certify_family(
                     "f3_global_environment_gain_max": float(
                         np.max(global_environment_gains)
                     ),
+                    "f3_global_environment_lcb_min": float(
+                        np.min(global_environment_lcbs)
+                    ),
                     "f3_probability_environment_gain_min": float(
                         np.min(probability_environment_gains)
                     ),
                     "f3_probability_environment_gain_max": float(
                         np.max(probability_environment_gains)
+                    ),
+                    "f3_probability_environment_lcb_min": float(
+                        np.min(probability_environment_lcbs)
                     ),
                     "f3": rule_f3_passed,
                 }
@@ -416,12 +455,18 @@ def certify_family(
             "environment_source": environments.source,
             "environment_count": int(len(environments.labels)),
             "distribution_shift_testable": distribution_shift_testable,
-            "ambiguity": "finite-sample multinomial L1 confidence set",
+            "ambiguity": (
+                "BHC finite-sample cohort-mixture set plus simultaneous "
+                "one-sided normal cohort-effect lower bounds"
+            ),
             "ambiguity_l1_radius": environments.l1_radius,
             "support_robust_gain": support_robust_gain,
             "support_mdl_threshold": support_mdl_threshold,
             "support_environment_gain_min": float(np.min(support_environment_gains)),
             "support_environment_gain_max": float(np.max(support_environment_gains)),
+            "support_environment_lcb_min": float(np.min(support_environment_lcbs)),
+            "family_f3_alpha": f3_alpha,
+            "family_robust_metric_count": robust_metric_count,
         }
         support_pvalue = max([f1.pvalue, *rule_pvalues], default=1.0)
         interim.append((record, support_pvalue, diagnostics, tuple(reasons)))
@@ -436,10 +481,13 @@ def certify_family(
             "strict_future_effect_required",
             "atomic_predicates",
         )
-    )
+    ) and optimizer.context.dataset.f0_contract.get(
+        "independent_certification_units", True
+    ) is True
     for (record, pvalue, diagnostics, reasons), adjusted_pvalue in zip(
         interim, adjusted, strict=True
     ):
+        final_reasons = reasons if f0 else (*reasons, "f0_contract_failed")
         f1_pvalue = (
             float(diagnostics.get("f1", {}).get("pvalue", 1.0))
             if isinstance(diagnostics.get("f1"), dict)
@@ -449,7 +497,9 @@ def certify_family(
             float(item["pvalue"]) for item in diagnostics.get("rules", [])
         )
         f3 = bool(diagnostics.get("f3", {}).get("passed", False))
-        certified = bool(f0 and f3 and not reasons and adjusted_pvalue <= config.alpha)
+        certified = bool(
+            f0 and f3 and not final_reasons and adjusted_pvalue <= test_alpha
+        )
         certificate = Certificate(
             support_key=support_key(record.support),
             f0=f0,
@@ -459,7 +509,7 @@ def certify_family(
             family_pvalue=pvalue,
             holm_adjusted_pvalue=adjusted_pvalue,
             certified=certified,
-            reasons=reasons,
+            reasons=final_reasons,
         )
         models.append(CertifiedModel(record, certificate, diagnostics))
     certified_models = tuple(model for model in models if model.certificate.certified)

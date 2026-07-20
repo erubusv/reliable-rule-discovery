@@ -186,24 +186,64 @@ def _predicate_matrix(frame: pd.DataFrame) -> pd.DataFrame:
     out[PREDICATES[9]] = accelerating & ~prior_accelerating
     out[PREDICATES[10]] = decelerating & ~prior_decelerating
     out[PREDICATES[11]] = steady & ~prior_steady
-    out.loc[frame["target"], :] = False
     return out.fillna(False).astype(np.uint8)
 
 
-def _load_vintage(
-    item: tuple[str, Path],
-) -> tuple[str, pd.DataFrame, pd.DataFrame, str]:
-    """Read, hash and derive one independent vintage deterministically."""
-    vintage, path = item
-    raw = _read(path)
-    frame = _prefix(raw)
-    del raw
-    matrix = _predicate_matrix(frame)
+def _read_first_payment(path: Path) -> tuple[pd.Series, str]:
+    """Read the contract first-payment cohort from Freddie origination data."""
+    frame = pd.read_csv(
+        path,
+        sep="|",
+        header=None,
+        usecols=[1, 19],
+        dtype="string",
+        keep_default_na=False,
+        engine="c",
+    ).rename(columns={1: "first_payment_date", 19: "loan_id"})
+    frame["loan_id"] = frame["loan_id"].str.strip()
+    period = pd.to_numeric(frame["first_payment_date"].str.strip(), errors="coerce")
+    year, month = period // 100, period % 100
+    if bool(
+        frame["loan_id"].eq("").any()
+        or frame["loan_id"].duplicated().any()
+        or period.isna().any()
+        or (~month.between(1, 12)).any()
+    ):
+        raise ValueError(f"invalid Freddie origination cohort data in {path}")
+    first_payment = pd.Series(
+        (year * 12 + month).to_numpy(dtype=np.int64),
+        index=frame["loan_id"],
+        name="first_payment_time",
+    )
     digest = hashlib.sha256()
     with path.open("rb") as handle:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
-    return vintage, frame, matrix, digest.hexdigest()
+    return first_payment, digest.hexdigest()
+
+
+def _load_vintage(
+    item: tuple[str, Path, Path],
+) -> tuple[str, pd.DataFrame, pd.DataFrame, pd.Series, str, str]:
+    """Read, hash and derive one independent vintage deterministically."""
+    vintage, performance_path, origination_path = item
+    raw = _read(performance_path)
+    frame = _prefix(raw)
+    del raw
+    matrix = _predicate_matrix(frame)
+    first_payment, origination_digest = _read_first_payment(origination_path)
+    digest = hashlib.sha256()
+    with performance_path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return (
+        vintage,
+        frame,
+        matrix,
+        first_payment,
+        digest.hexdigest(),
+        origination_digest,
+    )
 
 
 def preprocess_freddie(
@@ -219,18 +259,24 @@ def preprocess_freddie(
             raise FileExistsError(output_root)
         shutil.rmtree(output_root)
     pattern = re.compile(r"historical_data_time_(\d{4}Q[1-4])\.txt$")
-    paths: list[tuple[str, Path]] = []
+    paths: list[tuple[str, Path, Path]] = []
     requested = set(vintages)
     for path in input_root.glob(
         "[0-9][0-9][0-9][0-9]/Q[1-4]/historical_data_time_*.txt"
     ):
         match = pattern.match(path.name)
         if match and (not requested or match.group(1) in requested):
-            paths.append((match.group(1), path))
+            origination = path.with_name(f"historical_data_{match.group(1)}.txt")
+            if not origination.is_file():
+                raise FileNotFoundError(
+                    f"missing Freddie origination file for {match.group(1)}: "
+                    f"{origination}"
+                )
+            paths.append((match.group(1), path, origination))
     paths.sort()
-    if requested - {name for name, _ in paths}:
+    if requested - {name for name, _, _ in paths}:
         raise FileNotFoundError(
-            f"missing vintages: {sorted(requested - {name for name, _ in paths})}"
+            f"missing vintages: {sorted(requested - {name for name, _, _ in paths})}"
         )
     if not paths:
         raise FileNotFoundError("no Freddie performance files found")
@@ -244,7 +290,14 @@ def preprocess_freddie(
         max_workers=min(3, len(paths)), thread_name_prefix="crbstpp-freddie"
     ) as executor:
         derived = executor.map(_load_vintage, paths)
-        for vintage, frame, matrix, source_digest in derived:
+        for (
+            vintage,
+            frame,
+            matrix,
+            first_payment,
+            performance_digest,
+            origination_digest,
+        ) in derived:
             groups = frame.groupby("loan_id", sort=False)
             entities = (
                 groups.agg(
@@ -259,9 +312,16 @@ def preprocess_freddie(
                 entities["start_age"].isna().any() or (entities["start_age"] < 0).any()
             ):
                 raise ValueError("invalid Freddie start loan age")
-            entities["split_group"] = entities["start_time"].astype(
-                np.int64
-            ) - entities["start_age"].astype(np.int64)
+            entities["split_group"] = entities["entity_id"].map(first_payment)
+            if bool(entities["split_group"].isna().any()):
+                missing = entities.loc[
+                    entities["split_group"].isna(), "entity_id"
+                ].head(5)
+                raise ValueError(
+                    "performance loans are absent from Freddie origination data: "
+                    f"{missing.tolist()}"
+                )
+            entities["split_group"] = entities["split_group"].astype(np.int64)
             entities["baseline_origin"] = entities["start_age"].astype(np.int64)
             entity_codes = pd.Series(
                 np.arange(len(entities), dtype=np.int32) + entity_offset,
@@ -302,7 +362,8 @@ def preprocess_freddie(
             event_parts.append(events)
             target_parts.append(targets)
             entity_offset += len(entities)
-            source_digests[vintage] = source_digest
+            source_digests[f"{vintage}:performance"] = performance_digest
+            source_digests[f"{vintage}:origination"] = origination_digest
     entities = pd.concat(entity_parts, ignore_index=True)
     events = (
         pd.concat(event_parts, ignore_index=True)
@@ -331,11 +392,13 @@ def preprocess_freddie(
             "direct_target_proxy_excluded": True,
             "strict_future_effect_required": True,
             "atomic_predicates": True,
+            "independent_certification_units": True,
         },
         provenance={
-            "preprocessor": "crbstpp.preprocess.freddie.v1",
-            "vintages": [name for name, _ in paths],
+            "preprocessor": "crbstpp.preprocess.freddie.v2",
+            "vintages": [name for name, _, _ in paths],
             "source_sha256": source_digests,
             "predicate_definition": "primitive ELTV-band and UPB-direction transition onsets",
+            "split_definition": "ordered Freddie first-payment-date cohorts",
         },
     )

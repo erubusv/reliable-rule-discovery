@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from statistics import NormalDist
 from dataclasses import dataclass
 
 import numpy as np
@@ -53,8 +54,13 @@ def multinomial_l1_radius(n: int, environments: int, alpha: float) -> float:
     return min(2.0, radius)
 
 
-def environment_spec(context: Context, config: RunConfig) -> EnvironmentSpec:
+def environment_spec(
+    context: Context, config: RunConfig, *, alpha: float | None = None
+) -> EnvironmentSpec:
     """Construct the same pre-registered environments for search and certification."""
+    confidence_alpha = config.alpha if alpha is None else float(alpha)
+    if not 0.0 < confidence_alpha < 1.0:
+        raise ValueError("environment confidence alpha must lie in (0, 1)")
     raw = context.dataset.split_groups[context.entity_codes]
     source = "dataset.split_groups"
     if len(np.unique(raw)) <= 1:
@@ -74,7 +80,11 @@ def environment_spec(context: Context, config: RunConfig) -> EnvironmentSpec:
         labels=np.asarray(labels),
         counts=counts,
         probabilities=probabilities,
-        l1_radius=multinomial_l1_radius(len(raw), len(labels), config.alpha),
+        # Half of alpha covers estimation of the empirical mixture weights;
+        # the other half is reserved for simultaneous cohort-mean LCBs.
+        l1_radius=multinomial_l1_radius(
+            len(raw), len(labels), confidence_alpha / 2.0
+        ),
         source=source,
     )
 
@@ -96,6 +106,10 @@ def worst_case_total_variation_mean(
         or not 0.0 <= l1_radius <= 2.0
     ):
         raise ValueError("invalid finite-environment ambiguity problem")
+    if np.any(np.isnan(values)) or np.any(np.isposinf(values)):
+        raise ValueError("finite-environment values may contain only finite or -inf values")
+    if np.any(np.isneginf(values) & (probabilities > 0.0)):
+        return -math.inf
     if len(values) == 1 or l1_radius == 0.0:
         return float(probabilities @ values)
     weights = probabilities.copy()
@@ -142,3 +156,51 @@ def environment_robust_mean(
         means, environments.probabilities, environments.l1_radius
     )
     return worst, means
+
+
+def environment_robust_lcb(
+    values: np.ndarray,
+    environments: EnvironmentSpec,
+    *,
+    alpha: float,
+) -> tuple[float, np.ndarray, np.ndarray]:
+    """Worst mixture mean after simultaneous environment-mean uncertainty.
+
+    The previous F3 implementation perturbed only empirical cohort proportions
+    and treated estimated cohort effects as known.  This function first forms
+    Bonferroni simultaneous one-sided normal lower bounds for every cohort mean,
+    then minimizes those bounds over the finite-sample mixture ambiguity set.
+    The split ``alpha/2`` is paired with the BHC mixture-radius calibration in
+    :func:`environment_spec`.
+    """
+    values = np.asarray(values, dtype=np.float64)
+    if values.shape != environments.inverse.shape:
+        raise ValueError("entity gain and environment arrays must align")
+    count = len(environments.labels)
+    if count <= 1:
+        return -math.inf, np.full(count, math.nan), np.full(count, -math.inf)
+    sums = np.bincount(
+        environments.inverse, weights=values, minlength=count
+    ).astype(np.float64)
+    squared = np.bincount(
+        environments.inverse, weights=values * values, minlength=count
+    ).astype(np.float64)
+    means = sums / environments.counts
+    numerators = np.maximum(
+        0.0, squared - environments.counts * means * means
+    )
+    variances = np.divide(
+        numerators,
+        environments.counts - 1.0,
+        out=np.full(count, math.inf, dtype=np.float64),
+        where=environments.counts > 1.0,
+    )
+    standard_errors = np.sqrt(variances / environments.counts)
+    tail = float(alpha) / (2.0 * count)
+    critical = NormalDist().inv_cdf(1.0 - tail)
+    lower = means - critical * standard_errors
+    lower[~np.isfinite(lower)] = -math.inf
+    worst = worst_case_total_variation_mean(
+        lower, environments.probabilities, environments.l1_radius
+    )
+    return worst, means, lower

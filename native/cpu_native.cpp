@@ -37,6 +37,19 @@ bool int64_buffer(PyObject* object, Py_buffer* view, int dimensions, bool writab
     return true;
 }
 
+bool integer_lookup_buffer(PyObject* object, Py_buffer* view) {
+    const int flags = PyBUF_ND | PyBUF_FORMAT | PyBUF_C_CONTIGUOUS;
+    if (PyObject_GetBuffer(object, view, flags) != 0) return false;
+    if (view->ndim != 1 ||
+        (view->itemsize != static_cast<Py_ssize_t>(sizeof(std::int32_t)) &&
+         view->itemsize != static_cast<Py_ssize_t>(sizeof(std::int64_t)))) {
+        PyBuffer_Release(view);
+        PyErr_SetString(PyExc_ValueError, "expected a C-contiguous int32/int64 lookup");
+        return false;
+    }
+    return true;
+}
+
 std::uint64_t row_hash(const double* row, std::int64_t columns) {
     // FNV-1a over canonical IEEE-754 words.  Signed zero is canonicalized
     // because +0 and -0 define the same design row.  Hash collisions are
@@ -448,7 +461,7 @@ PyObject* accumulate_kernel(PyObject*, PyObject* args) {
     ++acquired;
     if (!double_buffer(basis_obj, &basis, 2, false)) { release(); return nullptr; }
     ++acquired;
-    if (!int64_buffer(lookup_obj, &lookup, 1, false)) { release(); return nullptr; }
+    if (!integer_lookup_buffer(lookup_obj, &lookup)) { release(); return nullptr; }
     ++acquired;
     if (!double_buffer(accumulator_obj, &accumulator, 2, true)) {
         release(); return nullptr;
@@ -471,7 +484,12 @@ PyObject* accumulate_kernel(PyObject*, PyObject* args) {
     const auto* endp = static_cast<const std::int64_t*>(ends.buf);
     const auto* offsetp = static_cast<const std::int64_t*>(offsets.buf);
     const auto* bp = static_cast<const double*>(basis.buf);
-    const auto* lookp = static_cast<const std::int64_t*>(lookup.buf);
+    const auto* lookp64 = lookup.itemsize == static_cast<Py_ssize_t>(sizeof(std::int64_t))
+                              ? static_cast<const std::int64_t*>(lookup.buf)
+                              : nullptr;
+    const auto* lookp32 = lookup.itemsize == static_cast<Py_ssize_t>(sizeof(std::int32_t))
+                              ? static_cast<const std::int32_t*>(lookup.buf)
+                              : nullptr;
     auto* out = static_cast<double*>(accumulator.buf);
     bool invalid = false;
     Py_BEGIN_ALLOW_THREADS
@@ -489,7 +507,7 @@ PyObject* accumulate_kernel(PyObject*, PyObject* args) {
                 invalid = true;
                 break;
             }
-            const auto position = lookp[row];
+            const auto position = lookp64 ? lookp64[row] : lookp32[row];
             if (position < 0 || position >= accumulator.shape[0]) {
                 invalid = true;
                 break;
@@ -507,6 +525,314 @@ PyObject* accumulate_kernel(PyObject*, PyObject* args) {
     }
     release();
     Py_RETURN_NONE;
+}
+
+PyObject* fill_candidate_batch(PyObject*, PyObject* args) {
+    PyObject *destination_obj, *maximum_rows_obj, *lookup_obj, *rows_list,
+             *values_list, *batch_obj, *column_obj, *start_obj;
+    if (!PyArg_ParseTuple(args, "OOOOOOOO", &destination_obj, &maximum_rows_obj,
+                          &lookup_obj, &rows_list, &values_list, &batch_obj,
+                          &column_obj, &start_obj))
+        return nullptr;
+    Py_buffer destination{}, maximum_rows{}, lookup{}, batch{}, column{};
+    if (!double_buffer(destination_obj, &destination, 3, true)) return nullptr;
+    if (!int64_buffer(maximum_rows_obj, &maximum_rows, 1, false)) {
+        PyBuffer_Release(&destination);
+        return nullptr;
+    }
+    if (!integer_lookup_buffer(lookup_obj, &lookup)) {
+        PyBuffer_Release(&destination);
+        PyBuffer_Release(&maximum_rows);
+        return nullptr;
+    }
+    if (!int64_buffer(batch_obj, &batch, 1, false)) {
+        PyBuffer_Release(&destination); PyBuffer_Release(&maximum_rows);
+        PyBuffer_Release(&lookup); return nullptr;
+    }
+    if (!int64_buffer(column_obj, &column, 1, false)) {
+        PyBuffer_Release(&destination); PyBuffer_Release(&maximum_rows);
+        PyBuffer_Release(&lookup); PyBuffer_Release(&batch); return nullptr;
+    }
+    const auto start = PyLong_AsLongLong(start_obj);
+    const auto count = PySequence_Size(rows_list);
+    const bool valid = start >= 0 && count >= 0 &&
+        PySequence_Size(values_list) == count && batch.shape[0] == count &&
+        column.shape[0] == count && destination.shape[1] > 0 &&
+        start + destination.shape[1] <= maximum_rows.shape[0];
+    if (PyErr_Occurred() || !valid) {
+        PyErr_SetString(PyExc_ValueError, "candidate fill metadata mismatch");
+        PyBuffer_Release(&destination); PyBuffer_Release(&maximum_rows);
+        PyBuffer_Release(&lookup); PyBuffer_Release(&batch); PyBuffer_Release(&column);
+        return nullptr;
+    }
+    std::vector<Py_buffer> row_views(static_cast<std::size_t>(count));
+    std::vector<Py_buffer> value_views(static_cast<std::size_t>(count));
+    std::int64_t acquired = 0;
+    for (std::int64_t item = 0; item < count; ++item) {
+        PyObject* rows_obj = PySequence_GetItem(rows_list, item);
+        PyObject* values_obj = PySequence_GetItem(values_list, item);
+        const bool row_acquired = rows_obj &&
+            int64_buffer(rows_obj, &row_views[item], 1, false);
+        const bool value_acquired = row_acquired && values_obj &&
+            double_buffer(values_obj, &value_views[item], 2, false);
+        if (!row_acquired || !value_acquired) {
+            if (row_acquired) PyBuffer_Release(&row_views[item]);
+            Py_XDECREF(rows_obj); Py_XDECREF(values_obj);
+            for (std::int64_t previous = 0; previous < acquired; ++previous) {
+                PyBuffer_Release(&row_views[previous]);
+                PyBuffer_Release(&value_views[previous]);
+            }
+            PyBuffer_Release(&destination); PyBuffer_Release(&maximum_rows);
+            PyBuffer_Release(&lookup); PyBuffer_Release(&batch);
+            PyBuffer_Release(&column);
+            return nullptr;
+        }
+        Py_DECREF(rows_obj); Py_DECREF(values_obj);
+        ++acquired;
+        if (row_views[item].shape[0] != value_views[item].shape[0]) {
+            PyErr_SetString(PyExc_ValueError, "candidate block row/value mismatch");
+            for (std::int64_t previous = 0; previous < acquired; ++previous) {
+                PyBuffer_Release(&row_views[previous]);
+                PyBuffer_Release(&value_views[previous]);
+            }
+            PyBuffer_Release(&destination); PyBuffer_Release(&maximum_rows);
+            PyBuffer_Release(&lookup); PyBuffer_Release(&batch);
+            PyBuffer_Release(&column);
+            return nullptr;
+        }
+    }
+    const auto* maximum = static_cast<const std::int64_t*>(maximum_rows.buf);
+    const auto* batchp = static_cast<const std::int64_t*>(batch.buf);
+    const auto* columnp = static_cast<const std::int64_t*>(column.buf);
+    const auto* lookup64 = lookup.itemsize == static_cast<Py_ssize_t>(sizeof(std::int64_t))
+                               ? static_cast<const std::int64_t*>(lookup.buf)
+                               : nullptr;
+    const auto* lookup32 = lookup.itemsize == static_cast<Py_ssize_t>(sizeof(std::int32_t))
+                               ? static_cast<const std::int32_t*>(lookup.buf)
+                               : nullptr;
+    auto* output = static_cast<double*>(destination.buf);
+    const auto batches = destination.shape[0], rows = destination.shape[1],
+               dimensions = destination.shape[2];
+    const auto lower_row = maximum[start];
+    const auto upper_row = maximum[start + rows - 1];
+    bool invalid = false;
+    Py_BEGIN_ALLOW_THREADS
+    for (std::int64_t item = 0; item < count && !invalid; ++item) {
+        const auto* block_rows = static_cast<const std::int64_t*>(row_views[item].buf);
+        const auto* block_values = static_cast<const double*>(value_views[item].buf);
+        const auto block_count = row_views[item].shape[0];
+        const auto width = value_views[item].shape[1];
+        const auto left = std::lower_bound(block_rows, block_rows + block_count,
+                                           lower_row) - block_rows;
+        const auto right = std::upper_bound(block_rows, block_rows + block_count,
+                                            upper_row) - block_rows;
+        if (batchp[item] < 0 || batchp[item] >= batches || columnp[item] < 0 ||
+            columnp[item] + width > dimensions) {
+            invalid = true;
+            break;
+        }
+        for (std::int64_t index = left; index < right; ++index) {
+            const auto raw_row = block_rows[index];
+            if (raw_row < 0 || raw_row >= lookup.shape[0]) {
+                invalid = true;
+                break;
+            }
+            const auto global = lookup64 ? lookup64[raw_row] : lookup32[raw_row];
+            const auto local = global - start;
+            if (local < 0 || local >= rows) {
+                invalid = true;
+                break;
+            }
+            std::memcpy(
+                output + (batchp[item] * rows + local) * dimensions + columnp[item],
+                block_values + index * width,
+                static_cast<std::size_t>(width) * sizeof(double));
+        }
+    }
+    Py_END_ALLOW_THREADS
+    for (std::int64_t item = 0; item < acquired; ++item) {
+        PyBuffer_Release(&row_views[item]);
+        PyBuffer_Release(&value_views[item]);
+    }
+    PyBuffer_Release(&destination); PyBuffer_Release(&maximum_rows);
+    PyBuffer_Release(&lookup); PyBuffer_Release(&batch); PyBuffer_Release(&column);
+    if (invalid) {
+        PyErr_SetString(PyExc_ValueError, "candidate block is outside its tile");
+        return nullptr;
+    }
+    Py_RETURN_NONE;
+}
+
+PyObject* sparse_joint_moments(PyObject*, PyObject* args) {
+    PyObject *rows_list, *values_list, *lookup_obj, *first_obj, *second_obj,
+             *gradient_obj, *hessian_obj, *cross_obj;
+    if (!PyArg_ParseTuple(args, "OOOOOOOO", &rows_list, &values_list,
+                          &lookup_obj, &first_obj, &second_obj, &gradient_obj,
+                          &hessian_obj, &cross_obj))
+        return nullptr;
+    Py_buffer lookup{}, first{}, second{}, gradient{}, hessian{}, cross{};
+    if (!integer_lookup_buffer(lookup_obj, &lookup)) return nullptr;
+    if (!double_buffer(first_obj, &first, 1, false)) {
+        PyBuffer_Release(&lookup); return nullptr;
+    }
+    if (!double_buffer(second_obj, &second, 1, false)) {
+        PyBuffer_Release(&lookup); PyBuffer_Release(&first); return nullptr;
+    }
+    if (!double_buffer(gradient_obj, &gradient, 1, true)) {
+        PyBuffer_Release(&lookup); PyBuffer_Release(&first);
+        PyBuffer_Release(&second); return nullptr;
+    }
+    if (!double_buffer(hessian_obj, &hessian, 2, true)) {
+        PyBuffer_Release(&lookup); PyBuffer_Release(&first);
+        PyBuffer_Release(&second); PyBuffer_Release(&gradient); return nullptr;
+    }
+    if (!double_buffer(cross_obj, &cross, 1, true)) {
+        PyBuffer_Release(&lookup); PyBuffer_Release(&first);
+        PyBuffer_Release(&second); PyBuffer_Release(&gradient);
+        PyBuffer_Release(&hessian); return nullptr;
+    }
+    const auto block_count = PySequence_Size(rows_list);
+    if (block_count < 1 || PySequence_Size(values_list) != block_count ||
+        first.shape[0] != second.shape[0]) {
+        PyErr_SetString(PyExc_ValueError, "invalid sparse joint block metadata");
+        goto sparse_joint_fail;
+    }
+    {
+        std::vector<Py_buffer> row_views(static_cast<std::size_t>(block_count));
+        std::vector<Py_buffer> value_views(static_cast<std::size_t>(block_count));
+        std::int64_t acquired = 0, width = -1;
+        for (std::int64_t block = 0; block < block_count; ++block) {
+            PyObject* rows_obj = PySequence_GetItem(rows_list, block);
+            PyObject* values_obj = PySequence_GetItem(values_list, block);
+            const bool row_acquired = rows_obj &&
+                int64_buffer(rows_obj, &row_views[block], 1, false);
+            const bool value_acquired = row_acquired && values_obj &&
+                double_buffer(values_obj, &value_views[block], 2, false);
+            Py_XDECREF(rows_obj); Py_XDECREF(values_obj);
+            if (!row_acquired || !value_acquired) {
+                if (row_acquired) PyBuffer_Release(&row_views[block]);
+                for (std::int64_t previous = 0; previous < acquired; ++previous) {
+                    PyBuffer_Release(&row_views[previous]);
+                    PyBuffer_Release(&value_views[previous]);
+                }
+                goto sparse_joint_fail;
+            }
+            ++acquired;
+            if (row_views[block].shape[0] != value_views[block].shape[0] ||
+                (width >= 0 && value_views[block].shape[1] != width)) {
+                PyErr_SetString(PyExc_ValueError, "inconsistent sparse joint block");
+                for (std::int64_t previous = 0; previous < acquired; ++previous) {
+                    PyBuffer_Release(&row_views[previous]);
+                    PyBuffer_Release(&value_views[previous]);
+                }
+                goto sparse_joint_fail;
+            }
+            width = value_views[block].shape[1];
+        }
+        const auto dimension = block_count * width;
+        if (gradient.shape[0] != dimension || cross.shape[0] != dimension ||
+            hessian.shape[0] != dimension || hessian.shape[1] != dimension) {
+            PyErr_SetString(PyExc_ValueError, "sparse joint output shape mismatch");
+            for (std::int64_t block = 0; block < acquired; ++block) {
+                PyBuffer_Release(&row_views[block]);
+                PyBuffer_Release(&value_views[block]);
+            }
+            goto sparse_joint_fail;
+        }
+        const auto* lookup64 = lookup.itemsize == static_cast<Py_ssize_t>(sizeof(std::int64_t))
+                                   ? static_cast<const std::int64_t*>(lookup.buf)
+                                   : nullptr;
+        const auto* lookup32 = lookup.itemsize == static_cast<Py_ssize_t>(sizeof(std::int32_t))
+                                   ? static_cast<const std::int32_t*>(lookup.buf)
+                                   : nullptr;
+        const auto* firstp = static_cast<const double*>(first.buf);
+        const auto* secondp = static_cast<const double*>(second.buf);
+        auto* gp = static_cast<double*>(gradient.buf);
+        auto* hp = static_cast<double*>(hessian.buf);
+        auto* cp = static_cast<double*>(cross.buf);
+        std::fill(gp, gp + dimension, 0.0);
+        std::fill(hp, hp + dimension * dimension, 0.0);
+        std::fill(cp, cp + dimension, 0.0);
+        bool invalid = false;
+        Py_BEGIN_ALLOW_THREADS
+        for (std::int64_t block = 0; block < block_count && !invalid; ++block) {
+            const auto* rows = static_cast<const std::int64_t*>(row_views[block].buf);
+            const auto* values = static_cast<const double*>(value_views[block].buf);
+            for (std::int64_t index = 0; index < row_views[block].shape[0]; ++index) {
+                const auto raw = rows[index];
+                if (raw < 0 || raw >= lookup.shape[0]) { invalid = true; break; }
+                const auto position = lookup64 ? lookup64[raw] : lookup32[raw];
+                if (position < 0 || position >= first.shape[0]) { invalid = true; break; }
+                for (std::int64_t knot = 0; knot < width; ++knot) {
+                    const auto column = block * width + knot;
+                    const auto value = values[index * width + knot];
+                    gp[column] += value * firstp[position];
+                    cp[column] += value * secondp[position];
+                }
+            }
+        }
+        for (std::int64_t left_block = 0;
+             left_block < block_count && !invalid; ++left_block) {
+            const auto* left_rows = static_cast<const std::int64_t*>(row_views[left_block].buf);
+            const auto* left_values = static_cast<const double*>(value_views[left_block].buf);
+            for (std::int64_t right_block = left_block;
+                 right_block < block_count && !invalid; ++right_block) {
+                const auto* right_rows = static_cast<const std::int64_t*>(row_views[right_block].buf);
+                const auto* right_values = static_cast<const double*>(value_views[right_block].buf);
+                std::int64_t left_index = 0, right_index = 0;
+                while (left_index < row_views[left_block].shape[0] &&
+                       right_index < row_views[right_block].shape[0]) {
+                    const auto left_row = left_rows[left_index];
+                    const auto right_row = right_rows[right_index];
+                    if (left_row < right_row) { ++left_index; continue; }
+                    if (right_row < left_row) { ++right_index; continue; }
+                    if (left_row < 0 || left_row >= lookup.shape[0]) {
+                        invalid = true;
+                        break;
+                    }
+                    const auto position = lookup64 ? lookup64[left_row] : lookup32[left_row];
+                    if (position < 0 || position >= second.shape[0]) {
+                        invalid = true;
+                        break;
+                    }
+                    const auto weight = secondp[position];
+                    for (std::int64_t left_knot = 0; left_knot < width; ++left_knot) {
+                        const auto left_column = left_block * width + left_knot;
+                        const auto left_value = left_values[left_index * width + left_knot];
+                        const auto right_start = left_block == right_block
+                            ? left_knot : 0;
+                        for (std::int64_t right_knot = right_start;
+                             right_knot < width; ++right_knot) {
+                            const auto right_column = right_block * width + right_knot;
+                            const auto value = left_value * weight *
+                                right_values[right_index * width + right_knot];
+                            hp[left_column * dimension + right_column] += value;
+                            if (left_column != right_column)
+                                hp[right_column * dimension + left_column] += value;
+                        }
+                    }
+                    ++left_index;
+                    ++right_index;
+                }
+            }
+        }
+        Py_END_ALLOW_THREADS
+        for (std::int64_t block = 0; block < acquired; ++block) {
+            PyBuffer_Release(&row_views[block]);
+            PyBuffer_Release(&value_views[block]);
+        }
+        if (invalid) {
+            PyErr_SetString(PyExc_ValueError, "sparse joint row lookup failed");
+            goto sparse_joint_fail;
+        }
+    }
+    PyBuffer_Release(&lookup); PyBuffer_Release(&first); PyBuffer_Release(&second);
+    PyBuffer_Release(&gradient); PyBuffer_Release(&hessian); PyBuffer_Release(&cross);
+    Py_RETURN_NONE;
+sparse_joint_fail:
+    PyBuffer_Release(&lookup); PyBuffer_Release(&first); PyBuffer_Release(&second);
+    PyBuffer_Release(&gradient); PyBuffer_Release(&hessian); PyBuffer_Release(&cross);
+    return nullptr;
 }
 
 PyObject* kernel_contributions(PyObject*, PyObject* args) {
@@ -722,6 +1048,8 @@ PyMethodDef methods[] = {
     {"set_num_threads", set_num_threads, METH_VARARGS, "Set deterministic OpenMP worker count."},
     {"future_rows", future_rows, METH_VARARGS, "Strict-future footprint rows."},
     {"accumulate_kernel", accumulate_kernel, METH_VARARGS, "Accumulate newly admitted kernel completions."},
+    {"fill_candidate_batch", fill_candidate_batch, METH_VARARGS, "Fill one hierarchy candidate tile."},
+    {"sparse_joint_moments", sparse_joint_moments, METH_VARARGS, "Exact moments of sparse joint blocks."},
     {"kernel_contributions", kernel_contributions, METH_VARARGS, "Strict-future kernel contributions."},
     {"completion_events", completion_events, METH_VARARGS, "Latest-witness completion events."},
     {nullptr, nullptr, 0, nullptr},

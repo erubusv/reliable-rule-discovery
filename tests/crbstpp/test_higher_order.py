@@ -11,10 +11,10 @@ from crbstpp.config import RunConfig
 from crbstpp.certification import certify_family
 from crbstpp.data import Dataset, write_dataset
 from crbstpp.ensemble import fit_ensemble
-from crbstpp.response import Context, ResponseEngine
+from crbstpp.response import Context, ModelMatrix, ResponseEngine
 from crbstpp.rules import RuleIdentity, Support
 from crbstpp.search import SupportOptimizer
-from crbstpp.solver import fit_model_matrix
+from crbstpp.solver import _general_recession, fit_model_matrix
 
 
 F0 = {
@@ -37,7 +37,6 @@ def cell_dataset(
     targets = []
     code = 0
     for cell in sorted(probabilities):
-        target_count = int(round(probabilities[cell] * per_cell))
         for replicate in range(per_cell):
             environment_start = 3 * (replicate % 10)
             entities.append(
@@ -52,7 +51,13 @@ def cell_dataset(
             for predicate, active in enumerate(cell):
                 if active:
                     events.append((code, environment_start + 1, predicate))
-            if replicate < target_count:
+            # Give every one of the ten temporal cohorts the same deterministic
+            # cell probability; otherwise a synthetic recovery test would
+            # confound its rule effect with the F3 environment by construction.
+            cohort_size = per_cell // 10
+            cohort_target = int(round(probabilities[cell] * cohort_size))
+            within_cohort = replicate // 10
+            if (within_cohort * 7_919) % cohort_size < cohort_target:
                 targets.append((code, environment_start + 2, 1))
             code += 1
     write_dataset(
@@ -97,12 +102,31 @@ def optimizer(data: Dataset, q_max: int) -> SupportOptimizer:
 
 
 class HigherOrderRecoveryTests(unittest.TestCase):
+    def test_combined_recession_ray_is_detected_when_axes_are_not(self) -> None:
+        x = np.asarray([[1.0, -2.0], [-2.0, 1.0]])
+        matrix = ModelMatrix(
+            x=x,
+            exposure_weight=np.ones(2),
+            noevent_weight=np.ones(2),
+            event_weight=np.zeros(2),
+            free_dimension=2,
+            closure_dimension=0,
+            rule_slices=(),
+            support=Support(()),
+            closure=(),
+            active_rows=np.asarray([0, 1]),
+            active_design_groups=np.asarray([0, 1]),
+            active_age_bins=np.zeros(2, dtype=np.int64),
+            aggregate_bins=np.zeros(2, dtype=np.int64),
+        )
+        self.assertTrue(_general_recession(matrix, "poisson"))
+
     def test_pair_support_passes_f0_f1_f2_on_held_out_entities(self) -> None:
         probabilities = {
-            (0, 0): 0.005,
-            (0, 1): 0.005,
-            (1, 0): 0.005,
-            (1, 1): 0.99,
+            (0, 0): 0.75,
+            (0, 1): 0.05,
+            (1, 0): 0.05,
+            (1, 1): 0.75,
         }
         with tempfile.TemporaryDirectory() as directory:
             data = cell_dataset(

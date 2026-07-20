@@ -329,7 +329,9 @@ def accumulate_kernel(
     ends = np.ascontiguousarray(ends, dtype=np.int64)
     offsets = np.ascontiguousarray(offsets, dtype=np.int64)
     basis = np.ascontiguousarray(basis, dtype=np.float64)
-    lookup = np.ascontiguousarray(lookup, dtype=np.int64)
+    if lookup.dtype not in (np.int32, np.int64):
+        lookup = np.asarray(lookup, dtype=np.int64)
+    lookup = np.ascontiguousarray(lookup)
     if accumulator.dtype != np.float64 or not accumulator.flags.c_contiguous:
         raise ValueError("kernel accumulator must be C-contiguous float64")
     _cpu_native.accumulate_kernel(
@@ -343,6 +345,80 @@ def accumulate_kernel(
         accumulator,
     )
     return True
+
+
+def fill_candidate_batch(
+    destination: np.ndarray,
+    maximum_rows: np.ndarray,
+    lookup: np.ndarray | None,
+    blocks: list[tuple[np.ndarray, np.ndarray]],
+    batch_indices: np.ndarray,
+    column_offsets: np.ndarray,
+    tile_start: int,
+) -> bool:
+    """Fill one dense hierarchy-pricing tile from sparse blocks in C++."""
+    if (
+        _cpu_native is None
+        or not hasattr(_cpu_native, "fill_candidate_batch")
+        or lookup is None
+    ):
+        return False
+    if destination.dtype != np.float64 or not destination.flags.c_contiguous:
+        raise ValueError("candidate destination must be C-contiguous float64")
+    maximum_rows = np.ascontiguousarray(maximum_rows, dtype=np.int64)
+    lookup = np.ascontiguousarray(lookup)
+    rows = [np.ascontiguousarray(item[0], dtype=np.int64) for item in blocks]
+    values = [np.ascontiguousarray(item[1], dtype=np.float64) for item in blocks]
+    batch_indices = np.ascontiguousarray(batch_indices, dtype=np.int64)
+    column_offsets = np.ascontiguousarray(column_offsets, dtype=np.int64)
+    _cpu_native.fill_candidate_batch(
+        destination,
+        maximum_rows,
+        lookup,
+        rows,
+        values,
+        batch_indices,
+        column_offsets,
+        int(tile_start),
+    )
+    return True
+
+
+def sparse_joint_moments(
+    blocks: list[tuple[np.ndarray, np.ndarray]],
+    lookup: np.ndarray | None,
+    first: np.ndarray,
+    second: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
+    """Exact gradient, Fisher matrix and intercept cross of sparse blocks."""
+    if (
+        _cpu_native is None
+        or not hasattr(_cpu_native, "sparse_joint_moments")
+        or lookup is None
+        or not blocks
+    ):
+        return None
+    rows = [np.ascontiguousarray(item[0], dtype=np.int64) for item in blocks]
+    values = [np.ascontiguousarray(item[1], dtype=np.float64) for item in blocks]
+    width = values[0].shape[1]
+    dimension = len(blocks) * width
+    lookup = np.ascontiguousarray(lookup)
+    first = np.ascontiguousarray(first, dtype=np.float64)
+    second = np.ascontiguousarray(second, dtype=np.float64)
+    gradient = np.empty(dimension, dtype=np.float64)
+    hessian = np.empty((dimension, dimension), dtype=np.float64)
+    cross = np.empty(dimension, dtype=np.float64)
+    _cpu_native.sparse_joint_moments(
+        rows,
+        values,
+        lookup,
+        first,
+        second,
+        gradient,
+        hessian,
+        cross,
+    )
+    return gradient, hessian, cross
 
 
 def completion_events(

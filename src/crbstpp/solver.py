@@ -5,6 +5,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 
 import numpy as np
+from scipy.optimize import linprog
 
 from .likelihood import loss_rows
 from .native import configure_cpu_threads, moments
@@ -104,6 +105,105 @@ def _axis_recession(matrix: ModelMatrix, likelihood: str) -> bool:
     return False
 
 
+def _general_recession_design(
+    x: np.ndarray,
+    exposure_weight: np.ndarray,
+    noevent_weight: np.ndarray,
+    event_weight: np.ndarray,
+    free_dimension: int,
+    likelihood: str,
+) -> bool:
+    """Detect an arbitrary feasible recession ray by a bounded cone LP.
+
+    Coordinate checks miss combinations such as ``d=(1,-1)``.  Intersecting
+    the recession cone with [-1,1] for free coefficients and [0,1] for
+    nonnegative coefficients is lossless: every nonzero ray has a scaled point
+    in that box.  The linear objective is strictly negative exactly when at
+    least one likelihood term improves along the ray.
+    """
+    x = np.asarray(x, dtype=np.float64)
+    dimension = x.shape[1]
+    event = event_weight > 0.0
+    noevent = noevent_weight > 0.0
+    if likelihood == "poisson":
+        constraints = [x]
+        if np.any(event):
+            # Event rows must have Xd=0; Xd<=0 is already included above.
+            constraints.append(-x[event])
+        improving = ~event & (exposure_weight > 0.0)
+        if not np.any(improving):
+            return False
+        objective = x[improving].T @ exposure_weight[improving]
+    else:
+        constraints = []
+        if np.any(noevent):
+            constraints.append(x[noevent])
+        if np.any(event):
+            constraints.append(-x[event])
+        noevent_only = noevent & ~event
+        event_only = event & ~noevent
+        if not np.any(noevent_only) and not np.any(event_only):
+            return False
+        objective = np.zeros(dimension, dtype=np.float64)
+        if np.any(noevent_only):
+            objective += x[noevent_only].T @ noevent_weight[noevent_only]
+        if np.any(event_only):
+            objective -= x[event_only].T @ event_weight[event_only]
+    if not constraints or not np.any(objective):
+        return False
+    bounds = [(-1.0, 1.0)] * free_dimension + [
+        (0.0, 1.0)
+    ] * (dimension - free_dimension)
+    result = linprog(
+        np.ascontiguousarray(objective),
+        A_ub=np.ascontiguousarray(np.vstack(constraints)),
+        b_ub=np.zeros(sum(len(value) for value in constraints), dtype=np.float64),
+        bounds=bounds,
+        method="highs",
+        options={"presolve": True},
+    )
+    if not result.success or result.fun is None or not math.isfinite(result.fun):
+        # Failure to construct a certificate must not label a finite model as
+        # recessionary.  The caller retains its original non-convergence.
+        return False
+    scale = max(1.0, float(np.linalg.norm(objective, ord=1)))
+    return bool(result.fun < -1.0e-10 * scale)
+
+
+def _general_recession(matrix: ModelMatrix, likelihood: str) -> bool:
+    return _general_recession_design(
+        matrix.x,
+        matrix.exposure_weight,
+        matrix.noevent_weight,
+        matrix.event_weight,
+        matrix.free_dimension,
+        likelihood,
+    )
+
+
+def _failed_fit(
+    matrix: ModelMatrix,
+    likelihood: str,
+    beta: np.ndarray,
+    nll: float,
+    iteration: int,
+    kkt: float,
+    rank: int,
+    message: str,
+) -> FitResult:
+    recession = _general_recession(matrix, likelihood)
+    return FitResult(
+        beta,
+        math.inf if recession else nll,
+        False,
+        iteration,
+        math.inf if recession else kkt,
+        0 if recession else rank,
+        recession,
+        "nonattained combined recession direction" if recession else message,
+    )
+
+
 def _checked_rank(hessian: np.ndarray) -> int:
     return int(np.linalg.matrix_rank(hessian))
 
@@ -153,14 +253,14 @@ def fit_model_matrix(
             or not np.all(np.isfinite(gradient))
             or not np.all(np.isfinite(hessian))
         ):
-            return FitResult(
+            return _failed_fit(
+                matrix,
+                likelihood,
                 beta,
                 nll,
-                False,
                 iteration,
                 math.inf,
                 rank,
-                False,
                 "nonfinite objective derivatives",
             )
         kkt = projected_kkt(beta, gradient, matrix.free_dimension)
@@ -223,8 +323,15 @@ def fit_model_matrix(
                 break
             step *= 0.5
         if not accepted:
-            return FitResult(
-                beta, nll, False, iteration, kkt, rank, False, "line search failed"
+            return _failed_fit(
+                matrix,
+                likelihood,
+                beta,
+                nll,
+                iteration,
+                kkt,
+                rank,
+                "line search failed",
             )
         if abs(previous - trial_nll) <= tolerance * max(1.0, abs(previous)):
             final_nll, final_gradient, final_hessian, _ = _objective(
@@ -257,14 +364,14 @@ def fit_model_matrix(
     nll, gradient, hessian, _ = _objective(
         matrix, likelihood, beta, device=device
     )
-    return FitResult(
+    return _failed_fit(
+        matrix,
+        likelihood,
         beta,
         nll,
-        False,
         int(max_iter),
         projected_kkt(beta, gradient, matrix.free_dimension),
         _checked_rank(hessian),
-        False,
         "maximum iterations reached",
     )
 
@@ -303,6 +410,30 @@ def fit_offset_design(
             raise ValueError("invalid offset-block warm start")
         if np.any(beta[free_dimension:] < 0.0):
             raise ValueError("offset-block warm start violates the nonnegative cone")
+
+    def failed(
+        nll: float, iteration: int, kkt: float, rank: int, message: str
+    ) -> FitResult:
+        recession = _general_recession_design(
+            x,
+            exposure_weight,
+            noevent_weight,
+            event_weight,
+            free_dimension,
+            likelihood,
+        )
+        return FitResult(
+            beta,
+            math.inf if recession else nll,
+            False,
+            iteration,
+            math.inf if recession else kkt,
+            0 if recession else rank,
+            recession,
+            "nonattained combined offset-block recession direction"
+            if recession
+            else message,
+        )
     # Recession directions depend only on design signs and event/no-event
     # support; the finite frozen offset does not change them.
     for index in range(dimension):
@@ -355,14 +486,11 @@ def fit_offset_design(
             and np.all(np.isfinite(gradient))
             and np.all(np.isfinite(hessian))
         ):
-            return FitResult(
-                beta,
+            return failed(
                 nll,
-                False,
                 iteration,
                 math.inf,
                 rank,
-                False,
                 "nonfinite offset-block derivatives",
             )
         kkt = projected_kkt(beta, gradient, free_dimension)
@@ -420,14 +548,11 @@ def fit_offset_design(
                 break
             direction *= 0.5
         if not accepted:
-            return FitResult(
-                beta,
+            return failed(
                 nll,
-                False,
                 iteration,
                 kkt,
                 rank,
-                False,
                 "offset-block line search failed",
             )
         if abs(previous - trial_nll) <= tolerance * max(1.0, abs(previous)):
@@ -443,14 +568,11 @@ def fit_offset_design(
         event_weight=event_weight,
     )
     gradient, hessian = moments(x, first, second, device=device)
-    return FitResult(
-        beta,
+    return failed(
         float(np.sum(values)),
-        False,
         int(max_iter),
         projected_kkt(beta, gradient, free_dimension),
         _checked_rank(hessian),
-        False,
         "offset-block maximum iterations reached",
     )
 

@@ -6,6 +6,7 @@ from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from itertools import combinations
+from typing import Callable
 
 import numpy as np
 
@@ -17,14 +18,16 @@ from .dual import (
     dual_geometry,
     offset_dual_certificate,
 )
-from .likelihood import loss_grid_sparse_event_derivatives, loss_rows
+from .likelihood import loss_rows
 from .native import (
     aggregate_design_rows,
     aggregate_design_rows_with_groups,
     configure_cpu_threads,
+    fill_candidate_batch,
     moments,
     moments_batch,
     nonnegative_quadratic_gains,
+    sparse_joint_moments,
 )
 from .objective import ObjectiveSpec, SupportRecord, support_score
 from .reliability import (
@@ -68,11 +71,11 @@ class _RestrictedAddBounds:
 
 @dataclass(frozen=True)
 class _ReliabilityPrice:
-    """D_fit first-order analogue of the held-out F1--F3 gates.
+    """Diagnostic D_fit first-order analogue of the held-out F1--F3 gates.
 
-    These margins only define the reliability-constrained search domain.  They
-    are never reported as statistical evidence; independent D_cert tests remain
-    the sole certification decision.
+    It is retained for diagnostics and parity tests only.  These margins do not
+    delete candidates and are never reported as statistical evidence;
+    independent D_cert tests remain the sole certification decision.
     """
 
     admissible: bool
@@ -198,6 +201,13 @@ class _RestrictedGeometry:
         )
 
 
+@dataclass(frozen=True)
+class _HierarchyRuleGeometry:
+    gradient: np.ndarray
+    hessian: np.ndarray
+    nested: bool
+
+
 def _nonnegative_quadratic_gain(gradient: np.ndarray, hessian: np.ndarray) -> float:
     """Solve the tiny M-dimensional nonnegative Fisher pricing problem exactly."""
     return _nonnegative_quadratic_solution(gradient, hessian)[0]
@@ -260,7 +270,7 @@ class SupportOptimizer:
             context.dataset,
             lag=config.impact_lag,
             knot_count=config.knot_count,
-            cache_bytes=5 * config.cache_bytes // 8,
+            cache_bytes=config.cache_bytes // 2,
         )
         all_skeletons = skeletons(context.dataset.n_predicates, config.q_max)
         self.diagnostics = SearchDiagnostics(total_skeletons=len(all_skeletons))
@@ -282,7 +292,7 @@ class SupportOptimizer:
         self._forced_fits: dict[tuple[Support, tuple[ClosureTerm, ...]], FitResult] = {}
         self._state_lock = threading.RLock()
         self._record_cache_bytes = 0
-        self._record_cache_limit = max(1, 2 * config.cache_bytes // 8)
+        self._record_cache_limit = max(1, config.cache_bytes // 8)
         self._relaxed_upper_cache: OrderedDict[tuple, float] = OrderedDict()
         self._relaxed_upper_limit = max(1, min(200_000, config.cache_bytes // 256))
         self._directional_upper_cache: OrderedDict[Support, float] = OrderedDict()
@@ -290,17 +300,21 @@ class SupportOptimizer:
             OrderedDict()
         )
         self._pricing_cache_bytes = 0
-        self._pricing_cache_limit = max(1, config.cache_bytes // 8)
-        self._raw_pricing_state: OrderedDict[
-            Support, tuple[np.ndarray, np.ndarray, np.ndarray]
-        ] = OrderedDict()
-        self._raw_pricing_cache_bytes = 0
-        self._raw_pricing_cache_limit = max(1, config.cache_bytes // 8)
+        self._pricing_cache_limit = max(1, config.cache_bytes // 64)
+        self._row_eta_state: OrderedDict[Support, np.ndarray] = OrderedDict()
+        self._row_eta_cache_bytes = 0
+        self._row_eta_cache_limit = max(1, config.cache_bytes // 64)
         self._block_price_cache: OrderedDict[
             tuple[Support, Antecedent, int], tuple[np.ndarray, np.ndarray]
         ] = OrderedDict()
         self._block_price_cache_limit = max(
             1, min(200_000, config.cache_bytes // max(1, 32 * config.knot_count**2))
+        )
+        self._hierarchy_rule_geometries: OrderedDict[
+            tuple[Support, Antecedent, int], _HierarchyRuleGeometry
+        ] = OrderedDict()
+        self._hierarchy_rule_geometry_limit = max(
+            1, min(200_000, config.cache_bytes // max(1, 64 * config.knot_count**2))
         )
         self._dual_geometry_cache: OrderedDict[tuple, DualGeometry] = OrderedDict()
         self._dual_geometry_cache_limit = max(
@@ -383,11 +397,12 @@ class SupportOptimizer:
         self.engine.clear_caches()
         self._pricing_state.clear()
         self._pricing_cache_bytes = 0
-        self._raw_pricing_state.clear()
-        self._raw_pricing_cache_bytes = 0
+        self._row_eta_state.clear()
+        self._row_eta_cache_bytes = 0
         self._relaxed_upper_cache.clear()
         self._directional_upper_cache.clear()
         self._block_price_cache.clear()
+        self._hierarchy_rule_geometries.clear()
         self._restricted_add_scores.clear()
         self._restricted_add_fits.clear()
         self._restricted_add_bounds.clear()
@@ -405,19 +420,66 @@ class SupportOptimizer:
         if baseline is not None:
             self._retain_record(baseline)
 
+    def prepare_certification(
+        self, family: tuple[SupportRecord, ...]
+    ) -> None:
+        """Release proposal state while retaining exact frozen-family blocks."""
+        supports = tuple(record.support for record in family)
+        self.engine.retain_support_blocks(self.context, supports)
+        self._pricing_state.clear()
+        self._pricing_cache_bytes = 0
+        self._row_eta_state.clear()
+        self._row_eta_cache_bytes = 0
+        self._relaxed_upper_cache.clear()
+        self._directional_upper_cache.clear()
+        self._block_price_cache.clear()
+        self._hierarchy_rule_geometries.clear()
+        self._restricted_add_scores.clear()
+        self._restricted_add_fits.clear()
+        self._restricted_add_bounds.clear()
+        self._restricted_drop_scores.clear()
+        self._restricted_add_problems.clear()
+        self._restricted_add_events.clear()
+        self._restricted_geometries.clear()
+        self._restricted_geometry_events.clear()
+        self._restricted_geometry_bytes = 0
+        self._reliability_prices.clear()
+        self._dual_geometry_cache.clear()
+        retained = {EMPTY_SUPPORT, *supports}
+        for support in tuple(self.records):
+            if support not in retained:
+                record = self.records.pop(support)
+                self._record_cache_bytes -= self._record_nbytes(record)
+
     def _structurally_admissible_dictionary(
         self, all_skeletons: tuple[Antecedent, ...]
     ) -> tuple[tuple[Antecedent, ...], tuple[RuleIdentity, ...]]:
         """Remove only empty atoms and exactly response-equivalent W values."""
+        def evaluate(
+            antecedent: Antecedent,
+        ) -> tuple[Antecedent, tuple[int, ...], int]:
+            configure_cpu_threads(1)
+            windows = (
+                (0,) if len(antecedent) == 1 else self.config.formation_windows
+            )
+            effective = self.engine.effective_windows(
+                self.context, antecedent, windows
+            )
+            return antecedent, effective, len(windows)
+
+        if len(all_skeletons) > 1 and self.config.pricing_workers > 1:
+            with ThreadPoolExecutor(
+                max_workers=min(self.config.pricing_workers, len(all_skeletons)),
+                thread_name_prefix="crbstpp-structural",
+            ) as executor:
+                evaluated = list(executor.map(evaluate, all_skeletons))
+        else:
+            evaluated = [evaluate(antecedent) for antecedent in all_skeletons]
         admitted_skeletons: list[Antecedent] = []
         admitted_rules: list[RuleIdentity] = []
-        for antecedent in all_skeletons:
-            windows = (0,) if len(antecedent) == 1 else self.config.formation_windows
-            effective_windows = list(
-                self.engine.effective_windows(self.context, antecedent, windows)
-            )
+        for antecedent, effective_windows, window_count in evaluated:
             self.diagnostics.equivalent_window_identities += 2 * (
-                len(windows) - len(effective_windows)
+                window_count - len(effective_windows)
             )
             if not effective_windows:
                 self.diagnostics.empty_skeletons += 1
@@ -1132,41 +1194,74 @@ class SupportOptimizer:
             self._pricing_cache_bytes -= removed[0].nbytes + removed[1].nbytes
         return result
 
-    def _raw_pricing_components(
-        self, current: SupportRecord
+    def _pricing_rows(
+        self, current: SupportRecord, rows: np.ndarray
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """Cache eta and exact row derivatives once per fitted support state."""
+        """Exact predictor derivatives only at requested grid rows.
+
+        Outside ``matrix.active_rows`` every fitted model equals its common
+        baseline.  Looking up the compact aggregated design therefore produces
+        exactly the same values as a dense ``n_grid`` predictor without keeping
+        three grid-sized arrays per support.  This is essential for genuinely
+        continuous, sparsely observed IBM account histories.
+        """
+        rows = np.ascontiguousarray(rows, dtype=np.int64)
+        if np.any(rows < 0) or np.any(rows >= self.context.n_grid):
+            raise ValueError("pricing row is outside the observation grid")
         with self._state_lock:
-            cached = self._raw_pricing_state.get(current.support)
-            if cached is not None:
-                self._raw_pricing_state.move_to_end(current.support)
-                return cached
-        eta = self.engine.linear_predictor(
-            self.context, current.matrix, current.fit.coefficients
+            group_eta = self._row_eta_state.get(current.support)
+            if group_eta is not None:
+                self._row_eta_state.move_to_end(current.support)
+        if group_eta is None:
+            group_eta = np.ascontiguousarray(
+                current.matrix.x @ current.fit.coefficients, dtype=np.float64
+            )
+            with self._state_lock:
+                existing = self._row_eta_state.get(current.support)
+                if existing is not None:
+                    group_eta = existing
+                else:
+                    self._row_eta_state[current.support] = group_eta
+                    self._row_eta_cache_bytes += group_eta.nbytes
+                    while self._row_eta_cache_bytes > self._row_eta_cache_limit:
+                        _, removed = self._row_eta_state.popitem(last=False)
+                        self._row_eta_cache_bytes -= removed.nbytes
+        eta = np.full(len(rows), current.fit.coefficients[0], dtype=np.float64)
+        positions = np.searchsorted(current.matrix.active_rows, rows)
+        matched = positions < len(current.matrix.active_rows)
+        if len(current.matrix.active_rows):
+            safe = np.minimum(positions, len(current.matrix.active_rows) - 1)
+            matched &= current.matrix.active_rows[safe] == rows
+        if np.any(matched):
+            eta[matched] = group_eta[
+                current.matrix.active_design_groups[positions[matched]]
+            ]
+        event = np.zeros(len(rows), dtype=np.float64)
+        if len(self.context.target_rows) and len(rows):
+            target_positions = np.searchsorted(self.context.target_rows, rows)
+            event_matched = target_positions < len(self.context.target_rows)
+            target_safe = np.minimum(
+                target_positions, len(self.context.target_rows) - 1
+            )
+            event_matched &= self.context.target_rows[target_safe] == rows
+            if np.any(event_matched):
+                event[event_matched] = self.context.target_counts[
+                    target_positions[event_matched]
+                ]
+        exposure = np.full(len(rows), self.engine.tick_exposure, dtype=np.float64)
+        noevent = (
+            exposure - event
+            if self.context.dataset.likelihood == "first_event_cloglog"
+            else exposure
         )
-        first, second = loss_grid_sparse_event_derivatives(
+        _, first, second = loss_rows(
             eta,
             likelihood=self.context.dataset.likelihood,
-            exposure=self.engine.tick_exposure,
-            event_rows=self.context.target_rows,
-            event_counts=self.context.target_counts,
+            exposure_weight=exposure,
+            noevent_weight=noevent,
+            event_weight=event,
         )
-        result = (
-            np.ascontiguousarray(eta, dtype=np.float64),
-            np.ascontiguousarray(first, dtype=np.float64),
-            np.ascontiguousarray(second, dtype=np.float64),
-        )
-        size = sum(value.nbytes for value in result)
-        with self._state_lock:
-            existing = self._raw_pricing_state.get(current.support)
-            if existing is not None:
-                return existing
-            self._raw_pricing_state[current.support] = result
-            self._raw_pricing_cache_bytes += size
-            while self._raw_pricing_cache_bytes > self._raw_pricing_cache_limit:
-                _, removed = self._raw_pricing_state.popitem(last=False)
-                self._raw_pricing_cache_bytes -= sum(value.nbytes for value in removed)
-        return result
+        return eta, first, second
 
     def _price_skeleton(
         self,
@@ -1198,7 +1293,12 @@ class SupportOptimizer:
                     cached[window] = value
         if not missing:
             return cached
-        blocks = self.engine.blocks_many(self.context, antecedent, requested)
+        # Profiling compares W identities but retains only one of them in the
+        # frozen dictionary.  Keeping every losing block would consume most of
+        # the run memory without avoiding any required exact computation.
+        blocks = self.engine.blocks_many(
+            self.context, antecedent, requested, retain=len(requested) == 1
+        )
         maximum = blocks[max(requested)]
         if not len(maximum.rows):
             zeros = np.zeros(self.config.knot_count, dtype=np.float64)
@@ -1210,7 +1310,6 @@ class SupportOptimizer:
             }
         else:
             indices, inverse = self._pricing_components(current)
-            _, raw_first, raw_second = self._raw_pricing_components(current)
             gradients = {
                 window: np.zeros(self.config.knot_count, dtype=np.float64)
                 for window in missing
@@ -1231,8 +1330,7 @@ class SupportOptimizer:
             for start in range(0, len(maximum.rows), 131_072):
                 end = min(len(maximum.rows), start + 131_072)
                 rows = maximum.rows[start:end]
-                first = raw_first[rows]
-                second = raw_second[rows]
+                _, first, second = self._pricing_rows(current, rows)
                 candidates = []
                 for window in missing:
                     block = blocks[window]
@@ -1332,9 +1430,35 @@ class SupportOptimizer:
                 self._reliability_prices.move_to_end(key)
                 return cached
             self.diagnostics.reliability_price_evaluations += 1
-        gradient, hessian = self._price_skeleton(
-            current, rule.antecedent, (rule.window,), device=device
-        )[rule.window]
+        geometry_key = (current.support, rule.antecedent, rule.window)
+        with self._state_lock:
+            geometry = self._hierarchy_rule_geometries.get(geometry_key)
+            if geometry is not None:
+                self._hierarchy_rule_geometries.move_to_end(geometry_key)
+        if geometry is None:
+            self._price_hierarchy_skeleton(
+                current, rule.antecedent, (rule.window,), device=device
+            )
+            with self._state_lock:
+                geometry = self._hierarchy_rule_geometries.get(geometry_key)
+        if geometry is None or not geometry.nested:
+            result = _ReliabilityPrice(
+                True,
+                False,
+                math.nan,
+                math.nan,
+                math.nan,
+                math.nan,
+                1.0,
+                1.0,
+                1.0,
+                np.zeros(self.config.knot_count, dtype=np.float64),
+            )
+            with self._state_lock:
+                self.diagnostics.reliability_untestable_fail_open += 1
+                self._reliability_prices[key] = result
+            return result
+        gradient, hessian = geometry.gradient, geometry.hessian
         global_gain, direction = _nonnegative_quadratic_solution(
             float(rule.sign) * gradient, hessian
         )
@@ -1373,8 +1497,8 @@ class SupportOptimizer:
             else:
                 activation = block.values @ direction
                 eta_direction = float(rule.sign) * activation
-                eta, first, _ = self._raw_pricing_components(current)
-                row_gain = -first[block.rows] * eta_direction
+                _, block_first, _ = self._pricing_rows(current, block.rows)
+                row_gain = -block_first * eta_direction
                 horizon_rows = self.engine.footprint_rows(
                     self.context, rule, self.config.early_warning_horizon
                 )
@@ -1412,8 +1536,9 @@ class SupportOptimizer:
                 # Match certification's entity-level future probability: for
                 # either sign, sign*dP/d(beta)=exp(-H)*dH is nonnegative.
                 horizon_local, _ = self.context.rows_to_entity_time(horizon_rows)
+                horizon_eta = self._pricing_rows(current, horizon_rows)[0]
                 horizon_intensity = (
-                    np.exp(np.clip(eta[horizon_rows], -745.0, 700.0))
+                    np.exp(np.clip(horizon_eta, -745.0, 700.0))
                     / self.context.dataset.ticks_per_unit
                 )
                 hazard = np.bincount(
@@ -1424,7 +1549,13 @@ class SupportOptimizer:
                 hazard_direction = np.bincount(
                     local[matched],
                     weights=(
-                        np.exp(np.clip(eta[block.rows[matched]], -745.0, 700.0))
+                        np.exp(
+                            np.clip(
+                                self._pricing_rows(current, block.rows[matched])[0],
+                                -745.0,
+                                700.0,
+                            )
+                        )
                         * np.maximum(activation[matched], 0.0)
                         / self.context.dataset.ticks_per_unit
                     ),
@@ -1581,7 +1712,6 @@ class SupportOptimizer:
         self.diagnostics.priced_blocks += len(identities)
         # Build the common conditional information once before worker launch.
         self._pricing_components(current)
-        self._raw_pricing_components(current)
         grouped: dict[Antecedent, set[int]] = {}
         for rule in identities:
             grouped.setdefault(rule.antecedent, set()).add(rule.window)
@@ -1646,14 +1776,13 @@ class SupportOptimizer:
             )
         return sorted(prices, key=lambda item: (-item[0], item[1]))
 
-    def _hierarchy_quadratic_gain(
+    def _profile_hierarchy_geometry(
         self,
         gradient: np.ndarray,
         hessian: np.ndarray,
         closure_dimension: int,
-        sign: int,
-    ) -> tuple[float, float]:
-        """Return total and rule-only gains after profiling closure nuisance."""
+    ) -> tuple[float, np.ndarray, np.ndarray, bool]:
+        """Profile newly introduced free closure nuisance from one Fisher block."""
         gradient = np.asarray(gradient, dtype=np.float64)
         hessian = 0.5 * (
             np.asarray(hessian, dtype=np.float64)
@@ -1679,7 +1808,7 @@ class SupportOptimizer:
             if np.linalg.norm(residual, ord=np.inf) > math.sqrt(
                 self.config.solver_tolerance
             ) * max(1.0, np.linalg.norm(closure_gradient, ord=np.inf)):
-                return math.inf, math.inf
+                return math.inf, rule_gradient, rule_hessian, False
             closure_gain = max(
                 0.0,
                 0.5 * float(closure_gradient @ inverse @ closure_gradient),
@@ -1687,6 +1816,22 @@ class SupportOptimizer:
             cross = hessian[:closure_dimension, closure_dimension:]
             rule_gradient = rule_gradient - cross.T @ inverse @ closure_gradient
             rule_hessian = rule_hessian - cross.T @ inverse @ cross
+        rule_hessian = 0.5 * (rule_hessian + rule_hessian.T)
+        return closure_gain, rule_gradient, rule_hessian, True
+
+    def _hierarchy_quadratic_gain(
+        self,
+        gradient: np.ndarray,
+        hessian: np.ndarray,
+        closure_dimension: int,
+        sign: int,
+    ) -> tuple[float, float]:
+        """Return total and pure-rule gains after profiling closure nuisance."""
+        closure_gain, rule_gradient, rule_hessian, valid = (
+            self._profile_hierarchy_geometry(gradient, hessian, closure_dimension)
+        )
+        if not valid:
+            return math.inf, math.inf
         rule_gain = _nonnegative_quadratic_gain(
             float(sign) * rule_gradient, rule_hessian
         )
@@ -1728,7 +1873,15 @@ class SupportOptimizer:
         blocks: dict[tuple[Antecedent, int], SparseBlock] = {}
         for block_antecedent, block_windows in sorted(block_requests.items()):
             built = self.engine.blocks_many(
-                self.context, block_antecedent, tuple(sorted(block_windows))
+                self.context,
+                block_antecedent,
+                tuple(sorted(block_windows)),
+                # A lower-order W family is reused as hierarchy nuisance by
+                # many higher-order skeletons.  Retain it under the bounded
+                # block LRU; the candidate's own losing W blocks are still
+                # transient.  This removes repeated pair reconstruction across
+                # triplets without changing a single response value.
+                retain=(block_antecedent != antecedent or len(block_windows) == 1),
             )
             blocks.update(
                 ((block_antecedent, window), block) for window, block in built.items()
@@ -1743,6 +1896,12 @@ class SupportOptimizer:
             if nonempty_rows
             else np.zeros(0, dtype=np.int64)
         )
+        row_lookup: np.ndarray | None = None
+        if self.context.n_grid <= max(64_000_000, 8 * len(maximum_rows)):
+            row_lookup = np.full(self.context.n_grid, -1, dtype=np.int32)
+            row_lookup[maximum_rows] = np.arange(
+                len(maximum_rows), dtype=np.int32
+            )
         dimensions = {
             window: (len(specifications[window][0]) + 1) * self.config.knot_count
             for window in nested_windows
@@ -1783,89 +1942,136 @@ class SupportOptimizer:
             if right <= left:
                 return
             block_rows = block.rows[left:right]
+            positions = (
+                row_lookup[block_rows].astype(np.int64, copy=False)
+                if row_lookup is not None
+                else np.searchsorted(rows, block_rows) + int(
+                    np.searchsorted(maximum_rows, rows[0])
+                )
+            )
+            tile_origin = int(np.searchsorted(maximum_rows, rows[0]))
             destination[
-                np.searchsorted(rows, block_rows),
+                positions - tile_origin,
                 column : column + self.config.knot_count,
             ] = block.values[left:right]
 
-        for start in range(0, len(maximum_rows), tile_rows):
+        fill_blocks: list[tuple[np.ndarray, np.ndarray]] = []
+        fill_batches: list[int] = []
+        fill_columns: list[int] = []
+        for batch_index, window in enumerate(nested_windows):
+            closure = specifications[window][0]
+            for term_index, term in enumerate(closure):
+                block = blocks[(term.antecedent, term.window)]
+                fill_blocks.append((block.rows, block.values))
+                fill_batches.append(batch_index)
+                fill_columns.append(term_index * self.config.knot_count)
+            block = blocks[(antecedent, window)]
+            fill_blocks.append((block.rows, block.values))
+            fill_batches.append(batch_index)
+            fill_columns.append(len(closure) * self.config.knot_count)
+        fill_batch_array = np.asarray(fill_batches, dtype=np.int64)
+        fill_column_array = np.asarray(fill_columns, dtype=np.int64)
+
+        baseline_only = (
+            current.matrix.dimension == 1
+            and len(indices) == 1
+            and int(indices[0]) == 0
+        )
+        sparse_cells = sum(len(rows) * self.config.knot_count for rows, _ in fill_blocks)
+        dense_cells = batch_size * len(maximum_rows) * maximum_dimension
+        sparse_density = sparse_cells / max(1, dense_cells)
+        tile_starts: range | tuple[int, ...] = range(
+            0, len(maximum_rows), tile_rows
+        )
+        # This routing changes representation only.  Sparse intersection costs
+        # scale with nonzero block cells, whereas fused dense CUDA costs scale
+        # with the padded joint tensor.  Use the exact sparse algebra only when
+        # it removes at least 75% of those cells; both paths are parity-tested.
+        if baseline_only and row_lookup is not None and sparse_density <= 0.25:
+            _, all_first, all_second = self._pricing_rows(current, maximum_rows)
+            sparse_complete = True
+            for window in nested_windows:
+                closure = specifications[window][0]
+                joint_blocks = [
+                    (
+                        blocks[(term.antecedent, term.window)].rows,
+                        blocks[(term.antecedent, term.window)].values,
+                    )
+                    for term in closure
+                ]
+                rule_block = blocks[(antecedent, window)]
+                joint_blocks.append((rule_block.rows, rule_block.values))
+                sparse = sparse_joint_moments(
+                    joint_blocks, row_lookup, all_first, all_second
+                )
+                if sparse is None:
+                    sparse_complete = False
+                    break
+                gradient, hessian, cross = sparse
+                dimension = dimensions[window]
+                gradients[window][:dimension] = gradient
+                hessians[window][:dimension, :dimension] = hessian
+                crosses[window][0, :dimension] = cross
+            if sparse_complete:
+                tile_starts = ()
+
+        for start in tile_starts:
             rows = maximum_rows[start : start + tile_rows]
-            design = self.engine.design_at_rows_with_context(
-                self.context, current.matrix, rows
-            )
-            eta = design @ current.fit.coefficients
-            positions = np.searchsorted(self.context.target_rows, rows)
-            matched = positions < len(self.context.target_rows)
-            if len(self.context.target_rows):
-                safe = np.minimum(positions, len(self.context.target_rows) - 1)
-                matched &= self.context.target_rows[safe] == rows
-            event = np.zeros(len(rows), dtype=np.float64)
-            if np.any(matched):
-                event[matched] = self.context.target_counts[positions[matched]]
-            exposure = np.full(len(rows), self.engine.tick_exposure, dtype=np.float64)
-            noevent = (
-                exposure - event
-                if self.context.dataset.likelihood == "first_event_cloglog"
-                else exposure
-            )
-            _, first, second = loss_rows(
-                eta,
-                likelihood=self.context.dataset.likelihood,
-                exposure_weight=exposure,
-                noevent_weight=noevent,
-                event_weight=event,
-            )
+            _, first, second = self._pricing_rows(current, rows)
+            if baseline_only:
+                active_design = np.ones((len(rows), 1), dtype=np.float64)
+            elif len(indices):
+                active_design = self.engine.design_at_rows_with_context(
+                    self.context, current.matrix, rows
+                )[:, indices]
+            else:
+                active_design = np.zeros((len(rows), 0), dtype=np.float64)
             candidate_batch = np.zeros(
                 (batch_size, len(rows), maximum_dimension), dtype=np.float64
             )
-            for batch_index, window in enumerate(nested_windows):
-                closure = specifications[window][0]
-                for term_index, term in enumerate(closure):
+            compiled_fill = fill_candidate_batch(
+                candidate_batch,
+                maximum_rows,
+                row_lookup,
+                fill_blocks,
+                fill_batch_array,
+                fill_column_array,
+                start,
+            )
+            if not compiled_fill:
+                for batch_index, window in enumerate(nested_windows):
+                    closure = specifications[window][0]
+                    for term_index, term in enumerate(closure):
+                        insert(
+                            candidate_batch[batch_index],
+                            rows,
+                            blocks[(term.antecedent, term.window)],
+                            term_index * self.config.knot_count,
+                        )
                     insert(
                         candidate_batch[batch_index],
                         rows,
-                        blocks[(term.antecedent, term.window)],
-                        term_index * self.config.knot_count,
+                        blocks[(antecedent, window)],
+                        len(closure) * self.config.knot_count,
                     )
-                insert(
-                    candidate_batch[batch_index],
-                    rows,
-                    blocks[(antecedent, window)],
-                    len(closure) * self.config.knot_count,
-                )
-            tile_gradients = np.zeros((batch_size, maximum_dimension), dtype=np.float64)
-            tile_hessians = np.zeros(
-                (batch_size, maximum_dimension, maximum_dimension),
-                dtype=np.float64,
+            tile_gradients, tile_hessians = moments_batch(
+                candidate_batch, first, second, device=device
             )
             tile_crosses = np.zeros(
                 (batch_size, len(indices), maximum_dimension), dtype=np.float64
             )
-            active_design = design[:, indices]
-            for batch_index in range(batch_size):
-                candidate = candidate_batch[batch_index]
-                joint = (
-                    np.concatenate((active_design, candidate), axis=1)
-                    if len(indices)
-                    else candidate
-                )
-                joint, reduced_first, reduced_second, _ = aggregate_design_rows(
-                    joint,
-                    first,
-                    second,
-                    np.zeros_like(first),
-                    copy_input=True,
-                )
-                reduced_candidate = joint[:, len(indices) :]
-                tile_gradients[batch_index], tile_hessians[batch_index] = moments(
-                    reduced_candidate,
-                    reduced_first,
-                    reduced_second,
-                    device=device,
-                )
-                if len(indices):
-                    tile_crosses[batch_index] = joint[:, : len(indices)].T @ (
-                        reduced_second[:, None] * reduced_candidate
+            if len(indices):
+                if baseline_only:
+                    tile_crosses[:, 0, :] = np.einsum(
+                        "r,brd->bd", second, candidate_batch, optimize=True
+                    )
+                else:
+                    tile_crosses = np.einsum(
+                        "ri,r,brd->bid",
+                        active_design,
+                        second,
+                        candidate_batch,
+                        optimize=True,
                     )
             for batch_index, window in enumerate(nested_windows):
                 gradients[window] += tile_gradients[batch_index]
@@ -1881,12 +2087,44 @@ class SupportOptimizer:
                 cross = crosses[window][:, :dimension]
                 hessian = hessian - cross.T @ inverse @ cross
             closure_dimension = dimension - self.config.knot_count
-            negative_total, negative_rule = self._hierarchy_quadratic_gain(
-                gradient, hessian, closure_dimension, -1
+            closure_gain, rule_gradient, rule_hessian, valid = (
+                self._profile_hierarchy_geometry(
+                    gradient, hessian, closure_dimension
+                )
             )
-            positive_total, positive_rule = self._hierarchy_quadratic_gain(
-                gradient, hessian, closure_dimension, 1
+            if not valid:
+                output[window] = (
+                    math.inf,
+                    math.inf,
+                    math.inf,
+                    math.inf,
+                    closure_dimension,
+                    True,
+                )
+                continue
+            with self._state_lock:
+                geometry_key = (current.support, antecedent, window)
+                self._hierarchy_rule_geometries[geometry_key] = (
+                    _HierarchyRuleGeometry(
+                        np.ascontiguousarray(rule_gradient),
+                        np.ascontiguousarray(rule_hessian),
+                        True,
+                    )
+                )
+                self._hierarchy_rule_geometries.move_to_end(geometry_key)
+                while (
+                    len(self._hierarchy_rule_geometries)
+                    > self._hierarchy_rule_geometry_limit
+                ):
+                    self._hierarchy_rule_geometries.popitem(last=False)
+            negative_rule = _nonnegative_quadratic_gain(
+                -rule_gradient, rule_hessian
             )
+            positive_rule = _nonnegative_quadratic_gain(
+                rule_gradient, rule_hessian
+            )
+            negative_total = closure_gain + negative_rule
+            positive_total = closure_gain + positive_rule
             output[window] = (
                 negative_total,
                 positive_total,
@@ -1918,6 +2156,18 @@ class SupportOptimizer:
             for antecedent, windows in sorted(grouped.items())
         ]
         devices = self.config.pricing_devices
+        if devices:
+            worker_count = min(
+                self.config.pricing_workers,
+                max(len(devices), self.config.pricing_workers // 2),
+            )
+            device_schedule = (
+                *devices,
+                *("cpu",) * max(0, worker_count - len(devices)),
+            )
+        else:
+            worker_count = self.config.pricing_workers
+            device_schedule = ("cpu",) * worker_count
 
         def price_group(
             indexed: tuple[int, tuple[Antecedent, tuple[int, ...]]],
@@ -1927,14 +2177,17 @@ class SupportOptimizer:
         ]:
             configure_cpu_threads(1)
             index, (antecedent, windows) = indexed
-            device = devices[index % len(devices)] if devices else "cpu"
+            device = device_schedule[index % len(device_schedule)]
             return antecedent, self._price_hierarchy_skeleton(
                 current, antecedent, windows, device=device
             )
 
         if len(groups) > 1:
             with ThreadPoolExecutor(
-                max_workers=min(self.config.pricing_workers, len(groups)),
+                # Two GPU workers plus bounded one-thread CPU workers keep both
+                # accelerators and spare physical cores busy without allowing
+                # all 12 producers to retain full W tensors simultaneously.
+                max_workers=min(worker_count, len(groups)),
                 thread_name_prefix="crbstpp-block-score",
             ) as executor:
                 component_items = list(executor.map(price_group, enumerate(groups)))
@@ -2018,8 +2271,15 @@ class SupportOptimizer:
     def _rank_profiled_identities(
         self, current: SupportRecord, identities: tuple[RuleIdentity, ...]
     ) -> list[tuple[float, float, RuleIdentity]]:
-        """Profile the best global-MDL W/sign once per antecedent skeleton."""
-        scored = self._rank_mdl_identities(current, identities)
+        """Profile one hierarchy-conditioned W/sign per antecedent skeleton.
+
+        New strict lower-order terms are profiled as free nuisance before the
+        reported rule gain is scored.  Both the complete add block and the pure
+        reported branch must cover their respective MDL codes.  This prevents
+        lower-order closure signal from selecting the wrong higher-order W/sign.
+        """
+        hierarchy_scored = self._rank_block_identities(current, identities)
+        scored = [(net, gain, rule) for net, gain, rule, _ in hierarchy_scored]
         profiled: list[tuple[float, float, RuleIdentity]] = []
         for antecedent in sorted({item[2].antecedent for item in scored}):
             group = [item for item in scored if item[2].antecedent == antecedent]
@@ -2033,29 +2293,17 @@ class SupportOptimizer:
     def _reliability_survivors(
         self, current: SupportRecord, rules: tuple[RuleIdentity, ...]
     ) -> tuple[RuleIdentity, ...]:
-        """Apply reliability pricing only after cheaper exact-safe screens."""
-        if not self.config.reliability_aware_search or not rules:
-            return rules
-        devices = self.config.pricing_devices or ("cpu",)
+        """Preserve every block-score-admissible rule for independent certification.
 
-        def evaluate(indexed: tuple[int, RuleIdentity]) -> tuple[RuleIdentity, bool]:
-            configure_cpu_threads(1)
-            index, rule = indexed
-            price = self._reliability_price(
-                current, rule, device=devices[index % len(devices)]
-            )
-            return rule, price.admissible
-
-        if len(rules) == 1:
-            evaluated = [evaluate((0, rules[0]))]
-        else:
-            with ThreadPoolExecutor(
-                max_workers=min(self.config.pricing_workers, len(rules)),
-                thread_name_prefix="crbstpp-reliability-price",
-            ) as executor:
-                evaluated = list(executor.map(evaluate, enumerate(rules)))
-        admitted = {rule for rule, keep in evaluated if keep}
-        return tuple(rule for rule in rules if rule in admitted)
+        D_fit analogues of F1--F3 are neither safe upper bounds nor independent
+        reliability evidence.  Computing them for every proposal previously
+        consumed a second full footprint pass while deleting no rule after the
+        fail-open correction.  The already available hierarchy-conditioned
+        Fisher geometry supplies the same exact-solver warm start at zero extra
+        pass cost; actual F1--F3 remain frozen D_cert tests.
+        """
+        del current
+        return rules
 
     def _local_score_maxima(
         self, profiled: list[tuple[float, float, RuleIdentity]]
@@ -2484,6 +2732,17 @@ class SupportOptimizer:
 
         rules = tuple(item[2] for item in admissible)
         safe = set(self._safe_identity_survivors(current, rules, acceptance))
+        # Adding a rule that promotes an existing free closure block into a
+        # signed reported block is a nonnested model replacement.  Frozen-
+        # current add bounds do not apply because the old nuisance coefficient
+        # disappears.  Such proposals must fail open to a direct exact refit.
+        safe.update(
+            rule
+            for rule in rules
+            if not set(current.matrix.closure).issubset(
+                hierarchy_closure(current.support.add(rule))
+            )
+        )
         with self._state_lock:
             self.diagnostics.restricted_relaxation_screens += len(rules) - len(safe)
         admissible = [item for item in admissible if item[2] in safe]
@@ -2510,6 +2769,7 @@ class SupportOptimizer:
         devices = self.config.pricing_devices or ("cpu",)
         best_score = acceptance
         best_rule: RuleIdentity | None = None
+        best_exact: SupportRecord | None = None
         audited = 0
         for index, (analytic_upper, _, _, rule) in enumerate(viable):
             if analytic_upper <= best_score + self.config.search_tolerance:
@@ -2517,6 +2777,22 @@ class SupportOptimizer:
                     self.diagnostics.lazy_exact_refits_avoided += len(viable) - index
                     self.diagnostics.lazy_bound_stops += 1
                 break
+            nested = set(current.matrix.closure).issubset(
+                hierarchy_closure(current.support.add(rule))
+            )
+            if not nested:
+                record = self.fit(current.support.add(rule), current)
+                score = record.score
+                audited += 1
+                if score > best_score + self.config.search_tolerance or (
+                    best_rule is not None
+                    and abs(score - best_score) <= self.config.search_tolerance
+                    and rule < best_rule
+                ):
+                    best_score = score
+                    best_rule = rule
+                    best_exact = record
+                continue
             # The cloglog conjugate requires scalar root solves on mixed
             # aggregate rows.  On this model its certified dual solve is more
             # expensive than the exact M-dimensional primal block solve.  Skip
@@ -2545,10 +2821,13 @@ class SupportOptimizer:
             ):
                 best_score = score
                 best_rule = rule
+                best_exact = None
         with self._state_lock:
             self.diagnostics.restricted_add_audits += audited
         if best_rule is None:
             return None
+        if best_exact is not None:
+            return best_exact
         record = self._full_refit_after_restricted_add(current, best_rule)
         if record.score <= acceptance + self.config.search_tolerance:
             raise AssertionError(
@@ -2700,7 +2979,7 @@ class SupportOptimizer:
         try:
             geometry = self._restricted_geometry(current, rule)
             if geometry is not None:
-                raw_offset = self._raw_pricing_components(current)[0][geometry.rows]
+                raw_offset = self._pricing_rows(current, geometry.rows)[0]
                 # ``row_patterns`` exactly identifies the unsigned sparse design
                 # row.  Aggregating the two-column (offset, pattern-id) key is
                 # therefore identical to aggregating (offset, full design), but
@@ -2751,9 +3030,19 @@ class SupportOptimizer:
         finally:
             with self._state_lock:
                 if succeeded:
-                    self._restricted_add_problems.setdefault(current.support, {})[
-                        identity
-                    ] = problem
+                    state = self._restricted_add_problems.setdefault(
+                        current.support, {}
+                    )
+                    state[identity] = problem
+                    # A restricted problem can contain millions of rows.  Search
+                    # is serial within one support state and sign-paired calls
+                    # share the same identity, so retaining more than the most
+                    # recent identity cannot save production work.  Bounding it
+                    # here removes the formerly unbounded multi-GB cache without
+                    # changing any fitted problem or proposal order.
+                    for previous in tuple(state):
+                        if previous != identity:
+                            state.pop(previous, None)
                     self.diagnostics.restricted_problem_builds += 1
                 completed = self._restricted_add_events.pop(event_key)
                 completed.set()
@@ -2878,10 +3167,19 @@ class SupportOptimizer:
             design[:, -self.config.knot_count :] *= -1.0
         warm: np.ndarray | None = None
         if self.config.reliability_aware_search:
-            price = self._reliability_prices.get((current.support, rule))
-            if price is not None and np.any(price.direction > 0.0):
+            geometry = self._hierarchy_rule_geometries.get(
+                (current.support, rule.antecedent, rule.window)
+            )
+            direction = (
+                _nonnegative_quadratic_solution(
+                    float(rule.sign) * geometry.gradient, geometry.hessian
+                )[1]
+                if geometry is not None and geometry.nested
+                else np.zeros(self.config.knot_count, dtype=np.float64)
+            )
+            if np.any(direction > 0.0):
                 candidate = np.zeros(design.shape[1], dtype=np.float64)
-                candidate[-self.config.knot_count :] = price.direction
+                candidate[-self.config.knot_count :] = direction
                 # A Fisher step can be too long away from the local quadratic
                 # region.  Backtracking to a feasible NLL-improving point is
                 # deterministic and never changes the exact block optimum.
@@ -2930,7 +3228,6 @@ class SupportOptimizer:
     def _best_restricted_drop(self, current: SupportRecord) -> SupportRecord | None:
         if not current.support.rules:
             return None
-        raw_eta = self._raw_pricing_components(current)[0]
         candidates: list[tuple[float, Support]] = []
         current_baseline = (
             current.matrix.free_dimension - current.matrix.closure_dimension
@@ -2983,7 +3280,7 @@ class SupportOptimizer:
                         removed[np.searchsorted(rows, block.rows)] += (
                             block.values @ coefficient
                         )
-                old_eta = raw_eta[rows]
+                old_eta = self._pricing_rows(current, rows)[0]
                 new_eta = old_eta - removed
                 event = np.zeros(len(rows), dtype=np.float64)
                 if len(self.context.target_rows):
@@ -3182,7 +3479,25 @@ class SupportOptimizer:
         self.diagnostics.restricted_block_terminals += 1
         return None
 
-    def search(self) -> SearchResult:
+    def search(
+        self,
+        *,
+        completed_paths: tuple[
+            tuple[Support, Support, dict[str, object]], ...
+        ] = (),
+        active_path: tuple[
+            Support, Support, tuple[dict[str, object], ...]
+        ]
+        | None = None,
+        progress_callback: Callable[
+            [
+                tuple[tuple[Support, Support, dict[str, object]], ...],
+                tuple[Support, Support, tuple[dict[str, object], ...]] | None,
+            ],
+            None,
+        ]
+        | None = None,
+    ) -> SearchResult:
         positive_atoms: dict[Support, SupportRecord] = {}
         empty = self.records[EMPTY_SUPPORT]
         for record in self._standalone_profiled_atoms(empty):
@@ -3202,9 +3517,31 @@ class SupportOptimizer:
         resolved_terminal: dict[Support, Support] = {}
         terminals: dict[Support, SupportRecord] = {}
         paths: list[dict[str, object]] = []
+        completed: dict[Support, tuple[Support, dict[str, object]]] = {}
+        valid_starts = {record.support for record in starts}
+        for start_support, terminal_support, path in completed_paths:
+            if start_support not in valid_starts:
+                continue
+            terminal_record = self.fit(terminal_support, empty)
+            if terminal_record.score > self.config.search_tolerance:
+                terminals[terminal_support] = terminal_record
+            completed[start_support] = (terminal_support, path)
+            paths.append(path)
+        resumed_active = (
+            active_path
+            if active_path is not None and active_path[0] in valid_starts
+            else None
+        )
         for start_record in starts:
-            current = start_record
-            moves: list[dict[str, object]] = []
+            if start_record.support in completed:
+                continue
+            if resumed_active is not None and resumed_active[0] == start_record.support:
+                current = self.fit(resumed_active[1], start_record)
+                moves = list(resumed_active[2])
+                resumed_active = None
+            else:
+                current = start_record
+                moves = []
             visited: list[Support] = []
             while True:
                 self.diagnostics.states += 1
@@ -3258,17 +3595,33 @@ class SupportOptimizer:
                     }
                 )
                 current = next_record
+                if progress_callback is not None:
+                    progress_callback(
+                        tuple(
+                            (start, terminal, path)
+                            for start, (terminal, path) in completed.items()
+                        ),
+                        (start_record.support, current.support, tuple(moves)),
+                    )
             if current.score > 0:
                 terminals[current.support] = current
                 for support in visited:
                     resolved_terminal[support] = current.support
-            paths.append(
-                {
-                    "start": support_key(start_record.support),
-                    "terminal": support_key(current.support),
-                    "moves": moves,
-                }
-            )
+            path = {
+                "start": support_key(start_record.support),
+                "terminal": support_key(current.support),
+                "moves": moves,
+            }
+            paths.append(path)
+            completed[start_record.support] = (current.support, path)
+            if progress_callback is not None:
+                progress_callback(
+                    tuple(
+                        (start, terminal, item)
+                        for start, (terminal, item) in completed.items()
+                    ),
+                    None,
+                )
         # Every exact-positive atom and every terminal support is frozen for
         # F0--F3.  In particular, higher-order atoms cannot be reported merely
         # because their automatic closure fitted well: F2 must validate their

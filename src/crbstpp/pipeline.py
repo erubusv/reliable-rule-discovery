@@ -11,7 +11,11 @@ from typing import Any
 import yaml
 import numpy as np
 
-from .certification import certify_family
+from .certification import (
+    CertificationResult,
+    CertifiedModel,
+    certify_family,
+)
 from .checkpoint import (
     CHECKPOINT_SCHEMA,
     RESULT_SCHEMA,
@@ -23,7 +27,7 @@ from .config import RunConfig
 from .data import Dataset
 from .ensemble import fit_ensemble
 from .objective import SupportRecord
-from .report import RunReport
+from .report import Certificate, RunReport
 from .response import Context
 from .rules import RuleIdentity, Support
 from .search import SupportOptimizer, support_key
@@ -52,43 +56,101 @@ def _support_from_payload(payload: list[dict[str, object]]) -> Support:
     )
 
 
+def _certificate_from_payload(payload: dict[str, object]) -> Certificate:
+    return Certificate(
+        support_key=str(payload["support_key"]),
+        f0=bool(payload["f0"]),
+        f1_pvalue=(
+            None if payload.get("f1_pvalue") is None else float(payload["f1_pvalue"])
+        ),
+        f2_pvalues=tuple(float(value) for value in payload.get("f2_pvalues", [])),
+        f3=bool(payload["f3"]),
+        family_pvalue=(
+            None
+            if payload.get("family_pvalue") is None
+            else float(payload["family_pvalue"])
+        ),
+        holm_adjusted_pvalue=(
+            None
+            if payload.get("holm_adjusted_pvalue") is None
+            else float(payload["holm_adjusted_pvalue"])
+        ),
+        certified=bool(payload["certified"]),
+        reasons=tuple(str(value) for value in payload.get("reasons", [])),
+    )
+
+
 def _record_payload(
-    record: SupportRecord, predicate_names: tuple[str, ...]
+    record: SupportRecord,
+    predicate_names: tuple[str, ...],
+    basis: np.ndarray,
 ) -> dict[str, object]:
-    return {
-        "key": support_key(record.support),
-        "rules": [
+    def direction(profile: np.ndarray) -> str:
+        tolerance = 1.0e-12 * max(1.0, float(np.max(np.abs(profile), initial=0.0)))
+        if np.all(profile >= -tolerance) and np.any(profile > tolerance):
+            return "excitation"
+        if np.all(profile <= tolerance) and np.any(profile < -tolerance):
+            return "inhibition"
+        if np.all(np.abs(profile) <= tolerance):
+            return "zero"
+        return "mixed"
+
+    rules = []
+    for rule, block in zip(
+        record.support.rules, record.matrix.rule_slices, strict=True
+    ):
+        coefficients = record.fit.coefficients[block]
+        profile = float(rule.sign) * (coefficients @ basis)
+        rules.append(
             {
                 **_rule_payload(rule),
                 "antecedent_names": [
                     predicate_names[index] for index in rule.antecedent
                 ],
-                "kernel": record.fit.coefficients[block].tolist(),
+                "kernel": coefficients.tolist(),
+                "lag_profile": profile.tolist(),
+                "direction": direction(profile),
+                "role": "reported_rule",
                 "reported": True,
             }
-            for rule, block in zip(
-                record.support.rules, record.matrix.rule_slices, strict=True
-            )
-        ],
-        "closure": [
+        )
+    closure = []
+    closure_width = (
+        record.matrix.closure_dimension // len(record.matrix.closure)
+        if record.matrix.closure
+        else 0
+    )
+    closure_left = record.matrix.free_dimension - record.matrix.closure_dimension
+    for index, term in enumerate(record.matrix.closure):
+        coefficients = record.fit.coefficients[
+            closure_left + index * closure_width : closure_left
+            + (index + 1) * closure_width
+        ]
+        profile = coefficients @ basis
+        closure.append(
             {
                 "antecedent": list(term.antecedent),
+                "antecedent_names": [
+                    predicate_names[item] for item in term.antecedent
+                ],
                 "window": term.window,
-                "kernel": record.fit.coefficients[
-                    record.matrix.free_dimension
-                    - record.matrix.closure_dimension
-                    + index
-                    * (
-                        record.matrix.closure_dimension // len(record.matrix.closure)
-                    ) : record.matrix.free_dimension
-                    - record.matrix.closure_dimension
-                    + (index + 1)
-                    * (record.matrix.closure_dimension // len(record.matrix.closure))
-                ].tolist(),
+                "kernel": coefficients.tolist(),
+                "lag_profile": profile.tolist(),
+                "direction": direction(profile),
+                "role": "hierarchy_nuisance",
                 "reported": False,
+                "certified_separately": False,
             }
-            for index, term in enumerate(record.matrix.closure)
-        ],
+        )
+    return {
+        "key": support_key(record.support),
+        "rules": rules,
+        "closure": closure,
+        "interpretation": (
+            "Only rules are certified identities. Closure kernels are shared "
+            "hierarchy nuisance and are shown solely to make a higher-order "
+            "rule's lower-order decomposition explicit."
+        ),
         "score": record.score,
         "penalty": record.penalty,
         "nll": record.fit.nll,
@@ -203,7 +265,70 @@ def run(
     else:
         logger.info("starting support search")
         search_started = time.perf_counter()
-        search_result = optimizer.search()
+        resumed_paths: tuple[
+            tuple[Support, Support, dict[str, object]], ...
+        ] = ()
+        resumed_active: tuple[
+            Support, Support, tuple[dict[str, object], ...]
+        ] | None = None
+        if checkpoint and checkpoint.get("stage") == "search_progress":
+            resumed_paths = tuple(
+                (
+                    _support_from_payload(item["start"]),
+                    _support_from_payload(item["terminal"]),
+                    item["path"],
+                )
+                for item in checkpoint.get("completed_paths", [])
+            )
+            active = checkpoint.get("active_path")
+            if isinstance(active, dict):
+                resumed_active = (
+                    _support_from_payload(active["start"]),
+                    _support_from_payload(active["current"]),
+                    tuple(active.get("moves", [])),
+                )
+
+        def save_search_progress(
+            completed: tuple[
+                tuple[Support, Support, dict[str, object]], ...
+            ],
+            active: tuple[
+                Support, Support, tuple[dict[str, object], ...]
+            ]
+            | None,
+        ) -> None:
+            atomic_json(
+                checkpoint_path,
+                {
+                    "schema": CHECKPOINT_SCHEMA,
+                    "stage": "search_progress",
+                    "config_digest": config.digest,
+                    "dataset_digest": dataset.digest,
+                    "completed_paths": [
+                        {
+                            "start": _support_payload(start),
+                            "terminal": _support_payload(terminal),
+                            "path": path,
+                        }
+                        for start, terminal, path in completed
+                    ],
+                    "active_path": (
+                        {
+                            "start": _support_payload(active[0]),
+                            "current": _support_payload(active[1]),
+                            "moves": list(active[2]),
+                        }
+                        if active is not None
+                        else None
+                    ),
+                },
+            )
+
+        search_result = optimizer.search(
+            completed_paths=resumed_paths,
+            active_path=resumed_active,
+            progress_callback=save_search_progress,
+        )
         search_seconds = time.perf_counter() - search_started
         family = search_result.family
         atomic_json(
@@ -217,23 +342,46 @@ def run(
                 "diagnostics": asdict(search_result.diagnostics),
             },
         )
-    logger.info("certifying family_size=%d", len(family))
-    certification_started = time.perf_counter()
-    certification = certify_family(optimizer, cert_context, family, config)
-    certification_seconds = time.perf_counter() - certification_started
-    atomic_json(
-        checkpoint_path,
-        {
-            "schema": CHECKPOINT_SCHEMA,
-            "stage": "certification_complete",
-            "config_digest": config.digest,
-            "dataset_digest": dataset.digest,
-            "family": [_support_payload(record.support) for record in family],
-            "certificates": [
-                model.certificate.to_dict() for model in certification.models
-            ],
-        },
-    )
+    optimizer.prepare_certification(family)
+    if checkpoint and checkpoint.get("stage") == "certification_complete":
+        by_key = {support_key(record.support): record for record in family}
+        restored_models = []
+        for item in checkpoint.get("certification", []):
+            certificate = _certificate_from_payload(item["certificate"])
+            record = by_key.get(certificate.support_key)
+            if record is None:
+                raise ValueError("certification checkpoint references unknown support")
+            restored_models.append(
+                CertifiedModel(record, certificate, item.get("diagnostics", {}))
+            )
+        certification = CertificationResult(
+            tuple(restored_models),
+            tuple(model for model in restored_models if model.certificate.certified),
+            len(restored_models),
+        )
+        certification_seconds = 0.0
+    else:
+        logger.info("certifying family_size=%d", len(family))
+        certification_started = time.perf_counter()
+        certification = certify_family(optimizer, cert_context, family, config)
+        certification_seconds = time.perf_counter() - certification_started
+        atomic_json(
+            checkpoint_path,
+            {
+                "schema": CHECKPOINT_SCHEMA,
+                "stage": "certification_complete",
+                "config_digest": config.digest,
+                "dataset_digest": dataset.digest,
+                "family": [_support_payload(record.support) for record in family],
+                "certification": [
+                    {
+                        "certificate": model.certificate.to_dict(),
+                        "diagnostics": model.diagnostics,
+                    }
+                    for model in certification.models
+                ],
+            },
+        )
     combined_codes = np.sort(np.concatenate([fit_codes, cert_codes])).astype(np.int32)
     combined_context = Context.make(dataset, combined_codes)
     certified_supports = tuple(
@@ -275,7 +423,8 @@ def run(
         },
         "search": search_payload,
         "family": [
-            _record_payload(record, dataset.predicate_names) for record in family
+            _record_payload(record, dataset.predicate_names, optimizer.engine.basis)
+            for record in family
         ],
         "certification": {
             "family_size": certification.family_size,

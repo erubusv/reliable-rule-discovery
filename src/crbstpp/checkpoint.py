@@ -7,8 +7,8 @@ from pathlib import Path
 from typing import Any
 
 
-CHECKPOINT_SCHEMA = "crbstpp.checkpoint.v1"
-RESULT_SCHEMA = "crbstpp.result.v2"
+CHECKPOINT_SCHEMA = "crbstpp.checkpoint.v2"
+RESULT_SCHEMA = "crbstpp.result.v3"
 
 
 def atomic_json(path: str | Path, payload: dict[str, Any]) -> None:

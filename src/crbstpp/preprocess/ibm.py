@@ -314,6 +314,11 @@ def preprocess_ibm(
             "direct_target_proxy_excluded": True,
             "strict_future_effect_required": True,
             "atomic_predicates": True,
+            # Accounts are linked by the same transaction graph.  Treating
+            # them as independent entity-level certification observations
+            # would invalidate F1--F3 standard errors; IBM remains usable for
+            # discovery, but not for reliability certification in v1.
+            "independent_certification_units": False,
         },
         provenance={
             "preprocessor": "crbstpp.preprocess.ibm.v1",
@@ -322,6 +327,9 @@ def preprocess_ibm(
             "calibration": "chronological first 20% of transactions; target labels unused",
             "timestamp_resolution": "one minute; Poisson exposure is measured in hours",
             "predicate_count": len(PREDICATES),
+            "certification_limitation": (
+                "transaction-linked accounts are not independent inference units"
+            ),
         },
     )
 

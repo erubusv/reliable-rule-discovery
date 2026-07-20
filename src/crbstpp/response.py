@@ -208,6 +208,37 @@ class ResponseEngine:
             self._row_threshold_cache_size = 0
             self._compute_locks.clear()
 
+    def retain_support_blocks(
+        self, context: Context, supports: tuple[Support, ...]
+    ) -> None:
+        """Drop discovery-only W blocks while retaining frozen-family models."""
+        specifications: set[tuple[Antecedent, int]] = set()
+        antecedents: set[Antecedent] = set()
+        for support in supports:
+            for term in hierarchy_closure(support):
+                specifications.add((term.antecedent, term.window))
+                antecedents.add(term.antecedent)
+            for rule in support.rules:
+                specifications.add((rule.antecedent, rule.window))
+                antecedents.add(rule.antecedent)
+        context_id = id(context)
+        with self._lock:
+            for key in tuple(self._cache):
+                if key[0] != context_id or (key[1], key[2]) not in specifications:
+                    removed = self._cache.pop(key)
+                    self._cache_size -= removed.nbytes
+            for key in tuple(self._completion_cache):
+                if key[0] != context_id or key[1] not in antecedents:
+                    removed = self._completion_cache.pop(key)
+                    self._completion_cache_size -= sum(
+                        array.nbytes for array in removed
+                    )
+            self._footprint_cache.clear()
+            self._footprint_cache_size = 0
+            self._row_threshold_cache.clear()
+            self._row_threshold_cache_size = 0
+            self._compute_locks.clear()
+
     def _source(
         self, predicate: int, context: Context
     ) -> tuple[np.ndarray, np.ndarray]:
@@ -526,6 +557,8 @@ class ResponseEngine:
         context: Context,
         antecedent: Antecedent,
         windows: tuple[int, ...],
+        *,
+        retain: bool = True,
     ) -> dict[int, SparseBlock]:
         """Build every nested W block after one pass over completions.
 
@@ -547,7 +580,7 @@ class ResponseEngine:
                 self._cache.move_to_end(keys[window])
         if len(cached) == len(requested):
             return cached
-        group_key = (id(context), antecedent, *requested)
+        group_key = (id(context), antecedent, retain, *requested)
         with self._compute_lock("blocks-many", group_key):
             with self._lock:
                 cached = {
@@ -569,11 +602,23 @@ class ResponseEngine:
                     np.zeros((0, self.knot_count), dtype=np.float64),
                 )
                 return {
-                    window: self._retain_block(keys[window], empty)
+                    window: self._retain_block(keys[window], empty) if retain else empty
                     for window in requested
                 }
-            lookup = np.full(context.n_grid, -1, dtype=np.int64)
-            lookup[threshold_rows] = np.arange(len(threshold_rows), dtype=np.int64)
+            # A dense global-row lookup is the fastest exact representation on
+            # ordinary grids.  On fine continuous-time grids it can dwarf the
+            # actual response footprint, so use exact sorted-row lookup there.
+            # int32 is sufficient because the accumulator itself cannot have
+            # more than 2^31 rows in memory.
+            dense_lookup = context.n_grid <= max(64_000_000, 8 * len(threshold_rows))
+            lookup: np.ndarray | None
+            if dense_lookup:
+                lookup = np.full(context.n_grid, -1, dtype=np.int32)
+                lookup[threshold_rows] = np.arange(
+                    len(threshold_rows), dtype=np.int32
+                )
+            else:
+                lookup = None
             accumulator = np.zeros(
                 (len(threshold_rows), self.knot_count), dtype=np.float64
             )
@@ -593,16 +638,18 @@ class ResponseEngine:
                 window_ticks = window * self.dataset.ticks_per_unit
                 right = int(np.searchsorted(spans, window_ticks, side="right"))
                 if right > left:
-                    compiled = accumulate_kernel(
-                        entities[left:right],
-                        times[left:right],
-                        context.starts,
-                        context.ends,
-                        context.offsets,
-                        self.basis,
-                        lookup,
-                        accumulator,
-                    )
+                    compiled = False
+                    if lookup is not None:
+                        compiled = accumulate_kernel(
+                            entities[left:right],
+                            times[left:right],
+                            context.starts,
+                            context.ends,
+                            context.offsets,
+                            self.basis,
+                            lookup,
+                            accumulator,
+                        )
                     if not compiled:
                         contributions = kernel_contributions(
                             entities[left:right],
@@ -630,18 +677,42 @@ class ResponseEngine:
                                     int(context.ends[entity] - completion),
                                 )
                                 for lag in range(1, remaining + 1):
-                                    accumulator[lookup[base + lag]] += self.basis[
-                                        :, lag - 1
-                                    ]
+                                    row = base + lag
+                                    position = (
+                                        int(lookup[row])
+                                        if lookup is not None
+                                        else int(np.searchsorted(threshold_rows, row))
+                                    )
+                                    if (
+                                        position >= len(threshold_rows)
+                                        or threshold_rows[position] != row
+                                    ):
+                                        raise AssertionError(
+                                            "kernel row missing from response footprint"
+                                        )
+                                    accumulator[position] += self.basis[:, lag - 1]
                         else:
                             raw_rows, raw_values = contributions
-                            np.add.at(accumulator, lookup[raw_rows], raw_values)
+                            if lookup is not None:
+                                positions = lookup[raw_rows].astype(
+                                    np.int64, copy=False
+                                )
+                            else:
+                                positions = np.searchsorted(threshold_rows, raw_rows)
+                                if np.any(positions >= len(threshold_rows)) or not np.array_equal(
+                                    threshold_rows[positions], raw_rows
+                                ):
+                                    raise AssertionError(
+                                        "kernel rows are outside the response footprint"
+                                    )
+                            np.add.at(accumulator, positions, raw_values)
                 left = right
                 footprint = minimum_spans <= window_ticks
                 rows = threshold_rows[footprint]
                 values = accumulator[footprint].copy()
-                output[window] = self._retain_block(
-                    keys[window], SparseBlock(rows, values)
+                result = SparseBlock(rows, values)
+                output[window] = (
+                    self._retain_block(keys[window], result) if retain else result
                 )
             return output
 
@@ -856,7 +927,7 @@ class ResponseEngine:
             closure=closure,
             active_rows=union,
             active_design_groups=np.ascontiguousarray(
-                design_groups[:active_count], dtype=np.int64
+                design_groups[:active_count], dtype=np.int32
             ),
             active_age_bins=age_bins,
             aggregate_bins=aggregate_bins,
