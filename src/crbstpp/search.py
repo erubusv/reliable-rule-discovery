@@ -11,7 +11,7 @@ import numpy as np
 
 from .config import RunConfig
 from .dual import DualCertificate, DualGeometry, dual_certificate, dual_geometry
-from .likelihood import loss_rows
+from .likelihood import loss_grid_sparse_event_derivatives, loss_rows
 from .native import (
     aggregate_design_rows,
     configure_cpu_threads,
@@ -82,12 +82,11 @@ class SearchDiagnostics:
     working_set_skeletons: int = 0
     restricted_block_fits: int = 0
     restricted_block_screens: int = 0
-    joint_block_fits: int = 0
-    joint_block_candidates: int = 0
-    joint_block_pruned: int = 0
     restricted_add_audits: int = 0
     restricted_drop_audits: int = 0
     restricted_block_terminals: int = 0
+    restricted_problem_builds: int = 0
+    restricted_problem_hits: int = 0
     standalone_branch_audits: int = 0
     standalone_branch_rejections: int = 0
     multi_source_roots: int = 0
@@ -108,6 +107,17 @@ class _StoredRecord:
     fit: FitResult
     penalty: float
     score: float
+
+
+@dataclass(frozen=True)
+class _RestrictedAddProblem:
+    offset: np.ndarray
+    unsigned_design: np.ndarray
+    exposure: np.ndarray
+    noevent: np.ndarray
+    event: np.ndarray
+    old_nll: float
+    free_dimension: int
 
 
 def _nonnegative_quadratic_gain(gradient: np.ndarray, hessian: np.ndarray) -> float:
@@ -143,18 +153,19 @@ def _nonnegative_quadratic_gain(gradient: np.ndarray, hessian: np.ndarray) -> fl
 class SupportOptimizer:
     """Exact fixed-support fits with profiled rule-block score search.
 
-    Each antecedent skeleton owns exactly one profiled W/sign identity.  Empty
-    and every objective-admissible single-skeleton root ascend a shared support
-    DAG.  Joint proposals accelerate ascent, while every score-admissible W/sign
-    alternative of an inactive skeleton and every active drop receives a
-    restricted exact audit before termination.  Every accepted move improves
-    the fully refitted MDL objective.  Positive atoms and all unique terminals
-    reach certification.
-    The terminal claim is finite-dictionary score-admissible restricted add/drop
-    stationarity, not exhaustive one-exchange stationarity or a global optimum.
+    Each antecedent skeleton owns exactly one W/sign identity profiled once at
+    the D_fit baseline.  Empty and every objective-admissible single-skeleton
+    root then ascend a shared support DAG over that frozen dictionary.  Every
+    score-positive inactive identity and every active drop receives a restricted
+    exact audit before termination.  Every accepted move improves the fully
+    refitted MDL objective.  Positive atoms and all unique terminals reach
+    certification.  The terminal claim is frozen-dictionary block-score
+    restricted add/drop stationarity, not all-identity one-exchange stationarity
+    or a global optimum.
     """
 
     def __init__(self, context: Context, config: RunConfig):
+        configure_cpu_threads(config.pricing_workers)
         self.context = context
         self.config = config
         self.engine = ResponseEngine(
@@ -192,9 +203,9 @@ class SupportOptimizer:
         )
         self._pricing_cache_bytes = 0
         self._pricing_cache_limit = max(1, config.cache_bytes // 8)
-        self._raw_pricing_state: OrderedDict[Support, tuple[np.ndarray, np.ndarray]] = (
-            OrderedDict()
-        )
+        self._raw_pricing_state: OrderedDict[
+            Support, tuple[np.ndarray, np.ndarray, np.ndarray]
+        ] = OrderedDict()
         self._raw_pricing_cache_bytes = 0
         self._raw_pricing_cache_limit = max(1, config.cache_bytes // 8)
         self._block_price_cache: OrderedDict[
@@ -208,11 +219,19 @@ class SupportOptimizer:
             1, min(50_000, config.cache_bytes // 4096)
         )
         self._skeleton_witnesses: dict[Antecedent, tuple[float, RuleIdentity]] = {}
+        self._profiled_dictionary: tuple[RuleIdentity, ...] | None = None
         self._working_antecedents: set[Antecedent] = set()
         self._restricted_add_scores: dict[
             Support, dict[RuleIdentity, float]
         ] = {}
         self._restricted_drop_scores: dict[Support, dict[Support, float]] = {}
+        self._restricted_add_problems: dict[
+            Support,
+            dict[tuple[Antecedent, int], _RestrictedAddProblem | None],
+        ] = {}
+        self._restricted_add_events: dict[
+            tuple[Support, Antecedent, int], threading.Event
+        ] = {}
         baseline_matrix = self.engine.model_matrix(context, EMPTY_SUPPORT)
         baseline_fit = fit_model_matrix(
             baseline_matrix,
@@ -265,6 +284,8 @@ class SupportOptimizer:
         self._block_price_cache.clear()
         self._restricted_add_scores.clear()
         self._restricted_drop_scores.clear()
+        self._restricted_add_problems.clear()
+        self._restricted_add_events.clear()
         self._dual_geometry_cache.clear()
         baseline = self.records.get(EMPTY_SUPPORT)
         self.records.clear()
@@ -508,6 +529,83 @@ class SupportOptimizer:
             thread_name_prefix="crbstpp-fixed",
         ) as executor:
             return list(executor.map(fit_one, enumerate(specifications)))
+
+    def _fit_embedded_closure_null(
+        self,
+        record: SupportRecord,
+        *,
+        device: str,
+    ) -> FitResult:
+        """Fit a closure null by losslessly projecting its fitted full matrix."""
+        closure = tuple(record.matrix.closure)
+        key = (EMPTY_SUPPORT, closure)
+        with self._state_lock:
+            cached = self._forced_fits.get(key)
+            if cached is not None:
+                self.diagnostics.forced_fit_cache_hits += 1
+                return cached
+        if not closure:
+            return self._stored_records[EMPTY_SUPPORT].fit
+        dimension = record.matrix.free_dimension
+        projected = np.ascontiguousarray(record.matrix.x[:, :dimension])
+        projected, exposure, noevent, event = aggregate_design_rows(
+            projected,
+            record.matrix.exposure_weight,
+            record.matrix.noevent_weight,
+            record.matrix.event_weight,
+            copy_input=True,
+        )
+        empty_i64 = np.zeros(0, dtype=np.int64)
+        matrix = ModelMatrix(
+            x=projected,
+            exposure_weight=exposure,
+            noevent_weight=noevent,
+            event_weight=event,
+            free_dimension=dimension,
+            closure_dimension=len(closure) * self.config.knot_count,
+            rule_slices=(),
+            support=EMPTY_SUPPORT,
+            closure=closure,
+            active_rows=empty_i64,
+            active_design_groups=empty_i64,
+            active_age_bins=empty_i64,
+            aggregate_bins=empty_i64,
+        )
+        fit = fit_model_matrix(
+            matrix,
+            likelihood=self.context.dataset.likelihood,
+            tolerance=self.config.solver_tolerance,
+            max_iter=self.config.solver_max_iter,
+            device=device,
+        )
+        with self._state_lock:
+            return self._forced_fits.setdefault(key, fit)
+
+    def _fit_embedded_closure_nulls(
+        self, records: list[SupportRecord]
+    ) -> list[FitResult]:
+        if not records:
+            return []
+        devices = self.config.pricing_devices or ("cpu",)
+        threads_per_fit = max(
+            1, self.config.pricing_workers // self.config.exact_workers
+        )
+
+        def solve(indexed: tuple[int, SupportRecord]) -> FitResult:
+            configure_cpu_threads(threads_per_fit)
+            index, record = indexed
+            device = devices[index % len(devices)]
+            return self._fit_embedded_closure_null(record, device=device)
+
+        if len(records) == 1 or self.config.exact_workers == 1:
+            return [solve((index, record)) for index, record in enumerate(records)]
+        with self._state_lock:
+            self.diagnostics.parallel_exact_batches += 1
+        with ThreadPoolExecutor(
+            max_workers=min(self.config.exact_workers, len(records)),
+            thread_name_prefix="crbstpp-closure-null",
+        ) as executor:
+            return list(executor.map(solve, enumerate(records)))
 
     def saturated_upper_score(self, support: Support) -> float:
         return support_score(
@@ -879,10 +977,10 @@ class SupportOptimizer:
             self._pricing_cache_bytes -= removed[0].nbytes + removed[1].nbytes
         return result
 
-    def _raw_pricing_derivatives(
+    def _raw_pricing_components(
         self, current: SupportRecord
-    ) -> tuple[np.ndarray, np.ndarray]:
-        """Cache exact row derivatives once per fitted support state."""
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Cache eta and exact row derivatives once per fitted support state."""
         with self._state_lock:
             cached = self._raw_pricing_state.get(current.support)
             if cached is not None:
@@ -891,29 +989,19 @@ class SupportOptimizer:
         eta = self.engine.linear_predictor(
             self.context, current.matrix, current.fit.coefficients
         )
-        event = np.zeros(self.context.n_grid, dtype=np.float64)
-        if len(self.context.target_rows):
-            event[self.context.target_rows] = self.context.target_counts
-        exposure = np.full(
-            self.context.n_grid, self.engine.tick_exposure, dtype=np.float64
-        )
-        noevent = (
-            exposure - event
-            if self.context.dataset.likelihood == "first_event_cloglog"
-            else exposure
-        )
-        _, first, second = loss_rows(
+        first, second = loss_grid_sparse_event_derivatives(
             eta,
             likelihood=self.context.dataset.likelihood,
-            exposure_weight=exposure,
-            noevent_weight=noevent,
-            event_weight=event,
+            exposure=self.engine.tick_exposure,
+            event_rows=self.context.target_rows,
+            event_counts=self.context.target_counts,
         )
         result = (
+            np.ascontiguousarray(eta, dtype=np.float64),
             np.ascontiguousarray(first, dtype=np.float64),
             np.ascontiguousarray(second, dtype=np.float64),
         )
-        size = result[0].nbytes + result[1].nbytes
+        size = sum(value.nbytes for value in result)
         with self._state_lock:
             existing = self._raw_pricing_state.get(current.support)
             if existing is not None:
@@ -922,7 +1010,9 @@ class SupportOptimizer:
             self._raw_pricing_cache_bytes += size
             while self._raw_pricing_cache_bytes > self._raw_pricing_cache_limit:
                 _, removed = self._raw_pricing_state.popitem(last=False)
-                self._raw_pricing_cache_bytes -= removed[0].nbytes + removed[1].nbytes
+                self._raw_pricing_cache_bytes -= sum(
+                    value.nbytes for value in removed
+                )
         return result
 
     def _price_skeleton(
@@ -967,7 +1057,7 @@ class SupportOptimizer:
             }
         else:
             indices, inverse = self._pricing_components(current)
-            raw_first, raw_second = self._raw_pricing_derivatives(current)
+            _, raw_first, raw_second = self._raw_pricing_components(current)
             gradients = {
                 window: np.zeros(self.config.knot_count, dtype=np.float64)
                 for window in missing
@@ -1140,7 +1230,7 @@ class SupportOptimizer:
         self.diagnostics.priced_blocks += len(identities)
         # Build the common conditional information once before worker launch.
         self._pricing_components(current)
-        self._raw_pricing_derivatives(current)
+        self._raw_pricing_components(current)
         grouped: dict[Antecedent, set[int]] = {}
         for rule in identities:
             grouped.setdefault(rule.antecedent, set()).add(rule.window)
@@ -1690,9 +1780,10 @@ class SupportOptimizer:
     def _expand_working_set(self, current: SupportRecord) -> bool:
         """Run one complete delayed-column audit and activate every violation."""
         existing = set(current.support.antecedents)
+        dictionary = self._profiled_dictionary or self.dictionary
         outside = tuple(
             rule
-            for rule in self.dictionary
+            for rule in dictionary
             if rule.antecedent not in existing
             and rule.antecedent not in self._working_antecedents
         )
@@ -1718,9 +1809,10 @@ class SupportOptimizer:
         self, support: Support, antecedents: set[Antecedent] | None = None
     ) -> tuple[RuleIdentity, ...]:
         existing = set(support.antecedents)
+        dictionary = self._profiled_dictionary or self.dictionary
         return tuple(
             rule
-            for rule in self.dictionary
+            for rule in dictionary
             if rule.antecedent not in existing
             and (antecedents is None or rule.antecedent in antecedents)
         )
@@ -2003,10 +2095,10 @@ class SupportOptimizer:
         *,
         antecedents: set[Antecedent],
     ) -> SupportRecord | None:
-        """Exactly profile every MDL-positive W/sign within each skeleton."""
+        """Exactly audit the score-profiled W/sign of every skeleton."""
         acceptance = current.score
         identities = self._inactive_identities(current.support, antecedents)
-        ranked = self._rank_mdl_identities(current, identities)
+        ranked = self._rank_profiled_identities(current, identities)
         admissible = [
             item for item in ranked if item[0] > self.config.search_tolerance
         ]
@@ -2018,280 +2110,181 @@ class SupportOptimizer:
                 len(devices) if devices else self.config.exact_workers,
             ),
         )
+        threads_per_audit = max(1, self.config.pricing_workers // wave_size)
 
         def audit(
             indexed: tuple[int, tuple[float, float, RuleIdentity]],
         ) -> tuple[float, RuleIdentity]:
             index, (_, _, rule) = indexed
-            configure_cpu_threads(1)
+            configure_cpu_threads(threads_per_audit)
             device = devices[index % len(devices)] if devices else "cpu"
             return self._restricted_add_score(
                 current, rule, device=device
             ), rule
 
-        for start in range(0, len(admissible), wave_size):
-            wave = admissible[start : start + wave_size]
-            indexed = list(enumerate(wave, start=start))
-            if len(indexed) > 1:
-                with ThreadPoolExecutor(
-                    max_workers=len(indexed),
-                    thread_name_prefix="crbstpp-restricted-add",
-                ) as executor:
+        def prepare(
+            indexed: tuple[int, tuple[float, float, RuleIdentity]],
+        ) -> None:
+            configure_cpu_threads(threads_per_audit)
+            _, (_, _, rule) = indexed
+            self._restricted_add_problem(current, rule)
+
+        executor = (
+            ThreadPoolExecutor(
+                max_workers=wave_size,
+                thread_name_prefix="crbstpp-restricted-add",
+            )
+            if wave_size > 1
+            else None
+        )
+        try:
+            for start in range(0, len(admissible), wave_size):
+                wave = admissible[start : start + wave_size]
+                # Materialize every distinct unsigned (antecedent, W) problem
+                # before launching the sign-specific Newton solves.  Without
+                # this one worker builds the sparse problem while its paired
+                # device waits on the single-flight event.
+                indexed = list(enumerate(wave, start=start))
+                if executor is not None and len(indexed) > 1:
+                    list(executor.map(prepare, indexed))
                     audited = list(executor.map(audit, indexed))
-            else:
-                audited = [audit(indexed[0])] if indexed else []
-            with self._state_lock:
-                self.diagnostics.restricted_add_audits += len(audited)
-            improving = [
-                item
-                for item in audited
-                if item[0] > acceptance + self.config.search_tolerance
-            ]
-            if not improving:
-                continue
-            _, rule = sorted(improving, key=lambda item: (-item[0], item[1]))[0]
-            record = self.fit(current.support.add(rule), current)
-            if record.score <= acceptance + self.config.search_tolerance:
-                raise AssertionError(
-                    "full refit degraded an improving restricted add block"
-                )
-            return record
-        return None
-
-    def _best_joint_addition(
-        self,
-        current: SupportRecord,
-        *,
-        antecedents: set[Antecedent],
-    ) -> SupportRecord | None:
-        """Use one exact restricted joint solve to amortize discovery moves."""
-        identities = self._inactive_identities(current.support, antecedents)
-        ranked = self._rank_profiled_identities(current, identities)
-        candidates = self._local_score_maxima(ranked)
-        if not current.support.rules:
-            candidates = [
-                item
-                for item in candidates
-                if (
-                    stored := self._stored_records.get(Support.of((item[2],)))
-                )
-                is not None
-                and stored.score > self.config.search_tolerance
-            ]
-        proposal = self._restricted_joint_proposal(
-            current, tuple(item[2] for item in candidates)
-        )
-        if proposal is None:
-            return None
-        record = self.fit(proposal, current)
-        if record.score <= current.score + self.config.search_tolerance:
-            raise AssertionError(
-                "full refit degraded an improving restricted joint block"
-            )
-        return record
-
-    def _restricted_joint_fit(
-        self,
-        current: SupportRecord,
-        rules: tuple[RuleIdentity, ...],
-    ) -> tuple[
-        FitResult,
-        float,
-        np.ndarray,
-        np.ndarray,
-        tuple[ClosureTerm, ...],
-    ] | None:
-        """Exactly fit several new blocks around one frozen current model."""
-        if not rules:
-            return None
-        trial = current.support
-        for rule in rules:
-            trial = trial.add(rule)
-        old_closure = set(current.matrix.closure)
-        new_closure = tuple(sorted(set(hierarchy_closure(trial)) - old_closure))
-        specifications = [
-            (term.antecedent, term.window, 1.0) for term in new_closure
-        ] + [
-            (rule.antecedent, rule.window, float(rule.sign)) for rule in rules
-        ]
-        blocks = [
-            self.engine.block(self.context, antecedent, window)
-            for antecedent, window, _ in specifications
-        ]
-        nonempty = [block.rows for block in blocks if len(block.rows)]
-        if not nonempty:
-            return None
-        rows = np.unique(np.concatenate(nonempty))
-        dimension = len(specifications) * self.config.knot_count
-        design = np.zeros((len(rows), dimension), dtype=np.float64)
-        for index, (block, (_, _, sign)) in enumerate(
-            zip(blocks, specifications, strict=True)
-        ):
-            if len(block.rows):
-                positions = np.searchsorted(rows, block.rows)
-                left = index * self.config.knot_count
-                design[positions, left : left + self.config.knot_count] = (
-                    sign * block.values
-                )
-        offset = self.engine.linear_predictor_at_rows(
-            self.context, current.matrix, current.fit.coefficients, rows
-        )
-        event = np.zeros(len(rows), dtype=np.float64)
-        if len(self.context.target_rows):
-            positions = np.searchsorted(self.context.target_rows, rows)
-            matched = positions < len(self.context.target_rows)
-            safe = np.minimum(positions, len(self.context.target_rows) - 1)
-            matched &= self.context.target_rows[safe] == rows
-            event[matched] = self.context.target_counts[positions[matched]]
-        exposure = np.full(len(rows), self.engine.tick_exposure, dtype=np.float64)
-        noevent = (
-            exposure - event
-            if self.context.dataset.likelihood == "first_event_cloglog"
-            else exposure.copy()
-        )
-        joint = np.concatenate((offset[:, None], design), axis=1)
-        joint, exposure, noevent, event = aggregate_design_rows(
-            joint, exposure, noevent, event, copy_input=False
-        )
-        offset, design = joint[:, 0], joint[:, 1:]
-        old_values, _, _ = loss_rows(
-            offset,
-            likelihood=self.context.dataset.likelihood,
-            exposure_weight=exposure,
-            noevent_weight=noevent,
-            event_weight=event,
-        )
-        fit = fit_offset_design(
-            design,
-            offset,
-            exposure,
-            noevent,
-            event,
-            likelihood=self.context.dataset.likelihood,
-            free_dimension=len(new_closure) * self.config.knot_count,
-            tolerance=self.config.solver_tolerance,
-            max_iter=self.config.solver_max_iter,
-            device=(self.config.pricing_devices or ("cpu",))[0],
-        )
-        with self._state_lock:
-            self.diagnostics.joint_block_fits += 1
-            self.diagnostics.joint_block_candidates += len(rules)
-        score = -math.inf
-        if fit.converged:
-            restricted_nll = (
-                current.fit.nll + fit.nll - float(np.sum(old_values))
-            )
-            score = support_score(
-                baseline_nll=self.baseline_nll,
-                fit_nll=restricted_nll,
-                penalty=self.objective.structural_penalty(trial),
-            )
-        hessian = np.zeros((dimension, dimension), dtype=np.float64)
-        if np.all(np.isfinite(fit.coefficients)):
-            _, _, second = loss_rows(
-                offset + design @ fit.coefficients,
-                likelihood=self.context.dataset.likelihood,
-                exposure_weight=exposure,
-                noevent_weight=noevent,
-                event_weight=event,
-            )
-            _, hessian = moments(
-                design,
-                np.zeros_like(second),
-                second,
-                device=(self.config.pricing_devices or ("cpu",))[0],
-            )
-        return fit, score, design, hessian, new_closure
-
-    def _restricted_joint_proposal(
-        self,
-        current: SupportRecord,
-        rules: tuple[RuleIdentity, ...],
-    ) -> Support | None:
-        """Find an improving exact restricted batch by deterministic pruning."""
-        selected = list(dict.fromkeys(rules))
-        acceptance = current.score + self.config.search_tolerance
-        while selected:
-            outcome = self._restricted_joint_fit(current, tuple(selected))
-            if outcome is None:
-                return None
-            fit, score, design, hessian, new_closure = outcome
-            if fit.converged and score > acceptance:
-                trial = current.support
-                for rule in selected:
-                    trial = trial.add(rule)
-                return trial
-            closure_dimension = len(new_closure) * self.config.knot_count
-            rule_norms = np.asarray(
-                [
-                    np.linalg.norm(
-                        fit.coefficients[
-                            closure_dimension + index * self.config.knot_count :
-                            closure_dimension + (index + 1) * self.config.knot_count
-                        ]
-                    )
-                    for index in range(len(selected))
-                ],
-                dtype=np.float64,
-            )
-            zero = rule_norms <= max(1.0e-12, self.config.solver_tolerance)
-            if np.any(zero):
-                removed = int(np.sum(zero))
-                selected = [
-                    rule for index, rule in enumerate(selected) if not zero[index]
-                ]
-            else:
-                all_indices = np.arange(len(fit.coefficients))
-                trial = current.support
-                for rule in selected:
-                    trial = trial.add(rule)
-                conditional_net: list[float] = []
-                for index in range(len(selected)):
-                    rule_columns = np.arange(
-                        closure_dimension + index * self.config.knot_count,
-                        closure_dimension + (index + 1) * self.config.knot_count,
-                    )
-                    other = np.setdiff1d(
-                        all_indices, rule_columns, assume_unique=True
-                    )
-                    h_rr = hessian[np.ix_(rule_columns, rule_columns)]
-                    if len(other):
-                        h_ro = hessian[np.ix_(rule_columns, other)]
-                        h_oo = hessian[np.ix_(other, other)]
-                        schur = h_rr - h_ro @ np.linalg.pinv(
-                            h_oo,
-                            rcond=max(1.0e-12, self.config.solver_tolerance),
-                        ) @ h_ro.T
-                    else:
-                        schur = h_rr
-                    beta = fit.coefficients[rule_columns]
-                    likelihood_code = float(beta @ schur @ beta)
-                    reduced = trial.drop(selected[index])
-                    penalty_code = (
-                        self.objective.structural_penalty(trial)
-                        - self.objective.structural_penalty(reduced)
-                    )
-                    conditional_net.append(likelihood_code - penalty_code)
-                negative = (
-                    np.asarray(conditional_net) <= self.config.search_tolerance
-                )
-                if np.any(negative):
-                    removed = int(np.sum(negative))
-                    selected = [
-                        rule
-                        for index, rule in enumerate(selected)
-                        if not negative[index]
-                    ]
                 else:
-                    drop_index = min(
-                        range(len(selected)),
-                        key=lambda index: (conditional_net[index], selected[index]),
+                    if indexed:
+                        prepare(indexed[0])
+                    audited = [audit(indexed[0])] if indexed else []
+                with self._state_lock:
+                    self.diagnostics.restricted_add_audits += len(audited)
+                improving = [
+                    item
+                    for item in audited
+                    if item[0] > acceptance + self.config.search_tolerance
+                ]
+                if not improving:
+                    continue
+                _, rule = sorted(improving, key=lambda item: (-item[0], item[1]))[0]
+                record = self.fit(current.support.add(rule), current)
+                if record.score <= acceptance + self.config.search_tolerance:
+                    raise AssertionError(
+                        "full refit degraded an improving restricted add block"
                     )
-                    selected.pop(drop_index)
-                    removed = 1
-            with self._state_lock:
-                self.diagnostics.joint_block_pruned += removed
+                return record
+        finally:
+            if executor is not None:
+                executor.shutdown(wait=True)
         return None
+
+    def _restricted_add_problem(
+        self, current: SupportRecord, rule: RuleIdentity
+    ) -> _RestrictedAddProblem | None:
+        """Build one unsigned exact problem shared by both rule signs."""
+        identity = (rule.antecedent, rule.window)
+        event_key = (current.support, rule.antecedent, rule.window)
+        while True:
+            with self._state_lock:
+                state = self._restricted_add_problems.setdefault(
+                    current.support, {}
+                )
+                if identity in state:
+                    self.diagnostics.restricted_problem_hits += 1
+                    return state[identity]
+                pending = self._restricted_add_events.get(event_key)
+                if pending is None:
+                    pending = threading.Event()
+                    self._restricted_add_events[event_key] = pending
+                    owner = True
+                else:
+                    owner = False
+            if owner:
+                break
+            pending.wait()
+
+        problem: _RestrictedAddProblem | None = None
+        succeeded = False
+        try:
+            unsigned = RuleIdentity(rule.antecedent, rule.window, 1)
+            trial = current.support.add(unsigned)
+            old_closure = set(current.matrix.closure)
+            new_closure = tuple(
+                sorted(set(hierarchy_closure(trial)) - old_closure)
+            )
+            specifications = [
+                (term.antecedent, term.window, 1.0) for term in new_closure
+            ]
+            specifications.append((rule.antecedent, rule.window, 1.0))
+            blocks = [
+                self.engine.block(self.context, antecedent, window)
+                for antecedent, window, _ in specifications
+            ]
+            nonempty = [block.rows for block in blocks if len(block.rows)]
+            if nonempty:
+                rows = np.unique(np.concatenate(nonempty))
+                dimension = len(specifications) * self.config.knot_count
+                design = np.zeros((len(rows), dimension), dtype=np.float64)
+                for index, (block, (_, _, sign)) in enumerate(
+                    zip(blocks, specifications, strict=True)
+                ):
+                    if not len(block.rows):
+                        continue
+                    positions = np.searchsorted(rows, block.rows)
+                    left = index * self.config.knot_count
+                    design[positions, left : left + self.config.knot_count] = (
+                        sign * block.values
+                    )
+                offset = self._raw_pricing_components(current)[0][rows]
+                event = np.zeros(len(rows), dtype=np.float64)
+                if len(self.context.target_rows):
+                    positions = np.searchsorted(self.context.target_rows, rows)
+                    matched = positions < len(self.context.target_rows)
+                    safe = np.minimum(
+                        positions, len(self.context.target_rows) - 1
+                    )
+                    matched &= self.context.target_rows[safe] == rows
+                    event[matched] = self.context.target_counts[positions[matched]]
+                exposure = np.full(
+                    len(rows), self.engine.tick_exposure, dtype=np.float64
+                )
+                noevent = (
+                    exposure - event
+                    if self.context.dataset.likelihood == "first_event_cloglog"
+                    else exposure.copy()
+                )
+                joint = np.concatenate((offset[:, None], design), axis=1)
+                joint, exposure, noevent, event = aggregate_design_rows(
+                    joint,
+                    exposure,
+                    noevent,
+                    event,
+                    copy_input=False,
+                )
+                offset = np.ascontiguousarray(joint[:, 0])
+                design = np.ascontiguousarray(joint[:, 1:])
+                old_values, _, _ = loss_rows(
+                    offset,
+                    likelihood=self.context.dataset.likelihood,
+                    exposure_weight=exposure,
+                    noevent_weight=noevent,
+                    event_weight=event,
+                )
+                problem = _RestrictedAddProblem(
+                    offset=offset,
+                    unsigned_design=design,
+                    exposure=exposure,
+                    noevent=noevent,
+                    event=event,
+                    old_nll=float(np.sum(old_values)),
+                    free_dimension=len(new_closure) * self.config.knot_count,
+                )
+            succeeded = True
+        finally:
+            with self._state_lock:
+                if succeeded:
+                    self._restricted_add_problems.setdefault(current.support, {})[
+                        identity
+                    ] = problem
+                    self.diagnostics.restricted_problem_builds += 1
+                completed = self._restricted_add_events.pop(event_key)
+                completed.set()
+        return problem
 
     def _restricted_add_score(
         self,
@@ -2306,78 +2299,25 @@ class SupportOptimizer:
         if cached is not None:
             return cached
         trial = current.support.add(rule)
-        old_closure = set(current.matrix.closure)
-        new_closure = tuple(sorted(set(hierarchy_closure(trial)) - old_closure))
-        specifications = [
-            (term.antecedent, term.window, 1.0) for term in new_closure
-        ]
-        specifications.append((rule.antecedent, rule.window, float(rule.sign)))
-        blocks = [
-            self.engine.block(self.context, antecedent, window)
-            for antecedent, window, _ in specifications
-        ]
-        nonempty = [block.rows for block in blocks if len(block.rows)]
-        if not nonempty:
+        problem = self._restricted_add_problem(current, rule)
+        if problem is None:
             with self._state_lock:
                 self._restricted_add_scores.setdefault(current.support, {})[
                     rule
                 ] = -math.inf
             return -math.inf
-        rows = np.unique(np.concatenate(nonempty))
-        dimension = len(specifications) * self.config.knot_count
-        design = np.zeros((len(rows), dimension), dtype=np.float64)
-        for index, (block, (_, _, sign)) in enumerate(
-            zip(blocks, specifications, strict=True)
-        ):
-            if not len(block.rows):
-                continue
-            positions = np.searchsorted(rows, block.rows)
-            left = index * self.config.knot_count
-            design[positions, left : left + self.config.knot_count] = (
-                sign * block.values
-            )
-        offset = self.engine.linear_predictor_at_rows(
-            self.context, current.matrix, current.fit.coefficients, rows
-        )
-        event = np.zeros(len(rows), dtype=np.float64)
-        if len(self.context.target_rows):
-            positions = np.searchsorted(self.context.target_rows, rows)
-            matched = positions < len(self.context.target_rows)
-            safe = np.minimum(positions, len(self.context.target_rows) - 1)
-            matched &= self.context.target_rows[safe] == rows
-            event[matched] = self.context.target_counts[positions[matched]]
-        exposure = np.full(
-            len(rows), self.engine.tick_exposure, dtype=np.float64
-        )
-        noevent = (
-            exposure - event
-            if self.context.dataset.likelihood == "first_event_cloglog"
-            else exposure.copy()
-        )
-        joint = np.concatenate((offset[:, None], design), axis=1)
-        joint, exposure, noevent, event = aggregate_design_rows(
-            joint,
-            exposure,
-            noevent,
-            event,
-            copy_input=False,
-        )
-        offset, design = joint[:, 0], joint[:, 1:]
-        old_values, _, _ = loss_rows(
-            offset,
-            likelihood=self.context.dataset.likelihood,
-            exposure_weight=exposure,
-            noevent_weight=noevent,
-            event_weight=event,
-        )
+        design = problem.unsigned_design
+        if rule.sign < 0:
+            design = design.copy()
+            design[:, -self.config.knot_count :] *= -1.0
         fit = fit_offset_design(
             design,
-            offset,
-            exposure,
-            noevent,
-            event,
+            problem.offset,
+            problem.exposure,
+            problem.noevent,
+            problem.event,
             likelihood=self.context.dataset.likelihood,
-            free_dimension=len(new_closure) * self.config.knot_count,
+            free_dimension=problem.free_dimension,
             tolerance=self.config.solver_tolerance,
             max_iter=self.config.solver_max_iter,
             device=device or (self.config.pricing_devices or ("cpu",))[0],
@@ -2386,9 +2326,7 @@ class SupportOptimizer:
             self.diagnostics.restricted_block_fits += 1
         score = -math.inf
         if fit.converged:
-            restricted_nll = (
-                current.fit.nll + fit.nll - float(np.sum(old_values))
-            )
+            restricted_nll = current.fit.nll + fit.nll - problem.old_nll
             score = support_score(
                 baseline_nll=self.baseline_nll,
                 fit_nll=restricted_nll,
@@ -2403,9 +2341,7 @@ class SupportOptimizer:
     ) -> SupportRecord | None:
         if not current.support.rules:
             return None
-        raw_eta = self.engine.linear_predictor(
-            self.context, current.matrix, current.fit.coefficients
-        )
+        raw_eta = self._raw_pricing_components(current)[0]
         candidates: list[tuple[float, Support]] = []
         current_baseline = (
             current.matrix.free_dimension - current.matrix.closure_dimension
@@ -2558,6 +2494,13 @@ class SupportOptimizer:
         hierarchy nuisance, rather than the reported branch, created the gain.
         """
         ranked = self._rank_profiled_identities(empty, self.dictionary)
+        self._profiled_dictionary = tuple(
+            self._skeleton_witnesses[antecedent][1]
+            for antecedent in self.skeletons
+            if antecedent in self._skeleton_witnesses
+        )
+        if len(self._profiled_dictionary) != len(self.skeletons):
+            raise AssertionError("baseline W/sign profile did not cover every skeleton")
         admissible = self._objective_root_candidates(ranked)
         standalone: dict[Support, SupportRecord] = {}
         for start in range(0, len(admissible), self.config.exact_workers):
@@ -2574,12 +2517,10 @@ class SupportOptimizer:
             standalone[support]
             for support in sorted(standalone, key=lambda item: item.rules)
         ]
-        null_models = self.fit_fixed_many(
-            [(EMPTY_SUPPORT, record.matrix.closure) for record in ordered]
-        )
+        null_fits = self._fit_embedded_closure_nulls(ordered)
         positives: dict[Support, SupportRecord] = {}
         log_n = math.log(max(2, self.objective.n_entities))
-        for record, (_, null_fit) in zip(ordered, null_models, strict=True):
+        for record, null_fit in zip(ordered, null_fits, strict=True):
             closure_code = (
                 len(record.matrix.closure) * self.config.knot_count * log_n
             )
@@ -2613,11 +2554,12 @@ class SupportOptimizer:
     def _best_profiled_move(self, current: SupportRecord) -> SupportRecord | None:
         """Audit score-admissible adds and every active drop.
 
-        Each inactive skeleton orders W/sign under the conditional-Fisher block
-        score.  Every positive alternative and every active drop is then audited
-        with common effects frozen; only one W/sign can enter a support.  Terminal
-        states are restricted add/drop fixed points, not exact one-exchange
-        optima: a later W/sign replacement is a swap and is not certified.
+        Each inactive skeleton selects one W/sign under the conditional-Fisher
+        block score.  Every positive profiled identity and every active drop is
+        then audited with common effects frozen.  Terminal states are profiled
+        block-score restricted add/drop fixed points, not exact one-exchange
+        optima: an unprofiled identity or later W/sign replacement is not
+        certified.
         """
         # Delayed column generation prices only the finite basin working set
         # during coordinate moves.  A complete outside-dictionary audit is
@@ -2625,11 +2567,6 @@ class SupportOptimizer:
         # violating skeleton is activated at once.  Hence terminal states have
         # still passed the complete dictionary audit without paying for it at
         # every accepted move.
-        direct = self._best_joint_addition(
-            current, antecedents=set(self._working_antecedents)
-        )
-        if direct is not None:
-            return direct
         direct = self._best_restricted_addition(
             current, antecedents=set(self._working_antecedents)
         )
@@ -2639,11 +2576,6 @@ class SupportOptimizer:
         if dropped is not None:
             return dropped
         if self._expand_working_set(current):
-            direct = self._best_joint_addition(
-                current, antecedents=set(self._working_antecedents)
-            )
-            if direct is not None:
-                return direct
             direct = self._best_restricted_addition(
                 current, antecedents=set(self._working_antecedents)
             )
@@ -2710,6 +2642,7 @@ class SupportOptimizer:
                     # per-identity audit values for the state can be released.
                     self._restricted_add_scores.pop(current.support, None)
                     self._restricted_drop_scores.pop(current.support, None)
+                    self._restricted_add_problems.pop(current.support, None)
                     if next_record is None:
                         break
                 gain = next_record.score - current.score

@@ -8,7 +8,11 @@ from unittest import mock
 import numpy as np
 import pandas as pd
 
-from crbstpp.likelihood import conjugate_sum, loss_rows
+from crbstpp.likelihood import (
+    conjugate_sum,
+    loss_grid_sparse_event_derivatives,
+    loss_rows,
+)
 from crbstpp.native import (
     aggregate_design_rows,
     aggregate_design_rows_with_groups,
@@ -30,6 +34,36 @@ from tests.crbstpp.test_core import synthetic_dataset
 
 
 class NumericalParityTests(unittest.TestCase):
+    def test_sparse_grid_derivatives_match_dense_weights(self) -> None:
+        eta = np.linspace(-4.0, 2.0, 31)
+        rows = np.asarray([1, 7, 19, 30], dtype=np.int64)
+        counts = np.asarray([1.0, 1.0, 1.0, 1.0])
+        for likelihood, exposure in (("poisson", 0.25), ("first_event_cloglog", 1.0)):
+            event = np.zeros(len(eta), dtype=np.float64)
+            event[rows] = counts
+            exposure_weight = np.full(len(eta), exposure, dtype=np.float64)
+            noevent = (
+                exposure_weight - event
+                if likelihood == "first_event_cloglog"
+                else exposure_weight
+            )
+            dense = loss_rows(
+                eta,
+                likelihood=likelihood,
+                exposure_weight=exposure_weight,
+                noevent_weight=noevent,
+                event_weight=event,
+            )
+            derivatives = loss_grid_sparse_event_derivatives(
+                eta,
+                likelihood=likelihood,
+                exposure=exposure,
+                event_rows=rows,
+                event_counts=counts,
+            )
+            for expected, actual in zip(dense[1:], derivatives, strict=True):
+                np.testing.assert_allclose(actual, expected, rtol=0.0, atol=1.0e-14)
+
     def test_restricted_drop_scores_are_feasible_lower_bounds(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             data = synthetic_dataset(Path(directory) / "data", 120)
@@ -91,6 +125,52 @@ class NumericalParityTests(unittest.TestCase):
                 self.assertGreaterEqual(full.score + 1e-8, restricted)
                 compared += 1
             self.assertGreater(compared, 0)
+            unsigned = {
+                (rule.antecedent, rule.window) for rule in optimizer.dictionary
+            }
+            self.assertEqual(
+                optimizer.diagnostics.restricted_problem_builds, len(unsigned)
+            )
+            self.assertEqual(
+                optimizer.diagnostics.restricted_problem_hits,
+                len(optimizer.dictionary) - len(unsigned),
+            )
+
+    def test_restricted_add_audits_one_identity_per_skeleton(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            data = synthetic_dataset(Path(directory) / "data", 120)
+            fit_codes, _, _ = data.split((0.6, 0.2, 0.2), 111)
+            config = RunConfig(
+                dataset=str(data.root),
+                q_max=2,
+                impact_lag=3,
+                knot_count=2,
+                formation_windows=(0, 1, 2),
+                solver_tolerance=1e-8,
+                solver_max_iter=150,
+                cache_bytes=32 * 1024**2,
+                early_warning_horizon=3,
+                pricing_devices=(),
+            )
+            optimizer = SupportOptimizer(Context.make(data, fit_codes), config)
+            empty = optimizer.records[Support(())]
+            blocked = type(empty)(
+                empty.support,
+                empty.matrix,
+                empty.fit,
+                empty.penalty,
+                float("inf"),
+            )
+            antecedents = set(optimizer.skeletons)
+            self.assertIsNone(
+                optimizer._best_restricted_addition(
+                    blocked, antecedents=antecedents
+                )
+            )
+            self.assertLessEqual(
+                optimizer.diagnostics.restricted_add_audits,
+                len(antecedents),
+            )
 
     def test_incremental_support_matrix_matches_fresh_construction(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -548,6 +628,67 @@ class NumericalParityTests(unittest.TestCase):
                     rtol=1e-11,
                     atol=1e-11,
                 )
+
+    def test_embedded_closure_null_matches_direct_matrix(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            data = synthetic_dataset(Path(directory) / "data", 120)
+            fit_codes, _, _ = data.split((0.6, 0.2, 0.2), 111)
+            config = RunConfig(
+                dataset=str(data.root),
+                q_max=2,
+                impact_lag=3,
+                knot_count=2,
+                formation_windows=(0, 1, 2),
+                solver_tolerance=1e-8,
+                solver_max_iter=150,
+                cache_bytes=32 * 1024**2,
+                early_warning_horizon=3,
+                pricing_devices=(),
+            )
+            optimizer = SupportOptimizer(Context.make(data, fit_codes), config)
+            empty = optimizer.records[Support(())]
+            rule = RuleIdentity((0, 1), 2, 1)
+            full = optimizer.fit(Support.of((rule,)), empty)
+            direct_matrix = optimizer.engine.model_matrix(
+                optimizer.context,
+                Support(()),
+                forced_closure=full.matrix.closure,
+            )
+            direct = fit_model_matrix(
+                direct_matrix,
+                likelihood=data.likelihood,
+                tolerance=config.solver_tolerance,
+                max_iter=config.solver_max_iter,
+            )
+            original = tuple(
+                value.copy()
+                for value in (
+                    full.matrix.x,
+                    full.matrix.exposure_weight,
+                    full.matrix.noevent_weight,
+                    full.matrix.event_weight,
+                )
+            )
+            embedded = optimizer._fit_embedded_closure_null(full, device="cpu")
+            for expected, actual in zip(
+                original,
+                (
+                    full.matrix.x,
+                    full.matrix.exposure_weight,
+                    full.matrix.noevent_weight,
+                    full.matrix.event_weight,
+                ),
+                strict=True,
+            ):
+                np.testing.assert_array_equal(actual, expected)
+            self.assertEqual(embedded.converged, direct.converged)
+            self.assertAlmostEqual(embedded.nll, direct.nll, places=10)
+            np.testing.assert_allclose(
+                embedded.coefficients,
+                direct.coefficients,
+                rtol=1e-11,
+                atol=1e-11,
+            )
 
     def test_closure_only_gain_does_not_admit_reported_pair(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

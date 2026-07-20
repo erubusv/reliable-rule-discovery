@@ -64,6 +64,38 @@ def loss_rows(
     )
 
 
+def loss_grid_sparse_event_derivatives(
+    eta: np.ndarray,
+    *,
+    likelihood: str,
+    exposure: float,
+    event_rows: np.ndarray,
+    event_counts: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Exact grid derivatives using only two dense output buffers."""
+    eta = np.asarray(eta, dtype=np.float64)
+    rows = np.asarray(event_rows, dtype=np.int64)
+    counts = np.asarray(event_counts, dtype=np.float64)
+    if rows.shape != counts.shape or (
+        len(rows) and (rows[0] < 0 or rows[-1] >= len(eta))
+    ):
+        raise ValueError("sparse event rows do not match the predictor grid")
+    first = float(exposure) * np.exp(np.clip(eta, -745.0, 700.0))
+    second = first.copy()
+    if not len(rows):
+        return first, second
+    if likelihood == "poisson":
+        first[rows] -= counts
+        return first, second
+    if likelihood != "first_event_cloglog":
+        raise ValueError(f"unknown likelihood: {likelihood}")
+    _, event_first, event_second = cloglog_event_terms(eta[rows])
+    noevent_value = np.exp(np.clip(eta[rows], -745.0, 700.0))
+    first[rows] += counts * (event_first - noevent_value)
+    second[rows] += counts * (event_second - noevent_value)
+    return first, second
+
+
 def poisson_conjugate(
     dual: np.ndarray, exposure_weight: np.ndarray, event_weight: np.ndarray
 ) -> np.ndarray:

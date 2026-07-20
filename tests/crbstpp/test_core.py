@@ -169,6 +169,22 @@ class LikelihoodSolverTests(unittest.TestCase):
             result = optimizer.search()
             self.assertGreater(len(result.family), 0)
             self.assertGreater(len(result.terminals), 0)
+            self.assertIsNotNone(optimizer._profiled_dictionary)
+            self.assertEqual(
+                len(optimizer._profiled_dictionary), len(optimizer.skeletons)
+            )
+            self.assertEqual(
+                len({rule.antecedent for rule in optimizer._profiled_dictionary}),
+                len(optimizer.skeletons),
+            )
+            frozen = set(optimizer._profiled_dictionary)
+            self.assertTrue(
+                all(
+                    rule in frozen
+                    for record in result.family
+                    for rule in record.support.rules
+                )
+            )
             expected_starts = {
                 "empty",
                 *(support_key(record.support) for record in result.positive_atoms),
