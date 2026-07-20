@@ -19,7 +19,7 @@ from crbstpp.rules import (
     hierarchy_closure,
     one_exchange_neighbors,
 )
-from crbstpp.search import SupportOptimizer
+from crbstpp.search import SupportOptimizer, support_key
 from crbstpp.solver import fit_model_matrix
 
 
@@ -169,6 +169,28 @@ class LikelihoodSolverTests(unittest.TestCase):
             result = optimizer.search()
             self.assertGreater(len(result.family), 0)
             self.assertGreater(len(result.terminals), 0)
+            expected_starts = {
+                "empty",
+                *(support_key(record.support) for record in result.positive_atoms),
+            }
+            self.assertEqual(
+                {str(path["start"]) for path in result.paths}, expected_starts
+            )
+            self.assertEqual(len(result.paths), len(result.positive_atoms) + 1)
+            self.assertEqual(
+                result.diagnostics.multi_source_roots,
+                len(result.positive_atoms) + 1,
+            )
+            self.assertEqual(
+                result.diagnostics.standalone_branch_audits,
+                len(result.positive_atoms)
+                + result.diagnostics.standalone_branch_rejections,
+            )
+            for record in result.family:
+                self.assertEqual(
+                    len(record.support.antecedents),
+                    len(set(record.support.antecedents)),
+                )
             empty = optimizer.records[Support(())]
             groups = [
                 [

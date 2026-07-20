@@ -88,6 +88,10 @@ class SearchDiagnostics:
     restricted_add_audits: int = 0
     restricted_drop_audits: int = 0
     restricted_block_terminals: int = 0
+    standalone_branch_audits: int = 0
+    standalone_branch_rejections: int = 0
+    multi_source_roots: int = 0
+    path_compression_hits: int = 0
 
 
 @dataclass(frozen=True)
@@ -139,14 +143,15 @@ def _nonnegative_quadratic_gain(gradient: np.ndarray, hessian: np.ndarray) -> fl
 class SupportOptimizer:
     """Exact fixed-support fits with profiled rule-block score search.
 
-    W/sign are discrete identities within each antecedent skeleton.  Joint
-    proposals accelerate ascent, while every score-admissible inactive identity
-    and every active drop receives a restricted exact audit before termination.
-    Every accepted move improves the fully refitted MDL objective.  Positive
-    atoms and terminal supports reach certification, whose F2 branch test
-    removes closure-driven reported rules.  The terminal claim is finite-
-    dictionary score-admissible restricted add/drop stationarity, not exhaustive
-    one-exchange stationarity or a global optimum.
+    Each antecedent skeleton owns exactly one profiled W/sign identity.  Empty
+    and every objective-admissible single-skeleton root ascend a shared support
+    DAG.  Joint proposals accelerate ascent, while every score-admissible W/sign
+    alternative of an inactive skeleton and every active drop receives a
+    restricted exact audit before termination.  Every accepted move improves
+    the fully refitted MDL objective.  Positive atoms and all unique terminals
+    reach certification.
+    The terminal claim is finite-dictionary score-admissible restricted add/drop
+    stationarity, not exhaustive one-exchange stationarity or a global optimum.
     """
 
     def __init__(self, context: Context, config: RunConfig):
@@ -204,8 +209,10 @@ class SupportOptimizer:
         )
         self._skeleton_witnesses: dict[Antecedent, tuple[float, RuleIdentity]] = {}
         self._working_antecedents: set[Antecedent] = set()
-        self._restricted_add_scores: dict[tuple[Support, RuleIdentity], float] = {}
-        self._restricted_drop_scores: dict[tuple[Support, Support], float] = {}
+        self._restricted_add_scores: dict[
+            Support, dict[RuleIdentity, float]
+        ] = {}
+        self._restricted_drop_scores: dict[Support, dict[Support, float]] = {}
         baseline_matrix = self.engine.model_matrix(context, EMPTY_SUPPORT)
         baseline_fit = fit_model_matrix(
             baseline_matrix,
@@ -1622,15 +1629,15 @@ class SupportOptimizer:
                 local_maxima.append(item)
         return sorted(local_maxima, key=lambda item: (-item[0], item[2]))
 
-    def _score_basin_seeds(
+    def _objective_root_candidates(
         self, profiled: list[tuple[float, float, RuleIdentity]]
     ) -> list[tuple[float, float, RuleIdentity]]:
-        """Return one exact-fit representative from every finite score basin.
+        """Return all objective-defined score-basin roots without a top-k.
 
-        Higher-order modes use both the inclusion DAG and the fixed-order
-        one-predicate-exchange graph.  The latter prevents every promising
-        pair from disappearing merely because a triplet has a larger score,
-        while still avoiding an exhaustive exact fit of all positive atoms.
+        Singletons remain primitive roots.  Higher-order roots are the local
+        maxima of both the inclusion DAG and the same-order one-predicate
+        exchange graph.  Non-root positive skeletons remain available to the
+        delayed full-dictionary add audit; only redundant launches are removed.
         """
         positive = [item for item in profiled if item[0] > self.config.search_tolerance]
         local_maxima = self._local_score_maxima(profiled)
@@ -1662,23 +1669,23 @@ class SupportOptimizer:
                 )
                 if not any(dominates(other, item) for other in adjacent):
                     exchange_maxima.append(item)
-        seeds = {
+        candidates = {
             item[2].antecedent: item
             for item in positive
-            if len(item[2].antecedent) == 1
+            if item[2].order == 1
         }
-        seeds.update({item[2].antecedent: item for item in local_maxima})
-        seeds.update({item[2].antecedent: item for item in exchange_maxima})
-        self._working_antecedents.update(seeds)
+        candidates.update({item[2].antecedent: item for item in local_maxima})
+        candidates.update({item[2].antecedent: item for item in exchange_maxima})
+        self._working_antecedents.update(item[2].antecedent for item in positive)
         with self._state_lock:
             self.diagnostics.score_basin_nodes += len(positive)
             self.diagnostics.score_basin_seeds += sum(
-                item[2].order > 1 for item in seeds.values()
+                item[2].order > 1 for item in candidates.values()
             )
             self.diagnostics.positive_primitive_roots += sum(
                 len(item[2].antecedent) == 1 for item in positive
             )
-        return sorted(seeds.values(), key=lambda item: (-item[0], item[2]))
+        return sorted(candidates.values(), key=lambda item: (-item[0], item[2]))
 
     def _expand_working_set(self, current: SupportRecord) -> bool:
         """Run one complete delayed-column audit and activate every violation."""
@@ -1996,7 +2003,7 @@ class SupportOptimizer:
         *,
         antecedents: set[Antecedent],
     ) -> SupportRecord | None:
-        """Audit every MDL-positive W/sign block by exact restricted fitting."""
+        """Exactly profile every MDL-positive W/sign within each skeleton."""
         acceptance = current.score
         identities = self._inactive_identities(current.support, antecedents)
         ranked = self._rank_mdl_identities(current, identities)
@@ -2294,9 +2301,8 @@ class SupportOptimizer:
         device: str | None = None,
     ) -> float:
         """Exact fixed-current block-coordinate objective for one new rule."""
-        key = (current.support, rule)
         with self._state_lock:
-            cached = self._restricted_add_scores.get(key)
+            cached = self._restricted_add_scores.get(current.support, {}).get(rule)
         if cached is not None:
             return cached
         trial = current.support.add(rule)
@@ -2313,7 +2319,9 @@ class SupportOptimizer:
         nonempty = [block.rows for block in blocks if len(block.rows)]
         if not nonempty:
             with self._state_lock:
-                self._restricted_add_scores[key] = -math.inf
+                self._restricted_add_scores.setdefault(current.support, {})[
+                    rule
+                ] = -math.inf
             return -math.inf
         rows = np.unique(np.concatenate(nonempty))
         dimension = len(specifications) * self.config.knot_count
@@ -2387,7 +2395,7 @@ class SupportOptimizer:
                 penalty=self.objective.structural_penalty(trial),
             )
         with self._state_lock:
-            self._restricted_add_scores[key] = score
+            self._restricted_add_scores.setdefault(current.support, {})[rule] = score
         return score
 
     def _best_restricted_drop(
@@ -2408,9 +2416,10 @@ class SupportOptimizer:
         )
 
         def score_trial(trial: Support) -> float:
-            cached_key = (current.support, trial)
             with self._state_lock:
-                cached = self._restricted_drop_scores.get(cached_key)
+                cached = self._restricted_drop_scores.get(current.support, {}).get(
+                    trial
+                )
             if cached is not None:
                 return cached
             trial_closure = set(hierarchy_closure(trial))
@@ -2497,7 +2506,9 @@ class SupportOptimizer:
                 penalty=self.objective.structural_penalty(trial),
             )
             with self._state_lock:
-                self._restricted_drop_scores[cached_key] = score
+                self._restricted_drop_scores.setdefault(current.support, {})[
+                    trial
+                ] = score
             return score
 
         for rule in current.support.rules:
@@ -2539,19 +2550,61 @@ class SupportOptimizer:
     def _standalone_profiled_atoms(
         self, empty: SupportRecord
     ) -> tuple[SupportRecord, ...]:
-        """Exact-fit primitive roots and higher-order score-basin seeds."""
+        """Return objective-admissible single-skeleton discovery roots.
+
+        W/sign are profiled once within every score-basin skeleton, so a root
+        contains exactly one identity.  A higher-order root must improve both
+        the baseline MDL and its exact closure-only null; otherwise automatic
+        hierarchy nuisance, rather than the reported branch, created the gain.
+        """
         ranked = self._rank_profiled_identities(empty, self.dictionary)
-        admissible = self._score_basin_seeds(ranked)
-        positives: dict[Support, SupportRecord] = {}
+        admissible = self._objective_root_candidates(ranked)
+        standalone: dict[Support, SupportRecord] = {}
         for start in range(0, len(admissible), self.config.exact_workers):
             wave = admissible[start : start + self.config.exact_workers]
             records = self.fit_many([Support.of((item[2],)) for item in wave], empty)
             for record in records:
                 if record.score > self.config.search_tolerance:
-                    positives[record.support] = record
+                    standalone[record.support] = record
                 else:
                     with self._state_lock:
                         self.diagnostics.block_score_exact_rejections += 1
+
+        ordered = [
+            standalone[support]
+            for support in sorted(standalone, key=lambda item: item.rules)
+        ]
+        null_models = self.fit_fixed_many(
+            [(EMPTY_SUPPORT, record.matrix.closure) for record in ordered]
+        )
+        positives: dict[Support, SupportRecord] = {}
+        log_n = math.log(max(2, self.objective.n_entities))
+        for record, (_, null_fit) in zip(ordered, null_models, strict=True):
+            closure_code = (
+                len(record.matrix.closure) * self.config.knot_count * log_n
+            )
+            branch_code = record.penalty - closure_code
+            if branch_code < -1.0e-8:
+                raise AssertionError("standalone branch MDL code is negative")
+            branch_score = (
+                2.0 * (null_fit.nll - record.fit.nll) - max(0.0, branch_code)
+                if null_fit.converged
+                else -math.inf
+            )
+            with self._state_lock:
+                self.diagnostics.standalone_branch_audits += 1
+            if branch_score > self.config.search_tolerance:
+                positives[record.support] = record
+            else:
+                with self._state_lock:
+                    self.diagnostics.standalone_branch_rejections += 1
+
+        # Rejected closure-driven seeds must not inflate every multi-source
+        # working set.  A complete delayed-dictionary audit remains mandatory
+        # at a stalled state, so this changes cost but not the terminal audit.
+        self._working_antecedents = {
+            record.support.rules[0].antecedent for record in positives.values()
+        }
         return tuple(
             positives[support]
             for support in sorted(positives, key=lambda item: item.rules)
@@ -2560,11 +2613,11 @@ class SupportOptimizer:
     def _best_profiled_move(self, current: SupportRecord) -> SupportRecord | None:
         """Audit score-admissible adds and every active drop.
 
-        Add identities must first be MDL-positive under the conditional-Fisher
-        block score.  Every such identity and every active drop is then audited
-        with common effects frozen.  Terminal states are therefore restricted
-        add/drop block-coordinate fixed points, not exact one-exchange optima:
-        a W/sign replacement is a drop-plus-add swap and is not certified here.
+        Each inactive skeleton orders W/sign under the conditional-Fisher block
+        score.  Every positive alternative and every active drop is then audited
+        with common effects frozen; only one W/sign can enter a support.  Terminal
+        states are restricted add/drop fixed points, not exact one-exchange
+        optima: a later W/sign replacement is a swap and is not certified.
         """
         # Delayed column generation prices only the finite basin working set
         # during coordinate moves.  A complete outside-dictionary audit is
@@ -2602,27 +2655,46 @@ class SupportOptimizer:
 
     def search(self) -> SearchResult:
         positive_atoms: dict[Support, SupportRecord] = {}
-        # One block-fixed-point multi-rule path is sufficient for the common-MDL
-        # model.  Every exact-positive singleton/pair/triplet basin root is
-        # frozen independently below and reaches F0--F2; alternative basins
-        # are represented by those atom models instead of launching a second
-        # expensive multi-rule ascent from every root.
-        starts: list[Support] = [EMPTY_SUPPORT]
         empty = self.records[EMPTY_SUPPORT]
-        # Every positive skeleton ascends the finite add/drop score DAG to one
-        # of these local-maximum seeds.  Seeds must improve exact J before they
-        # initialize a discovery path; there is no restart or top-k budget.
         for record in self._standalone_profiled_atoms(empty):
             positive_atoms[record.support] = record
-        starts = sorted(set(starts), key=lambda support: support.rules)
+
+        # Empty plus every objective-admissible singleton/pair/triplet root
+        # defines the multi-source search.  There is no top-k or restart budget.
+        # High-score roots run first so their exact transition chains are most
+        # likely to be reused by later roots.
+        root_records = sorted(
+            positive_atoms.values(),
+            key=lambda record: (-record.score, record.support.rules),
+        )
+        starts = [empty, *root_records]
+        self.diagnostics.multi_source_roots = len(starts)
         transition_cache: dict[Support, Support | None] = {}
+        resolved_terminal: dict[Support, Support] = {}
         terminals: dict[Support, SupportRecord] = {}
         paths: list[dict[str, object]] = []
-        for start in starts:
-            current = self.fit(start, empty) if start.rules else empty
+        for start_record in starts:
+            current = start_record
             moves: list[dict[str, object]] = []
+            visited: list[Support] = []
             while True:
                 self.diagnostics.states += 1
+                compressed = resolved_terminal.get(current.support)
+                if compressed is not None:
+                    self.diagnostics.path_compression_hits += 1
+                    terminal_record = terminals[compressed]
+                    if terminal_record.support != current.support:
+                        moves.append(
+                            {
+                                "from": support_key(current.support),
+                                "to": support_key(terminal_record.support),
+                                "gain": float(terminal_record.score - current.score),
+                                "cached_path": True,
+                            }
+                        )
+                    current = terminal_record
+                    break
+                visited.append(current.support)
                 if current.support in transition_cache:
                     self.diagnostics.transition_cache_hits += 1
                     next_support = transition_cache[current.support]
@@ -2634,6 +2706,10 @@ class SupportOptimizer:
                     transition_cache[current.support] = (
                         None if next_record is None else next_record.support
                     )
+                    # This exact transition is now immutable in the shared DAG;
+                    # per-identity audit values for the state can be released.
+                    self._restricted_add_scores.pop(current.support, None)
+                    self._restricted_drop_scores.pop(current.support, None)
                     if next_record is None:
                         break
                 gain = next_record.score - current.score
@@ -2652,9 +2728,11 @@ class SupportOptimizer:
                 current = next_record
             if current.score > 0:
                 terminals[current.support] = current
+                for support in visited:
+                    resolved_terminal[support] = current.support
             paths.append(
                 {
-                    "start": support_key(start),
+                    "start": support_key(start_record.support),
                     "terminal": support_key(current.support),
                     "moves": moves,
                 }

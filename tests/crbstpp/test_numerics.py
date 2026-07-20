@@ -59,7 +59,7 @@ class NumericalParityTests(unittest.TestCase):
             self.assertIsNone(optimizer._best_restricted_drop(current))
             for rule in support.rules:
                 trial = support.drop(rule)
-                restricted = optimizer._restricted_drop_scores[(support, trial)]
+                restricted = optimizer._restricted_drop_scores[support][trial]
                 full = optimizer.fit(trial, current)
                 if full.fit.converged:
                     self.assertGreaterEqual(full.score + 1e-8, restricted)
