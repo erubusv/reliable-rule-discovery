@@ -20,6 +20,7 @@ from .dual import (
 from .likelihood import loss_grid_sparse_event_derivatives, loss_rows
 from .native import (
     aggregate_design_rows,
+    aggregate_design_rows_with_groups,
     configure_cpu_threads,
     moments,
     moments_batch,
@@ -113,6 +114,9 @@ class SearchDiagnostics:
     restricted_relaxation_screens: int = 0
     lazy_exact_refits_avoided: int = 0
     lazy_bound_stops: int = 0
+    restricted_geometry_builds: int = 0
+    restricted_geometry_hits: int = 0
+    restricted_geometry_evictions: int = 0
 
 
 @dataclass(frozen=True)
@@ -140,6 +144,24 @@ class _RestrictedAddProblem:
     event: np.ndarray
     old_nll: float
     free_dimension: int
+
+
+@dataclass(frozen=True)
+class _RestrictedGeometry:
+    rows: np.ndarray
+    design_patterns: np.ndarray
+    row_patterns: np.ndarray
+    event: np.ndarray
+    free_dimension: int
+
+    @property
+    def nbytes(self) -> int:
+        return int(
+            self.rows.nbytes
+            + self.design_patterns.nbytes
+            + self.row_patterns.nbytes
+            + self.event.nbytes
+        )
 
 
 def _nonnegative_quadratic_gain(gradient: np.ndarray, hessian: np.ndarray) -> float:
@@ -243,9 +265,8 @@ class SupportOptimizer:
         self._skeleton_witnesses: dict[Antecedent, tuple[float, RuleIdentity]] = {}
         self._profiled_dictionary: tuple[RuleIdentity, ...] | None = None
         self._working_antecedents: set[Antecedent] = set()
-        self._restricted_add_scores: dict[
-            Support, dict[RuleIdentity, float]
-        ] = {}
+        self._restricted_add_scores: dict[Support, dict[RuleIdentity, float]] = {}
+        self._restricted_add_fits: dict[Support, dict[RuleIdentity, FitResult]] = {}
         self._restricted_add_bounds: dict[
             Support, dict[RuleIdentity, _RestrictedAddBounds]
         ] = {}
@@ -257,6 +278,15 @@ class SupportOptimizer:
         self._restricted_add_events: dict[
             tuple[Support, Antecedent, int], threading.Event
         ] = {}
+        self._restricted_geometries: OrderedDict[
+            tuple[tuple[ClosureTerm, ...], Antecedent, int],
+            _RestrictedGeometry | None,
+        ] = OrderedDict()
+        self._restricted_geometry_events: dict[
+            tuple[tuple[ClosureTerm, ...], Antecedent, int], threading.Event
+        ] = {}
+        self._restricted_geometry_bytes = 0
+        self._restricted_geometry_limit = max(1, config.cache_bytes // 16)
         baseline_matrix = self.engine.model_matrix(context, EMPTY_SUPPORT)
         baseline_fit = fit_model_matrix(
             baseline_matrix,
@@ -308,10 +338,14 @@ class SupportOptimizer:
         self._directional_upper_cache.clear()
         self._block_price_cache.clear()
         self._restricted_add_scores.clear()
+        self._restricted_add_fits.clear()
         self._restricted_add_bounds.clear()
         self._restricted_drop_scores.clear()
         self._restricted_add_problems.clear()
         self._restricted_add_events.clear()
+        self._restricted_geometries.clear()
+        self._restricted_geometry_events.clear()
+        self._restricted_geometry_bytes = 0
         self._dual_geometry_cache.clear()
         baseline = self.records.get(EMPTY_SUPPORT)
         self.records.clear()
@@ -408,15 +442,18 @@ class SupportOptimizer:
         source: SupportRecord | None = None,
         *,
         device: str | None = None,
+        warm_start_override: np.ndarray | None = None,
     ) -> SupportRecord:
         with self._state_lock:
             cached = self.records.get(support)
-            if cached is not None:
+            if cached is not None and (
+                cached.fit.converged or warm_start_override is None
+            ):
                 self.records.move_to_end(support)
                 self.diagnostics.fit_cache_hits += 1
                 return cached
             stored = self._stored_records.get(support)
-        if stored is not None:
+        if stored is not None and (stored.fit.converged or warm_start_override is None):
             matrix = self.engine.model_matrix(self.context, support)
             record = SupportRecord(
                 support, matrix, stored.fit, stored.penalty, stored.score
@@ -426,11 +463,18 @@ class SupportOptimizer:
                 return self._retain_record(record)
         matrix = (
             self.engine.extend_model_matrix(self.context, support, source.matrix)
-            if source is not None
-            and set(source.support.rules).issubset(support.rules)
+            if source is not None and set(source.support.rules).issubset(support.rules)
             else self.engine.model_matrix(self.context, support)
         )
-        warm = None if source is None else self.warm_start(source, matrix)
+        warm = (
+            np.asarray(warm_start_override, dtype=np.float64)
+            if warm_start_override is not None
+            else None
+            if source is None
+            else self.warm_start(source, matrix)
+        )
+        if warm is not None and warm.shape != (matrix.dimension,):
+            raise ValueError("warm-start override dimension does not match model")
         fit = fit_model_matrix(
             matrix,
             likelihood=self.context.dataset.likelihood,
@@ -452,7 +496,17 @@ class SupportOptimizer:
             # Parallel proposal waves are unique by construction, but this
             # race check also makes the public method safe for repeated jobs.
             existing = self._stored_records.get(support)
-            if existing is not None:
+            replace_existing = (
+                existing is not None
+                and fit.converged
+                and (
+                    not existing.fit.converged
+                    or fit.nll
+                    < existing.fit.nll
+                    - self.config.solver_tolerance * max(1.0, abs(existing.fit.nll))
+                )
+            )
+            if existing is not None and not replace_existing:
                 record = SupportRecord(
                     support, matrix, existing.fit, existing.penalty, existing.score
                 )
@@ -1036,9 +1090,7 @@ class SupportOptimizer:
             self._raw_pricing_cache_bytes += size
             while self._raw_pricing_cache_bytes > self._raw_pricing_cache_limit:
                 _, removed = self._raw_pricing_state.popitem(last=False)
-                self._raw_pricing_cache_bytes -= sum(
-                    value.nbytes for value in removed
-                )
+                self._raw_pricing_cache_bytes -= sum(value.nbytes for value in removed)
         return result
 
     def _price_skeleton(
@@ -1134,9 +1186,7 @@ class SupportOptimizer:
                         and len(indices) == 1
                         and int(indices[0]) == 0
                     ):
-                        flat_cross = np.sum(
-                            weighted_candidates, axis=0, keepdims=True
-                        )
+                        flat_cross = np.sum(weighted_candidates, axis=0, keepdims=True)
                     else:
                         design = self.engine.design_at_rows_with_context(
                             self.context, current.matrix, rows
@@ -1294,17 +1344,13 @@ class SupportOptimizer:
         components = dict(component_items)
         gradients = np.asarray(
             [
-                float(rule.sign)
-                * components[rule.antecedent][rule.window][0]
+                float(rule.sign) * components[rule.antecedent][rule.window][0]
                 for rule in identities
             ],
             dtype=np.float64,
         )
         hessians = np.asarray(
-            [
-                components[rule.antecedent][rule.window][1]
-                for rule in identities
-            ],
+            [components[rule.antecedent][rule.window][1] for rule in identities],
             dtype=np.float64,
         )
         compiled_gains = nonnegative_quadratic_gains(gradients, hessians)
@@ -1314,9 +1360,7 @@ class SupportOptimizer:
             else np.asarray(
                 [
                     _nonnegative_quadratic_gain(gradient, hessian)
-                    for gradient, hessian in zip(
-                        gradients, hessians, strict=True
-                    )
+                    for gradient, hessian in zip(gradients, hessians, strict=True)
                 ]
             )
         )
@@ -1786,9 +1830,7 @@ class SupportOptimizer:
                 if not any(dominates(other, item) for other in adjacent):
                     exchange_maxima.append(item)
         candidates = {
-            item[2].antecedent: item
-            for item in positive
-            if item[2].order == 1
+            item[2].antecedent: item for item in positive if item[2].order == 1
         }
         candidates.update({item[2].antecedent: item for item in local_maxima})
         candidates.update({item[2].antecedent: item for item in exchange_maxima})
@@ -2134,9 +2176,7 @@ class SupportOptimizer:
         acceptance = current.score
         identities = self._inactive_identities(current.support, antecedents)
         ranked = self._rank_profiled_identities(current, identities)
-        admissible = [
-            item for item in ranked if item[0] > self.config.search_tolerance
-        ]
+        admissible = [item for item in ranked if item[0] > self.config.search_tolerance]
         if not admissible:
             return None
 
@@ -2148,55 +2188,44 @@ class SupportOptimizer:
         if not admissible:
             return None
 
-        # Candidate bounds are much cheaper than the iterative exact block
-        # solves, but still operate on disjoint compressed sparse problems.  A
-        # small deterministic worker wave shares the available physical cores
-        # without changing any certificate or decision.
-        worker_count = max(1, min(self.config.exact_workers, len(admissible)))
-        threads_per_bound = max(1, self.config.pricing_workers // worker_count)
-
-        def certify(
-            item: tuple[float, float, RuleIdentity],
-        ) -> tuple[float, float, RuleIdentity, _RestrictedAddBounds]:
-            configure_cpu_threads(threads_per_bound)
-            net, gain, rule = item
-            return net, gain, rule, self._restricted_add_bound(current, rule)
-
-        if worker_count > 1:
-            with ThreadPoolExecutor(
-                max_workers=worker_count,
-                thread_name_prefix="crbstpp-restricted-bound",
-            ) as executor:
-                bounded = list(executor.map(certify, admissible))
-        else:
-            bounded = [certify(item) for item in admissible]
-
-        viable = []
-        for net, gain, rule, bound in bounded:
-            if bound.upper_score <= acceptance + self.config.search_tolerance:
-                with self._state_lock:
-                    if bound.dual is None:
-                        self.diagnostics.restricted_relaxation_screens += 1
-                    else:
-                        self.diagnostics.restricted_dual_screens += 1
-                continue
-            viable.append((bound.upper_score, net, gain, rule))
+        # The analytic relaxation is already cached by the safe survivor pass.
+        # It orders work without constructing a candidate problem.  Conditional
+        # dual geometry is created only when the current exact incumbent cannot
+        # yet dominate this cheaper upper bound.
+        viable = [
+            (self.safe_upper_score(current.support.add(rule)), net, gain, rule)
+            for net, gain, rule in admissible
+        ]
         viable.sort(key=lambda item: (-item[0], -item[1], item[3]))
-        if not viable:
-            return None
-
         devices = self.config.pricing_devices or ("cpu",)
         best_score = acceptance
         best_rule: RuleIdentity | None = None
         audited = 0
-        for index, (upper_score, _, _, rule) in enumerate(viable):
-            if upper_score <= best_score + self.config.search_tolerance:
+        for index, (analytic_upper, _, _, rule) in enumerate(viable):
+            if analytic_upper <= best_score + self.config.search_tolerance:
                 with self._state_lock:
                     self.diagnostics.lazy_exact_refits_avoided += len(viable) - index
                     self.diagnostics.lazy_bound_stops += 1
                 break
+            # The cloglog conjugate requires scalar root solves on mixed
+            # aggregate rows.  On this model its certified dual solve is more
+            # expensive than the exact M-dimensional primal block solve.  Skip
+            # that redundant certificate deterministically; the preceding
+            # analytic bound remains safe and the exact solve preserves the
+            # identical accepted move.  Poisson retains the cheap vectorized
+            # dual certificate.
+            if self.context.dataset.likelihood != "first_event_cloglog":
+                bound = self._restricted_add_bound(current, rule)
+                if bound.upper_score <= best_score + self.config.search_tolerance:
+                    with self._state_lock:
+                        if bound.dual is None:
+                            self.diagnostics.restricted_relaxation_screens += 1
+                        else:
+                            self.diagnostics.restricted_dual_screens += 1
+                        self.diagnostics.lazy_exact_refits_avoided += 1
+                    continue
             score = self._restricted_add_score(
-                current, rule, device=devices[index % len(devices)]
+                current, rule, device=devices[audited % len(devices)]
             )
             audited += 1
             if score > best_score + self.config.search_tolerance or (
@@ -2210,12 +2239,50 @@ class SupportOptimizer:
             self.diagnostics.restricted_add_audits += audited
         if best_rule is None:
             return None
-        record = self.fit(current.support.add(best_rule), current)
+        record = self._full_refit_after_restricted_add(current, best_rule)
         if record.score <= acceptance + self.config.search_tolerance:
             raise AssertionError(
-                "full refit degraded an improving restricted add block"
+                "full refit degraded an improving restricted add block: "
+                f"current={current.support!r}, rule={best_rule!r}, "
+                f"restricted_score={best_score:.17g}, "
+                f"full_score={record.score:.17g}, fit={record.fit!r}"
             )
         return record
+
+    def _full_refit_after_restricted_add(
+        self, current: SupportRecord, rule: RuleIdentity
+    ) -> SupportRecord:
+        """Warm the exact full model with its improving block solution.
+
+        The restricted solve optimizes every newly introduced hierarchy block
+        and the candidate rule while freezing existing coefficients.  Embedding
+        that feasible point into the full model prevents a failed cold retry
+        from turning a proven improving add into a false non-convergence.
+        """
+        trial = current.support.add(rule)
+        with self._state_lock:
+            restricted = self._restricted_add_fits.get(current.support, {}).get(rule)
+        if restricted is None or not restricted.converged:
+            return self.fit(trial, current)
+
+        matrix = self.engine.extend_model_matrix(self.context, trial, current.matrix)
+        warm = self.warm_start(current, matrix)
+        target_closure, target_rules = self._block_map(matrix)
+        new_closure = tuple(sorted(set(matrix.closure) - set(current.matrix.closure)))
+        width = self.config.knot_count
+        expected = (len(new_closure) + 1) * width
+        if len(restricted.coefficients) != expected:
+            raise AssertionError("restricted add coefficient layout is inconsistent")
+        for index, term in enumerate(new_closure):
+            warm[target_closure[term]] = restricted.coefficients[
+                index * width : (index + 1) * width
+            ]
+        warm[target_rules[rule]] = restricted.coefficients[-width:]
+        return self.fit(
+            trial,
+            current,
+            warm_start_override=warm,
+        )
 
     def _restricted_add_bound(
         self, current: SupportRecord, rule: RuleIdentity
@@ -2257,14 +2324,11 @@ class SupportOptimizer:
             valid = (
                 certificate.feasible
                 and certificate.nll_lower_bound
-                <= problem.old_nll
-                + 1.0e-7 * max(1.0, abs(problem.old_nll))
+                <= problem.old_nll + 1.0e-7 * max(1.0, abs(problem.old_nll))
             )
             if valid:
                 restricted_lower_nll = (
-                    current.fit.nll
-                    + certificate.nll_lower_bound
-                    - problem.old_nll
+                    current.fit.nll + certificate.nll_lower_bound - problem.old_nll
                 )
                 dual_upper = support_score(
                     baseline_nll=self.baseline_nll,
@@ -2301,14 +2365,12 @@ class SupportOptimizer:
     def _restricted_add_problem(
         self, current: SupportRecord, rule: RuleIdentity
     ) -> _RestrictedAddProblem | None:
-        """Build one unsigned exact problem shared by both rule signs."""
+        """Materialize a compact offset problem from cached sparse geometry."""
         identity = (rule.antecedent, rule.window)
         event_key = (current.support, rule.antecedent, rule.window)
         while True:
             with self._state_lock:
-                state = self._restricted_add_problems.setdefault(
-                    current.support, {}
-                )
+                state = self._restricted_add_problems.setdefault(current.support, {})
                 if identity in state:
                     self.diagnostics.restricted_problem_hits += 1
                     return state[identity]
@@ -2326,63 +2388,39 @@ class SupportOptimizer:
         problem: _RestrictedAddProblem | None = None
         succeeded = False
         try:
-            unsigned = RuleIdentity(rule.antecedent, rule.window, 1)
-            trial = current.support.add(unsigned)
-            old_closure = set(current.matrix.closure)
-            new_closure = tuple(
-                sorted(set(hierarchy_closure(trial)) - old_closure)
-            )
-            specifications = [
-                (term.antecedent, term.window, 1.0) for term in new_closure
-            ]
-            specifications.append((rule.antecedent, rule.window, 1.0))
-            blocks = [
-                self.engine.block(self.context, antecedent, window)
-                for antecedent, window, _ in specifications
-            ]
-            nonempty = [block.rows for block in blocks if len(block.rows)]
-            if nonempty:
-                rows = np.unique(np.concatenate(nonempty))
-                dimension = len(specifications) * self.config.knot_count
-                design = np.zeros((len(rows), dimension), dtype=np.float64)
-                for index, (block, (_, _, sign)) in enumerate(
-                    zip(blocks, specifications, strict=True)
-                ):
-                    if not len(block.rows):
-                        continue
-                    positions = np.searchsorted(rows, block.rows)
-                    left = index * self.config.knot_count
-                    design[positions, left : left + self.config.knot_count] = (
-                        sign * block.values
-                    )
-                offset = self._raw_pricing_components(current)[0][rows]
-                event = np.zeros(len(rows), dtype=np.float64)
-                if len(self.context.target_rows):
-                    positions = np.searchsorted(self.context.target_rows, rows)
-                    matched = positions < len(self.context.target_rows)
-                    safe = np.minimum(
-                        positions, len(self.context.target_rows) - 1
-                    )
-                    matched &= self.context.target_rows[safe] == rows
-                    event[matched] = self.context.target_counts[positions[matched]]
+            geometry = self._restricted_geometry(current, rule)
+            if geometry is not None:
+                raw_offset = self._raw_pricing_components(current)[0][geometry.rows]
+                # ``row_patterns`` exactly identifies the unsigned sparse design
+                # row.  Aggregating the two-column (offset, pattern-id) key is
+                # therefore identical to aggregating (offset, full design), but
+                # avoids materializing N x d for every support state.
+                keys = np.empty((len(geometry.rows), 2), dtype=np.float64)
+                keys[:, 0] = raw_offset
+                keys[:, 1] = geometry.row_patterns
                 exposure = np.full(
-                    len(rows), self.engine.tick_exposure, dtype=np.float64
+                    len(geometry.rows), self.engine.tick_exposure, dtype=np.float64
                 )
+                event = geometry.event.copy()
                 noevent = (
                     exposure - event
                     if self.context.dataset.likelihood == "first_event_cloglog"
                     else exposure.copy()
                 )
-                joint = np.concatenate((offset[:, None], design), axis=1)
-                joint, exposure, noevent, event = aggregate_design_rows(
-                    joint,
+                keys, exposure, noevent, event = aggregate_design_rows(
+                    keys,
                     exposure,
                     noevent,
                     event,
                     copy_input=False,
                 )
-                offset = np.ascontiguousarray(joint[:, 0])
-                design = np.ascontiguousarray(joint[:, 1:])
+                pattern_ids = keys[:, 1].astype(np.int64)
+                if np.any(pattern_ids < 0) or np.any(
+                    pattern_ids >= len(geometry.design_patterns)
+                ):
+                    raise AssertionError("restricted pattern id is out of range")
+                offset = np.ascontiguousarray(keys[:, 0])
+                design = np.ascontiguousarray(geometry.design_patterns[pattern_ids])
                 old_values, _, _ = loss_rows(
                     offset,
                     likelihood=self.context.dataset.likelihood,
@@ -2397,7 +2435,7 @@ class SupportOptimizer:
                     noevent=noevent,
                     event=event,
                     old_nll=float(np.sum(old_values)),
-                    free_dimension=len(new_closure) * self.config.knot_count,
+                    free_dimension=geometry.free_dimension,
                 )
             succeeded = True
         finally:
@@ -2410,6 +2448,99 @@ class SupportOptimizer:
                 completed = self._restricted_add_events.pop(event_key)
                 completed.set()
         return problem
+
+    def _restricted_geometry(
+        self, current: SupportRecord, rule: RuleIdentity
+    ) -> _RestrictedGeometry | None:
+        """Return reusable exact row patterns for one hierarchy-aware skeleton."""
+        unsigned = RuleIdentity(rule.antecedent, rule.window, 1)
+        trial = current.support.add(unsigned)
+        old_closure = set(current.matrix.closure)
+        new_closure = tuple(sorted(set(hierarchy_closure(trial)) - old_closure))
+        key = (new_closure, rule.antecedent, rule.window)
+        while True:
+            with self._state_lock:
+                if key in self._restricted_geometries:
+                    geometry = self._restricted_geometries[key]
+                    self._restricted_geometries.move_to_end(key)
+                    self.diagnostics.restricted_geometry_hits += 1
+                    return geometry
+                pending = self._restricted_geometry_events.get(key)
+                if pending is None:
+                    pending = threading.Event()
+                    self._restricted_geometry_events[key] = pending
+                    owner = True
+                else:
+                    owner = False
+            if owner:
+                break
+            pending.wait()
+
+        geometry: _RestrictedGeometry | None = None
+        succeeded = False
+        try:
+            specifications = [(term.antecedent, term.window) for term in new_closure]
+            specifications.append((rule.antecedent, rule.window))
+            blocks = [
+                self.engine.block(self.context, antecedent, window)
+                for antecedent, window in specifications
+            ]
+            nonempty = [block.rows for block in blocks if len(block.rows)]
+            if nonempty:
+                rows = np.unique(np.concatenate(nonempty))
+                dimension = len(specifications) * self.config.knot_count
+                design = np.zeros((len(rows), dimension), dtype=np.float64)
+                for index, block in enumerate(blocks):
+                    if not len(block.rows):
+                        continue
+                    positions = np.searchsorted(rows, block.rows)
+                    left = index * self.config.knot_count
+                    design[positions, left : left + self.config.knot_count] = (
+                        block.values
+                    )
+                dummy = np.zeros(len(rows), dtype=np.float64)
+                patterns, _, _, _, row_patterns = aggregate_design_rows_with_groups(
+                    design,
+                    dummy,
+                    dummy,
+                    dummy,
+                    copy_input=False,
+                )
+                event = np.zeros(len(rows), dtype=np.float64)
+                if len(self.context.target_rows):
+                    positions = np.searchsorted(self.context.target_rows, rows)
+                    matched = positions < len(self.context.target_rows)
+                    safe = np.minimum(positions, len(self.context.target_rows) - 1)
+                    matched &= self.context.target_rows[safe] == rows
+                    event[matched] = self.context.target_counts[positions[matched]]
+                geometry = _RestrictedGeometry(
+                    rows=np.ascontiguousarray(rows),
+                    design_patterns=np.ascontiguousarray(patterns),
+                    row_patterns=np.ascontiguousarray(row_patterns),
+                    event=np.ascontiguousarray(event),
+                    free_dimension=len(new_closure) * self.config.knot_count,
+                )
+            succeeded = True
+        finally:
+            with self._state_lock:
+                if succeeded:
+                    self._restricted_geometries[key] = geometry
+                    self._restricted_geometries.move_to_end(key)
+                    if geometry is not None:
+                        self._restricted_geometry_bytes += geometry.nbytes
+                    self.diagnostics.restricted_geometry_builds += 1
+                    while (
+                        self._restricted_geometry_bytes
+                        > self._restricted_geometry_limit
+                        and self._restricted_geometries
+                    ):
+                        _, removed = self._restricted_geometries.popitem(last=False)
+                        if removed is not None:
+                            self._restricted_geometry_bytes -= removed.nbytes
+                        self.diagnostics.restricted_geometry_evictions += 1
+                completed = self._restricted_geometry_events.pop(key)
+                completed.set()
+        return geometry
 
     def _restricted_add_score(
         self,
@@ -2449,6 +2580,7 @@ class SupportOptimizer:
         )
         with self._state_lock:
             self.diagnostics.restricted_block_fits += 1
+            self._restricted_add_fits.setdefault(current.support, {})[rule] = fit
         score = -math.inf
         if fit.converged:
             restricted_nll = current.fit.nll + fit.nll - problem.old_nll
@@ -2461,9 +2593,7 @@ class SupportOptimizer:
             self._restricted_add_scores.setdefault(current.support, {})[rule] = score
         return score
 
-    def _best_restricted_drop(
-        self, current: SupportRecord
-    ) -> SupportRecord | None:
+    def _best_restricted_drop(self, current: SupportRecord) -> SupportRecord | None:
         if not current.support.rules:
             return None
         raw_eta = self._raw_pricing_components(current)[0]
@@ -2491,9 +2621,7 @@ class SupportOptimizer:
                 left = current_baseline + index * width
                 effects.append(
                     (
-                        self.engine.block(
-                            self.context, term.antecedent, term.window
-                        ),
+                        self.engine.block(self.context, term.antecedent, term.window),
                         current.fit.coefficients[left : left + width],
                     )
                 )
@@ -2501,9 +2629,7 @@ class SupportOptimizer:
             for rule in current.support.rules:
                 if rule in trial_rules:
                     continue
-                promoted = (
-                    ClosureTerm(rule.antecedent, rule.window) in trial_closure
-                )
+                promoted = ClosureTerm(rule.antecedent, rule.window) in trial_closure
                 if not promoted:
                     effects.append(
                         (
@@ -2555,9 +2681,7 @@ class SupportOptimizer:
                     event_weight=event,
                 )
                 with np.errstate(over="ignore", invalid="ignore"):
-                    delta = float(
-                        np.sum(new_loss - old_loss, dtype=np.longdouble)
-                    )
+                    delta = float(np.sum(new_loss - old_loss, dtype=np.longdouble))
                 nll = current.fit.nll + delta
             else:
                 nll = current.fit.nll
@@ -2567,9 +2691,9 @@ class SupportOptimizer:
                 penalty=self.objective.structural_penalty(trial),
             )
             with self._state_lock:
-                self._restricted_drop_scores.setdefault(current.support, {})[
-                    trial
-                ] = score
+                self._restricted_drop_scores.setdefault(current.support, {})[trial] = (
+                    score
+                )
             return score
 
         for rule in current.support.rules:
@@ -2653,9 +2777,7 @@ class SupportOptimizer:
         positives: dict[Support, SupportRecord] = {}
         log_n = math.log(max(2, self.objective.n_entities))
         for record, null_fit in zip(ordered, null_fits, strict=True):
-            closure_code = (
-                len(record.matrix.closure) * self.config.knot_count * log_n
-            )
+            closure_code = len(record.matrix.closure) * self.config.knot_count * log_n
             branch_code = record.penalty - closure_code
             if branch_code < -1.0e-8:
                 raise AssertionError("standalone branch MDL code is negative")
@@ -2773,6 +2895,7 @@ class SupportOptimizer:
                     # This exact transition is now immutable in the shared DAG;
                     # per-identity audit values for the state can be released.
                     self._restricted_add_scores.pop(current.support, None)
+                    self._restricted_add_fits.pop(current.support, None)
                     self._restricted_add_bounds.pop(current.support, None)
                     self._restricted_drop_scores.pop(current.support, None)
                     self._restricted_add_problems.pop(current.support, None)

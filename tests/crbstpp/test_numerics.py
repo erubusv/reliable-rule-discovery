@@ -27,7 +27,7 @@ from crbstpp.response import Context, ResponseEngine
 from crbstpp.config import RunConfig
 from crbstpp.data import Dataset, write_dataset
 from crbstpp.dual import offset_dual_certificate
-from crbstpp.rules import RuleIdentity, Support
+from crbstpp.rules import RuleIdentity, Support, hierarchy_closure
 from crbstpp.search import (
     SupportOptimizer,
     _RestrictedAddBounds,
@@ -130,9 +130,7 @@ class NumericalParityTests(unittest.TestCase):
                 self.assertGreaterEqual(full.score + 1e-8, restricted)
                 compared += 1
             self.assertGreater(compared, 0)
-            unsigned = {
-                (rule.antecedent, rule.window) for rule in optimizer.dictionary
-            }
+            unsigned = {(rule.antecedent, rule.window) for rule in optimizer.dictionary}
             self.assertEqual(
                 optimizer.diagnostics.restricted_problem_builds, len(unsigned)
             )
@@ -198,9 +196,7 @@ class NumericalParityTests(unittest.TestCase):
                     certificate.nll_lower_bound,
                     exact.nll + 1e-7 * max(1.0, abs(exact.nll)),
                 )
-                self.assertAlmostEqual(
-                    certificate.nll_lower_bound, exact.nll, places=5
-                )
+                self.assertAlmostEqual(certificate.nll_lower_bound, exact.nll, places=5)
                 certified += 1
                 if certified == 4:
                     break
@@ -277,6 +273,81 @@ class NumericalParityTests(unittest.TestCase):
                 checked += 1
             self.assertGreater(checked, 0)
 
+    def test_pattern_compressed_restricted_problem_matches_dense_reference(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            data = synthetic_dataset(Path(directory) / "data", 120)
+            fit_codes, _, _ = data.split((0.6, 0.2, 0.2), 111)
+            config = RunConfig(
+                dataset=str(data.root),
+                q_max=2,
+                impact_lag=3,
+                knot_count=2,
+                formation_windows=(0, 1, 2),
+                solver_tolerance=1e-8,
+                solver_max_iter=150,
+                cache_bytes=32 * 1024**2,
+                early_warning_horizon=3,
+                pricing_devices=(),
+            )
+            optimizer = SupportOptimizer(Context.make(data, fit_codes), config)
+            empty = optimizer.records[Support(())]
+            rule = next(rule for rule in optimizer.dictionary if rule.order == 2)
+            compact = optimizer._restricted_add_problem(empty, rule)
+            self.assertIsNotNone(compact)
+
+            unsigned = RuleIdentity(rule.antecedent, rule.window, 1)
+            trial = empty.support.add(unsigned)
+            new_closure = tuple(
+                sorted(set(hierarchy_closure(trial)) - set(empty.matrix.closure))
+            )
+            specifications = [(term.antecedent, term.window) for term in new_closure]
+            specifications.append((rule.antecedent, rule.window))
+            blocks = [
+                optimizer.engine.block(optimizer.context, antecedent, window)
+                for antecedent, window in specifications
+            ]
+            rows = np.unique(
+                np.concatenate([block.rows for block in blocks if len(block.rows)])
+            )
+            design = np.zeros(
+                (len(rows), len(specifications) * config.knot_count),
+                dtype=np.float64,
+            )
+            for block_index, block in enumerate(blocks):
+                positions = np.searchsorted(rows, block.rows)
+                left = block_index * config.knot_count
+                design[positions, left : left + config.knot_count] = block.values
+            offset = optimizer._raw_pricing_components(empty)[0][rows]
+            event = np.zeros(len(rows), dtype=np.float64)
+            positions = np.searchsorted(optimizer.context.target_rows, rows)
+            matched = positions < len(optimizer.context.target_rows)
+            safe = np.minimum(positions, len(optimizer.context.target_rows) - 1)
+            matched &= optimizer.context.target_rows[safe] == rows
+            event[matched] = optimizer.context.target_counts[positions[matched]]
+            exposure = np.full(len(rows), optimizer.engine.tick_exposure)
+            noevent = exposure - event
+            joint, exposure, noevent, event = aggregate_design_rows(
+                np.concatenate((offset[:, None], design), axis=1),
+                exposure,
+                noevent,
+                event,
+                copy_input=False,
+            )
+            np.testing.assert_array_equal(compact.offset, joint[:, 0])
+            np.testing.assert_array_equal(compact.unsigned_design, joint[:, 1:])
+            np.testing.assert_array_equal(compact.exposure, exposure)
+            np.testing.assert_array_equal(compact.noevent, noevent)
+            np.testing.assert_array_equal(compact.event, event)
+            self.assertEqual(
+                compact.free_dimension, len(new_closure) * config.knot_count
+            )
+
+            geometry = optimizer._restricted_geometry(empty, rule)
+            self.assertIsNotNone(geometry)
+            self.assertGreaterEqual(optimizer.diagnostics.restricted_geometry_hits, 1)
+
     def test_lazy_add_stops_after_incumbent_dominates_remaining_bounds(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             data = synthetic_dataset(Path(directory) / "data", 90)
@@ -319,10 +390,15 @@ class NumericalParityTests(unittest.TestCase):
                 ),
                 mock.patch.object(
                     optimizer,
+                    "safe_upper_score",
+                    side_effect=lambda support: bounds[support.rules[-1]].upper_score,
+                ),
+                mock.patch.object(
+                    optimizer,
                     "_restricted_add_score",
-                    side_effect=lambda current, rule, device=None: 6.0
-                    if rule == rules[0]
-                    else 4.0,
+                    side_effect=lambda current, rule, device=None: (
+                        6.0 if rule == rules[0] else 4.0
+                    ),
                 ) as exact,
                 mock.patch.object(optimizer, "fit", side_effect=fitted),
             ):
@@ -361,9 +437,7 @@ class NumericalParityTests(unittest.TestCase):
             )
             antecedents = set(optimizer.skeletons)
             self.assertIsNone(
-                optimizer._best_restricted_addition(
-                    blocked, antecedents=antecedents
-                )
+                optimizer._best_restricted_addition(blocked, antecedents=antecedents)
             )
             self.assertLessEqual(
                 optimizer.diagnostics.restricted_add_audits,
@@ -373,18 +447,12 @@ class NumericalParityTests(unittest.TestCase):
     def test_incremental_support_matrix_matches_fresh_construction(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             data = synthetic_dataset(Path(directory) / "data", 120)
-            context = Context.make(
-                data, np.arange(data.n_entities, dtype=np.int32)
-            )
-            engine = ResponseEngine(
-                data, lag=3, knot_count=2, cache_bytes=32 * 1024**2
-            )
+            context = Context.make(data, np.arange(data.n_entities, dtype=np.int32))
+            engine = ResponseEngine(data, lag=3, knot_count=2, cache_bytes=32 * 1024**2)
             source_support = Support.of((RuleIdentity((0,), 0, 1),))
             target_support = source_support.add(RuleIdentity((0, 1), 2, -1))
             source = engine.model_matrix(context, source_support)
-            incremental = engine.extend_model_matrix(
-                context, target_support, source
-            )
+            incremental = engine.extend_model_matrix(context, target_support, source)
             fresh = engine.model_matrix(context, target_support)
             for left, right in (
                 (incremental.x, fresh.x),
@@ -407,9 +475,7 @@ class NumericalParityTests(unittest.TestCase):
         reference = np.asarray(
             [
                 _nonnegative_quadratic_gain(gradient, hessian)
-                for gradient, hessian in zip(
-                    gradients, hessians, strict=True
-                )
+                for gradient, hessian in zip(gradients, hessians, strict=True)
             ]
         )
         np.testing.assert_allclose(compiled, reference, rtol=1e-12, atol=1e-12)
