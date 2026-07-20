@@ -147,7 +147,7 @@ class LikelihoodSolverTests(unittest.TestCase):
             self.assertTrue(certificate.feasible)
             self.assertLessEqual(certificate.nll_lower_bound, fit.nll + 1e-6)
 
-    def test_small_search_returns_stationary_family(self) -> None:
+    def test_small_block_search_matches_exact_neighbor_audit(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             data = synthetic_dataset(Path(directory) / "data")
             fit_codes, _, _ = data.split((0.6, 0.2, 0.2), 111)

@@ -21,7 +21,7 @@ from crbstpp.config import RunConfig
 from crbstpp.data import Dataset, write_dataset
 from crbstpp.rules import RuleIdentity, Support
 from crbstpp.search import SupportOptimizer
-from crbstpp.solver import fit_model_matrix
+from crbstpp.solver import _objective, fit_model_matrix
 
 from tests.crbstpp.test_core import synthetic_dataset
 
@@ -334,6 +334,108 @@ class NumericalParityTests(unittest.TestCase):
                 np.testing.assert_allclose(
                     fused[rule.window][1], hessian, rtol=1e-13, atol=1e-13
                 )
+
+    def test_hierarchy_joint_block_score_matches_direct_trial_quadratic(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            data = synthetic_dataset(Path(directory) / "data", 90)
+            fit_codes, _, _ = data.split((0.6, 0.2, 0.2), 111)
+            config = RunConfig(
+                dataset=str(data.root),
+                q_max=2,
+                impact_lag=3,
+                knot_count=2,
+                formation_windows=(0, 1, 2),
+                solver_tolerance=1e-8,
+                solver_max_iter=150,
+                cache_bytes=32 * 1024**2,
+                early_warning_horizon=3,
+                pricing_devices=(),
+            )
+            optimizer = SupportOptimizer(Context.make(data, fit_codes), config)
+            empty = optimizer.records[Support(())]
+            prices = optimizer._price_hierarchy_skeleton(
+                empty, (0, 1), (0, 1, 2), device="cpu"
+            )
+            for window in (0, 1, 2):
+                positive = RuleIdentity((0, 1), window, 1)
+                matrix = optimizer.engine.model_matrix(
+                    optimizer.context, Support.of((positive,))
+                )
+                warm = optimizer.warm_start(empty, matrix)
+                _, gradient, hessian, _ = _objective(matrix, data.likelihood, warm)
+                old = empty.matrix.dimension
+                old_inverse = np.linalg.pinv(hessian[:old, :old], rcond=1e-12)
+                cross = hessian[:old, old:]
+                conditional_gradient = (
+                    gradient[old:] - cross.T @ old_inverse @ gradient[:old]
+                )
+                conditional_hessian = (
+                    hessian[old:, old:] - cross.T @ old_inverse @ cross
+                )
+                expected = tuple(
+                    optimizer._hierarchy_quadratic_gain(
+                        conditional_gradient,
+                        conditional_hessian,
+                        matrix.closure_dimension,
+                        sign,
+                    )
+                    for sign in (-1, 1)
+                )
+                self.assertTrue(prices[window][5])
+                np.testing.assert_allclose(
+                    prices[window][:2],
+                    (expected[0][0], expected[1][0]),
+                    rtol=1e-11,
+                    atol=1e-11,
+                )
+                np.testing.assert_allclose(
+                    prices[window][2:4],
+                    (expected[0][1], expected[1][1]),
+                    rtol=1e-11,
+                    atol=1e-11,
+                )
+
+    def test_closure_only_gain_does_not_admit_reported_pair(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            data = synthetic_dataset(Path(directory) / "data", 90)
+            fit_codes, _, _ = data.split((0.6, 0.2, 0.2), 111)
+            config = RunConfig(
+                dataset=str(data.root),
+                q_max=2,
+                impact_lag=3,
+                knot_count=2,
+                formation_windows=(0, 1, 2),
+                solver_tolerance=1e-8,
+                solver_max_iter=150,
+                cache_bytes=32 * 1024**2,
+                early_warning_horizon=3,
+                pricing_devices=(),
+            )
+            optimizer = SupportOptimizer(Context.make(data, fit_codes), config)
+            empty = optimizer.records[Support(())]
+            rule = next(
+                identity
+                for identity in optimizer.dictionary
+                if identity.antecedent == (0, 1) and identity.sign > 0
+            )
+            closure_dimension = config.knot_count * 2
+            artificial_price = {
+                rule.window: (
+                    1.0e6,
+                    1.0e6,
+                    0.0,
+                    0.0,
+                    closure_dimension,
+                    True,
+                )
+            }
+            with mock.patch.object(
+                optimizer,
+                "_price_hierarchy_skeleton",
+                return_value=artificial_price,
+            ):
+                ranked = optimizer._rank_block_identities(empty, (rule,))
+            self.assertLess(ranked[0][0], 0.0)
 
     def test_dual_geometry_is_shared_across_signs(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
