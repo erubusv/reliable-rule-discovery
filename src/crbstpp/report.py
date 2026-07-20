@@ -10,6 +10,7 @@ class Certificate:
     f0: bool
     f1_pvalue: float | None
     f2_pvalues: tuple[float, ...]
+    f3: bool
     family_pvalue: float | None
     holm_adjusted_pvalue: float | None
     certified: bool

@@ -262,7 +262,10 @@ def run(
     result_payload = {
         "schema": RESULT_SCHEMA,
         "algorithm": "CRBS-TPP",
-        "claim": "certified predictive early-warning rules; non-causal",
+        "claim": (
+            "cohort-mixture distributionally robust predictive early-warning "
+            "rules; non-causal"
+        ),
         "config_digest": config.digest,
         "dataset_digest": dataset.digest,
         "split_sizes": {

@@ -39,12 +39,21 @@ def cell_dataset(
     for cell in sorted(probabilities):
         target_count = int(round(probabilities[cell] * per_cell))
         for replicate in range(per_cell):
-            entities.append((f"e{code:06d}", 0, 2, 0, 0))
+            environment_start = 3 * (replicate % 10)
+            entities.append(
+                (
+                    f"e{code:06d}",
+                    environment_start,
+                    environment_start + 2,
+                    0,
+                    0,
+                )
+            )
             for predicate, active in enumerate(cell):
                 if active:
-                    events.append((code, 1, predicate))
+                    events.append((code, environment_start + 1, predicate))
             if replicate < target_count:
-                targets.append((code, 2, 1))
+                targets.append((code, environment_start + 2, 1))
             code += 1
     write_dataset(
         root,
@@ -97,7 +106,7 @@ class HigherOrderRecoveryTests(unittest.TestCase):
         }
         with tempfile.TemporaryDirectory() as directory:
             data = cell_dataset(
-                Path(directory) / "data", 2, probabilities, per_cell=1000
+                Path(directory) / "data", 2, probabilities, per_cell=5000
             )
             fit_codes, cert_codes, test_codes = data.split((0.6, 0.2, 0.2), 13)
             config = RunConfig(
@@ -124,6 +133,7 @@ class HigherOrderRecoveryTests(unittest.TestCase):
             self.assertEqual(len(certification.certified), 1)
             certificate = certification.certified[0].certificate
             self.assertTrue(certificate.f0)
+            self.assertTrue(certificate.f3)
             self.assertLessEqual(certificate.holm_adjusted_pvalue, config.alpha)
             combined = np.sort(np.concatenate([fit_codes, cert_codes])).astype(np.int32)
             ensemble = fit_ensemble(

@@ -8,7 +8,12 @@ from pathlib import Path
 
 import numpy as np
 
-from crbstpp.certification import _branch_null_closure, _entity_losses_sparse
+from crbstpp.certification import (
+    _branch_null_closure,
+    _entity_losses_sparse,
+    _multinomial_l1_radius,
+    _worst_case_total_variation_mean,
+)
 from crbstpp.config import RunConfig
 from crbstpp.data import Dataset
 from crbstpp.pipeline import run
@@ -21,6 +26,20 @@ from tests.crbstpp.test_core import synthetic_dataset
 
 
 class PipelineContractTests(unittest.TestCase):
+    def test_f3_total_variation_worst_case_is_exact(self) -> None:
+        values = np.asarray([1.0, 3.0])
+        probabilities = np.asarray([0.5, 0.5])
+        self.assertAlmostEqual(
+            _worst_case_total_variation_mean(values, probabilities, 0.2),
+            1.8,
+        )
+        self.assertAlmostEqual(
+            _worst_case_total_variation_mean(values, probabilities, 2.0),
+            1.0,
+        )
+        self.assertEqual(_multinomial_l1_radius(100, 1, 0.05), 0.0)
+        self.assertGreater(_multinomial_l1_radius(100, 2, 0.05), 0.0)
+
     def test_manifest_provenance_tampering_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "data"
@@ -87,8 +106,9 @@ class PipelineContractTests(unittest.TestCase):
             )
             run_dir = root / "run"
             report = run(config, run_dir=run_dir)
-            self.assertEqual(report.schema, "crbstpp.result.v1")
+            self.assertEqual(report.schema, "crbstpp.result.v2")
             self.assertIn("f0", report.result["certification"]["all"][0]["certificate"])
+            self.assertIn("f3", report.result["certification"]["all"][0]["certificate"])
             resumed = run(config, run_dir=run_dir, resume=True)
             self.assertEqual(resumed.result, report.result)
             repeated = run(config, run_dir=root / "run-repeat")

@@ -8,7 +8,7 @@ from typing import Any
 
 
 CHECKPOINT_SCHEMA = "crbstpp.checkpoint.v1"
-RESULT_SCHEMA = "crbstpp.result.v1"
+RESULT_SCHEMA = "crbstpp.result.v2"
 
 
 def atomic_json(path: str | Path, payload: dict[str, Any]) -> None:

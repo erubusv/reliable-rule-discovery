@@ -38,6 +38,134 @@ class CertificationResult:
     family_size: int
 
 
+@dataclass(frozen=True)
+class _EnvironmentSpec:
+    """Natural held-out environments and their calibrated mixture set."""
+
+    inverse: np.ndarray
+    labels: np.ndarray
+    counts: np.ndarray
+    probabilities: np.ndarray
+    l1_radius: float
+    source: str
+
+
+def _multinomial_l1_radius(n: int, environments: int, alpha: float) -> float:
+    """Finite-sample confidence radius for multinomial mixture weights.
+
+    The Bretagnolle--Huber--Carol inequality gives
+    ``P(||p_hat-p||_1 >= eps) <= 2**K exp(-n eps**2/2)``.  Thus the radius is
+    fixed by sample size, environment count and the pre-registered alpha; no
+    hand-selected stress magnitude or inferred market regime is introduced.
+    """
+    if n < 1:
+        raise ValueError("environment calibration requires observations")
+    if environments <= 1:
+        return 0.0
+    radius = math.sqrt(
+        2.0
+        * (float(environments) * math.log(2.0) + math.log(1.0 / float(alpha)))
+        / float(n)
+    )
+    return min(2.0, radius)
+
+
+def _environment_spec(context: Context, config: RunConfig) -> _EnvironmentSpec:
+    """Use pre-existing financial cohorts rather than inferred regimes."""
+    raw = context.dataset.split_groups[context.entity_codes]
+    source = "dataset.split_groups"
+    if len(np.unique(raw)) <= 1:
+        # Recurrent datasets such as IBM intentionally use random entity
+        # splitting and therefore have no split-group cohort.  Their entity
+        # entry times still define an outcome-blind temporal cohort.  The block
+        # width is the complete formation-plus-impact horizon, not a tuned
+        # market-regime threshold.
+        width = max(
+            1,
+            (max(config.formation_windows) + config.impact_lag)
+            * context.dataset.ticks_per_unit,
+        )
+        origin = int(np.min(context.starts))
+        raw = (context.starts - origin) // width
+        source = "entity_start_time/formation_plus_impact_horizon"
+    labels, inverse, counts = np.unique(raw, return_inverse=True, return_counts=True)
+    counts = counts.astype(np.float64)
+    probabilities = counts / float(np.sum(counts))
+    return _EnvironmentSpec(
+        inverse=np.asarray(inverse, dtype=np.int64),
+        labels=np.asarray(labels),
+        counts=counts,
+        probabilities=probabilities,
+        l1_radius=_multinomial_l1_radius(len(raw), len(labels), config.alpha),
+        source=source,
+    )
+
+
+def _worst_case_total_variation_mean(
+    values: np.ndarray,
+    probabilities: np.ndarray,
+    l1_radius: float,
+) -> float:
+    """Exact minimum mean over an L1 ball on a finite environment simplex."""
+    values = np.asarray(values, dtype=np.float64)
+    probabilities = np.asarray(probabilities, dtype=np.float64)
+    if (
+        values.ndim != 1
+        or probabilities.shape != values.shape
+        or not len(values)
+        or np.any(probabilities < 0.0)
+        or not np.isclose(float(np.sum(probabilities)), 1.0)
+        or not 0.0 <= l1_radius <= 2.0
+    ):
+        raise ValueError("invalid finite-environment ambiguity problem")
+    if len(values) == 1 or l1_radius == 0.0:
+        return float(probabilities @ values)
+    weights = probabilities.copy()
+    low_order = np.argsort(values, kind="stable")
+    high_order = low_order[::-1]
+    budget = min(1.0, 0.5 * float(l1_radius))
+    low_index = high_index = 0
+    tolerance = 16.0 * np.finfo(float).eps
+    while budget > tolerance:
+        while (
+            low_index < len(values) and weights[low_order[low_index]] >= 1.0 - tolerance
+        ):
+            low_index += 1
+        while high_index < len(values) and weights[high_order[high_index]] <= tolerance:
+            high_index += 1
+        if low_index >= len(values) or high_index >= len(values):
+            break
+        low = int(low_order[low_index])
+        high = int(high_order[high_index])
+        if low == high or values[low] >= values[high]:
+            break
+        moved = min(budget, 1.0 - weights[low], weights[high])
+        if moved <= tolerance:
+            break
+        weights[low] += moved
+        weights[high] -= moved
+        budget -= moved
+    return float(weights @ values)
+
+
+def _environment_robust_mean(
+    values: np.ndarray, environments: _EnvironmentSpec
+) -> tuple[float, np.ndarray]:
+    values = np.asarray(values, dtype=np.float64)
+    if values.shape != environments.inverse.shape:
+        raise ValueError("entity gain and environment arrays must align")
+    sums = np.bincount(
+        environments.inverse,
+        weights=values,
+        minlength=len(environments.labels),
+    )
+    means = sums / environments.counts
+    worst = _worst_case_total_variation_mean(
+        means, environments.probabilities, environments.l1_radius
+    )
+    return worst, means
+
+
 def one_sided_mean_test(values: np.ndarray, threshold: float = 0.0) -> EffectTest:
     values = np.asarray(values, dtype=np.float64)
     values = values[np.isfinite(values)] - float(threshold)
@@ -187,6 +315,7 @@ def certify_family(
         knot_count=config.knot_count,
         cache_bytes=config.cache_bytes // 4,
     )
+    environments = _environment_spec(certification_context, config)
     interim: list[tuple[SupportRecord, float, dict[str, object], tuple[str, ...]]] = []
     for record in family:
         reasons: list[str] = []
@@ -202,13 +331,31 @@ def certify_family(
             reasons.append("closure_null_nonconvergence")
             interim.append((record, 1.0, diagnostics, tuple(reasons)))
             continue
-        _, null_entity = _evaluate_frozen(
+        null_cert_matrix, null_entity = _evaluate_frozen(
             cert_engine, certification_context, null_matrix, null_fit
         )
         f1 = one_sided_mean_test(null_entity - full_entity)
         diagnostics["f1"] = f1.__dict__
         if not f1.testable:
             reasons.append("f1_not_testable")
+        support_robust_gain, support_environment_gains = _environment_robust_mean(
+            null_entity - full_entity, environments
+        )
+        support_dimension = max(0, full_matrix.dimension - null_cert_matrix.dimension)
+        support_mdl_threshold = (
+            support_dimension
+            * math.log(max(2, len(certification_context.entity_codes)))
+            / (2.0 * len(certification_context.entity_codes))
+        )
+        distribution_shift_testable = len(environments.labels) > 1
+        support_f3 = bool(
+            distribution_shift_testable and support_robust_gain > support_mdl_threshold
+        )
+        if not distribution_shift_testable:
+            reasons.append("f3_distribution_shift_not_testable")
+        if not support_f3:
+            if distribution_shift_testable:
+                reasons.append("f3_support_robust_gain_below_mdl")
         branch_specifications = []
         for root in record.support.rules:
             drop_support = _branch_drop(record.support, root)
@@ -219,11 +366,13 @@ def certify_family(
         branch_models = optimizer.fit_fixed_many(branch_specifications)
         rule_pvalues: list[float] = []
         rule_diagnostics: list[dict[str, object]] = []
+        rule_f3: list[bool] = []
         for root, (drop_matrix, drop_fit) in zip(
             record.support.rules, branch_models, strict=True
         ):
             if not drop_fit.converged:
                 rule_pvalues.append(1.0)
+                rule_f3.append(False)
                 reasons.append(f"branch_nonconvergence:{root}")
                 rule_diagnostics.append(
                     {
@@ -233,6 +382,9 @@ def certify_family(
                         "probability": None,
                         "footprint_rows": 0,
                         "pvalue": 1.0,
+                        "f3_robust_global_gain": None,
+                        "f3_robust_probability_contribution": None,
+                        "f3": False,
                         "reason": drop_fit.message,
                     }
                 )
@@ -288,6 +440,21 @@ def certify_family(
             probability_test = one_sided_mean_test(
                 probability_difference, config.probability_materiality
             )
+            robust_global_gain, global_environment_gains = _environment_robust_mean(
+                drop_entity - full_entity, environments
+            )
+            robust_probability, probability_environment_gains = (
+                _environment_robust_mean(probability_difference, environments)
+            )
+            rule_f3_passed = bool(
+                robust_global_gain > 0.0
+                and robust_probability > config.probability_materiality
+            )
+            rule_f3.append(rule_f3_passed)
+            if robust_global_gain <= 0.0:
+                reasons.append(f"f3_rule_robust_gain_nonpositive:{root}")
+            if robust_probability <= config.probability_materiality:
+                reasons.append(f"f3_rule_robust_probability_nonpositive:{root}")
             pvalue = max(global_test.pvalue, local_test.pvalue, probability_test.pvalue)
             rule_pvalues.append(pvalue)
             rule_diagnostics.append(
@@ -298,6 +465,21 @@ def certify_family(
                     "probability": probability_test.__dict__,
                     "footprint_rows": int(len(footprint)),
                     "pvalue": pvalue,
+                    "f3_robust_global_gain": robust_global_gain,
+                    "f3_robust_probability_contribution": robust_probability,
+                    "f3_global_environment_gain_min": float(
+                        np.min(global_environment_gains)
+                    ),
+                    "f3_global_environment_gain_max": float(
+                        np.max(global_environment_gains)
+                    ),
+                    "f3_probability_environment_gain_min": float(
+                        np.min(probability_environment_gains)
+                    ),
+                    "f3_probability_environment_gain_max": float(
+                        np.max(probability_environment_gains)
+                    ),
+                    "f3": rule_f3_passed,
                 }
             )
             if not (
@@ -307,6 +489,19 @@ def certify_family(
             ):
                 reasons.append(f"f2_not_testable:{root}")
         diagnostics["rules"] = rule_diagnostics
+        f3 = bool(support_f3 and all(rule_f3))
+        diagnostics["f3"] = {
+            "passed": f3,
+            "environment_source": environments.source,
+            "environment_count": int(len(environments.labels)),
+            "distribution_shift_testable": distribution_shift_testable,
+            "ambiguity": "finite-sample multinomial L1 confidence set",
+            "ambiguity_l1_radius": environments.l1_radius,
+            "support_robust_gain": support_robust_gain,
+            "support_mdl_threshold": support_mdl_threshold,
+            "support_environment_gain_min": float(np.min(support_environment_gains)),
+            "support_environment_gain_max": float(np.max(support_environment_gains)),
+        }
         support_pvalue = max([f1.pvalue, *rule_pvalues], default=1.0)
         interim.append((record, support_pvalue, diagnostics, tuple(reasons)))
     adjusted = _holm_adjust([item[1] for item in interim])
@@ -332,12 +527,14 @@ def certify_family(
         rule_pvalues = tuple(
             float(item["pvalue"]) for item in diagnostics.get("rules", [])
         )
-        certified = bool(f0 and not reasons and adjusted_pvalue <= config.alpha)
+        f3 = bool(diagnostics.get("f3", {}).get("passed", False))
+        certified = bool(f0 and f3 and not reasons and adjusted_pvalue <= config.alpha)
         certificate = Certificate(
             support_key=support_key(record.support),
             f0=f0,
             f1_pvalue=f1_pvalue,
             f2_pvalues=rule_pvalues,
+            f3=f3,
             family_pvalue=pvalue,
             holm_adjusted_pvalue=adjusted_pvalue,
             certified=certified,

@@ -2927,7 +2927,7 @@ class SupportOptimizer:
                 }
             )
         # Every exact-positive atom and every terminal support is frozen for
-        # F0--F2.  In particular, higher-order atoms cannot be reported merely
+        # F0--F3.  In particular, higher-order atoms cannot be reported merely
         # because their automatic closure fitted well: F2 must validate their
         # hierarchy-preserving branch contribution on D_cert.
         family_map = dict(positive_atoms)
