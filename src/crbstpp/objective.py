@@ -16,14 +16,19 @@ class ObjectiveSpec:
     window_count_by_order: tuple[int, int, int]
 
     def penalty_for_dimension(
-        self, support: Support, parameter_dimension: int
+        self,
+        support: Support,
+        parameter_dimension: int,
+        *,
+        n_entities: int | None = None,
     ) -> float:
         size = len(support.rules)
         if size == 0:
             return 0.0
         if not 0 <= size <= self.skeleton_count:
             raise ValueError("support size exceeds skeleton dictionary")
-        parameter_code = parameter_dimension * math.log(max(2, int(self.n_entities)))
+        sample_size = self.n_entities if n_entities is None else int(n_entities)
+        parameter_code = parameter_dimension * math.log(max(2, sample_size))
         support_code = 2.0 * (
             math.lgamma(self.skeleton_count + 1)
             - math.lgamma(size + 1)

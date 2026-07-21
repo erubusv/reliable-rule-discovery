@@ -131,7 +131,13 @@ class HigherOrderRecoveryTests(unittest.TestCase):
         }
         with tempfile.TemporaryDirectory() as directory:
             data = cell_dataset(
-                Path(directory) / "data", 2, probabilities, per_cell=5000
+                # F3 now includes a simultaneous environment-robust horizon
+                # bound; use enough deterministic cells for that stricter
+                # finite-sample condition to be identifiable.
+                Path(directory) / "data",
+                2,
+                probabilities,
+                per_cell=40_000,
             )
             fit_codes, cert_codes, test_codes = data.split((0.6, 0.2, 0.2), 13)
             config = RunConfig(
@@ -166,6 +172,9 @@ class HigherOrderRecoveryTests(unittest.TestCase):
             self.assertTrue(certificate.f0)
             self.assertTrue(certificate.f3)
             self.assertLessEqual(certificate.holm_adjusted_pvalue, config.alpha)
+            diagnostics = certification.certified[0].diagnostics
+            self.assertEqual(diagnostics["f3"]["family_robust_metric_count"], 4)
+            self.assertIn("f3_robust_horizon_gain", diagnostics["rules"][0])
             combined = np.sort(np.concatenate([fit_codes, cert_codes])).astype(np.int32)
             ensemble = fit_ensemble(
                 Context.make(data, combined),

@@ -202,8 +202,12 @@ def _prefit_family_nulls(
         tuple[Support, tuple[ClosureTerm, ...]], SupportRecord
     ] = {}
     for record in family:
-        closure = hierarchy_closure(record.support)
-        jobs.setdefault((EMPTY_SUPPORT, closure), record)
+        # F1 and support-level F3 ask whether the complete predictive support
+        # improves on the pre-registered empty baseline.  Closure-only models
+        # are reserved for hierarchy-preserving branch tests below; using one
+        # as the support null both duplicated F2 and allowed a nuisance-model
+        # failure to abort the overall predictive comparison.
+        jobs.setdefault((EMPTY_SUPPORT, ()), record)
         for root in record.support.rules:
             drop_support = _branch_drop(record.support, root)
             drop_closure = _branch_null_closure(
@@ -242,7 +246,9 @@ def certify_family(
     environments = _environment_spec(
         certification_context, config, alpha=f3_alpha
     )
-    robust_metric_count = sum(1 + 2 * len(record.support.rules) for record in family)
+    # One support functional plus global, horizon and sign-aligned probability
+    # functionals for every reported rule.
+    robust_metric_count = sum(1 + 3 * len(record.support.rules) for record in family)
     robust_metric_alpha = f3_alpha / max(1, robust_metric_count)
     interim: list[tuple[SupportRecord, float, dict[str, object], tuple[str, ...]]] = []
     for record in family:
@@ -251,12 +257,11 @@ def certify_family(
         full_matrix, full_entity = _evaluate_frozen(
             cert_engine, certification_context, record.matrix, record.fit
         )
-        closure = hierarchy_closure(record.support)
         null_matrix, null_fit = _fit_on_discovery(
-            optimizer, EMPTY_SUPPORT, closure=closure, source=record
+            optimizer, EMPTY_SUPPORT, closure=(), source=record
         )
         if not null_fit.converged:
-            reasons.append("closure_null_nonconvergence")
+            reasons.append("baseline_null_nonconvergence")
             interim.append((record, 1.0, diagnostics, tuple(reasons)))
             continue
         null_cert_matrix, null_entity = _evaluate_frozen(
@@ -277,7 +282,7 @@ def certify_family(
         )
         support_dimension = max(0, full_matrix.dimension - null_cert_matrix.dimension)
         support_mdl_threshold = (
-            optimizer.objective.reported_branch_penalty(
+            optimizer.objective.penalty_for_dimension(
                 record.support,
                 support_dimension,
                 n_entities=len(certification_context.entity_codes),
@@ -400,13 +405,25 @@ def certify_family(
                     alpha=robust_metric_alpha,
                 )
             )
+            (
+                robust_horizon_gain,
+                horizon_environment_gains,
+                horizon_environment_lcbs,
+            ) = _environment_robust_lcb(
+                local_difference,
+                environments,
+                alpha=robust_metric_alpha,
+            )
             rule_f3_passed = bool(
                 robust_global_gain > 0.0
+                and robust_horizon_gain > 0.0
                 and robust_probability > config.probability_materiality
             )
             rule_f3.append(rule_f3_passed)
             if robust_global_gain <= 0.0:
                 reasons.append(f"f3_rule_robust_gain_nonpositive:{root}")
+            if robust_horizon_gain <= 0.0:
+                reasons.append(f"f3_rule_robust_horizon_nonpositive:{root}")
             if robust_probability <= config.probability_materiality:
                 reasons.append(f"f3_rule_robust_probability_nonpositive:{root}")
             pvalue = max(global_test.pvalue, local_test.pvalue, probability_test.pvalue)
@@ -420,6 +437,7 @@ def certify_family(
                     "footprint_rows": int(len(footprint)),
                     "pvalue": pvalue,
                     "f3_robust_global_gain": robust_global_gain,
+                    "f3_robust_horizon_gain": robust_horizon_gain,
                     "f3_robust_probability_contribution": robust_probability,
                     "f3_global_environment_gain_min": float(
                         np.min(global_environment_gains)
@@ -429,6 +447,15 @@ def certify_family(
                     ),
                     "f3_global_environment_lcb_min": float(
                         np.min(global_environment_lcbs)
+                    ),
+                    "f3_horizon_environment_gain_min": float(
+                        np.min(horizon_environment_gains)
+                    ),
+                    "f3_horizon_environment_gain_max": float(
+                        np.max(horizon_environment_gains)
+                    ),
+                    "f3_horizon_environment_lcb_min": float(
+                        np.min(horizon_environment_lcbs)
                     ),
                     "f3_probability_environment_gain_min": float(
                         np.min(probability_environment_gains)
