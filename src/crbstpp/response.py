@@ -11,6 +11,7 @@ from .data import Dataset
 from .native import (
     aggregate_design_rows_with_groups,
     accumulate_kernel,
+    bounded_span_order,
     completion_events,
     completion_window_counts,
     future_rows,
@@ -679,13 +680,11 @@ class ResponseEngine:
             )
             entities, times, spans = self.completions(context, antecedent)
             maximum_ticks = maximum_window * self.dataset.ticks_per_unit
-            admitted = spans <= maximum_ticks
-            entities, times, spans = (
-                entities[admitted],
-                times[admitted],
-                spans[admitted],
-            )
-            order = np.argsort(spans, kind="stable")
+            order = bounded_span_order(spans, maximum_ticks)
+            if order is None:
+                admitted = spans <= maximum_ticks
+                indices = np.flatnonzero(admitted)
+                order = indices[np.argsort(spans[indices], kind="stable")]
             entities, times, spans = entities[order], times[order], spans[order]
             left = 0
             for window in requested:

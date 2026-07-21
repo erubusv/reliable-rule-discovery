@@ -24,6 +24,41 @@ def cpu_available() -> bool:
     return _cpu_native is not None
 
 
+def bounded_span_order(spans: np.ndarray, maximum_span: int) -> np.ndarray | None:
+    """Stable indices of nonnegative spans at most ``maximum_span``.
+
+    The compiled counting pass is exact and linear in the number of spans plus
+    the (small) integer window range.  ``None`` requests the NumPy fallback.
+    """
+    if _cpu_native is None or not hasattr(_cpu_native, "bounded_span_order"):
+        return None
+    if int(maximum_span) < 0:
+        raise ValueError("maximum span must be nonnegative")
+    # Continuous-time ticks can be arbitrarily fine; counting sort is only a
+    # memory win when the integer range is compact.  Falling back changes no
+    # ordering or values.
+    if int(maximum_span) > 1_000_000:
+        return None
+    spans = np.ascontiguousarray(spans, dtype=np.int64)
+    output = np.empty(len(spans), dtype=np.int64)
+    count = int(_cpu_native.bounded_span_order(spans, int(maximum_span), output))
+    return output[:count]
+
+
+def sorted_unique_union(parts: list[np.ndarray]) -> np.ndarray | None:
+    """Merge sorted unique int64 arrays exactly without concatenating/sorting."""
+    if _cpu_native is None or not hasattr(_cpu_native, "sorted_unique_union"):
+        return None
+    arrays = [np.ascontiguousarray(part, dtype=np.int64) for part in parts]
+    if not arrays:
+        return np.zeros(0, dtype=np.int64)
+    if len(arrays) == 1:
+        return arrays[0]
+    output = np.empty(sum(len(part) for part in arrays), dtype=np.int64)
+    count = int(_cpu_native.sorted_unique_union(arrays, output))
+    return output[:count]
+
+
 def configure_cpu_threads(count: int) -> None:
     if int(count) < 1:
         raise ValueError("CPU thread count must be positive")

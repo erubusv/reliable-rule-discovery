@@ -1271,6 +1271,150 @@ PyObject* response_min_spans(PyObject*, PyObject* args) {
     Py_RETURN_NONE;
 }
 
+PyObject* bounded_span_order(PyObject*, PyObject* args) {
+    PyObject *spans_obj, *output_obj;
+    long long maximum;
+    if (!PyArg_ParseTuple(args, "OLO", &spans_obj, &maximum, &output_obj)) {
+        return nullptr;
+    }
+    Py_buffer spans{}, output{};
+    if (!int64_buffer(spans_obj, &spans, 1, false)) return nullptr;
+    if (!int64_buffer(output_obj, &output, 1, true)) {
+        PyBuffer_Release(&spans);
+        return nullptr;
+    }
+    if (maximum < 0 || output.shape[0] < spans.shape[0]) {
+        PyErr_SetString(PyExc_ValueError, "bounded span order buffer mismatch");
+        PyBuffer_Release(&spans);
+        PyBuffer_Release(&output);
+        return nullptr;
+    }
+    const auto* input = static_cast<const std::int64_t*>(spans.buf);
+    auto* ordered = static_cast<std::int64_t*>(output.buf);
+    const auto count = spans.shape[0];
+    std::int64_t admitted = 0;
+    bool valid = true;
+    bool allocation_failed = false;
+    Py_BEGIN_ALLOW_THREADS
+    try {
+        std::vector<std::int64_t> offsets(
+            static_cast<std::size_t>(maximum) + 1, 0);
+        for (std::int64_t index = 0; index < count; ++index) {
+            const auto span = input[index];
+            if (span < 0) {
+                valid = false;
+                break;
+            }
+            if (span <= maximum) ++offsets[static_cast<std::size_t>(span)];
+        }
+        if (valid) {
+            std::int64_t prefix = 0;
+            for (auto& value : offsets) {
+                const auto frequency = value;
+                value = prefix;
+                prefix += frequency;
+            }
+            admitted = prefix;
+            for (std::int64_t index = 0; index < count; ++index) {
+                const auto span = input[index];
+                if (span <= maximum) {
+                    ordered[offsets[static_cast<std::size_t>(span)]++] = index;
+                }
+            }
+        }
+    } catch (const std::bad_alloc&) {
+        allocation_failed = true;
+    }
+    Py_END_ALLOW_THREADS
+    PyBuffer_Release(&spans);
+    PyBuffer_Release(&output);
+    if (allocation_failed) return PyErr_NoMemory();
+    if (!valid) {
+        PyErr_SetString(PyExc_ValueError, "completion spans must be nonnegative");
+        return nullptr;
+    }
+    return PyLong_FromLongLong(admitted);
+}
+
+PyObject* sorted_unique_union(PyObject*, PyObject* args) {
+    PyObject *parts_obj, *output_obj;
+    if (!PyArg_ParseTuple(args, "OO", &parts_obj, &output_obj)) return nullptr;
+    PyObject* sequence = PySequence_Fast(parts_obj, "row parts must be a sequence");
+    if (sequence == nullptr) return nullptr;
+    Py_buffer output{};
+    if (!int64_buffer(output_obj, &output, 1, true)) {
+        Py_DECREF(sequence);
+        return nullptr;
+    }
+    const auto part_count = PySequence_Fast_GET_SIZE(sequence);
+    std::vector<Py_buffer> parts(static_cast<std::size_t>(part_count));
+    std::int64_t capacity = 0;
+    bool valid = true;
+    Py_ssize_t acquired = 0;
+    for (Py_ssize_t index = 0; index < part_count; ++index) {
+        PyObject* item = PySequence_Fast_GET_ITEM(sequence, index);
+        if (!int64_buffer(item, &parts[static_cast<std::size_t>(index)], 1, false)) {
+            valid = false;
+            break;
+        }
+        ++acquired;
+        const auto& part = parts[static_cast<std::size_t>(index)];
+        if (capacity > std::numeric_limits<std::int64_t>::max() - part.shape[0]) {
+            PyErr_SetString(PyExc_OverflowError, "row union capacity overflow");
+            valid = false;
+            break;
+        }
+        capacity += part.shape[0];
+    }
+    if (valid && output.shape[0] < capacity) {
+        PyErr_SetString(PyExc_ValueError, "row union output is too small");
+        valid = false;
+    }
+    std::int64_t written = 0;
+    if (valid) {
+        auto* destination = static_cast<std::int64_t*>(output.buf);
+        std::vector<std::int64_t> positions(static_cast<std::size_t>(part_count), 0);
+        Py_BEGIN_ALLOW_THREADS
+        for (;;) {
+            bool found = false;
+            std::int64_t next = std::numeric_limits<std::int64_t>::max();
+            for (Py_ssize_t part_index = 0; part_index < part_count; ++part_index) {
+                const auto& part = parts[static_cast<std::size_t>(part_index)];
+                const auto position = positions[static_cast<std::size_t>(part_index)];
+                if (position >= part.shape[0]) continue;
+                const auto* values = static_cast<const std::int64_t*>(part.buf);
+                if (position > 0 && values[position] <= values[position - 1]) {
+                    valid = false;
+                    break;
+                }
+                next = std::min(next, values[position]);
+                found = true;
+            }
+            if (!valid || !found) break;
+            destination[written++] = next;
+            for (Py_ssize_t part_index = 0; part_index < part_count; ++part_index) {
+                const auto& part = parts[static_cast<std::size_t>(part_index)];
+                auto& position = positions[static_cast<std::size_t>(part_index)];
+                const auto* values = static_cast<const std::int64_t*>(part.buf);
+                if (position < part.shape[0] && values[position] == next) ++position;
+            }
+        }
+        Py_END_ALLOW_THREADS
+    }
+    for (Py_ssize_t index = 0; index < acquired; ++index) {
+        PyBuffer_Release(&parts[static_cast<std::size_t>(index)]);
+    }
+    PyBuffer_Release(&output);
+    Py_DECREF(sequence);
+    if (!valid) {
+        if (!PyErr_Occurred()) {
+            PyErr_SetString(PyExc_ValueError, "row parts must be strictly increasing");
+        }
+        return nullptr;
+    }
+    return PyLong_FromLongLong(written);
+}
+
 PyMethodDef methods[] = {
     {"moments", moments, METH_VARARGS, "Deterministic gradient/Fisher moments."},
     {"nonnegative_quadratic_gains", nonnegative_quadratic_gains, METH_VARARGS, "Exact batched nonnegative quadratic gains."},
@@ -1284,6 +1428,8 @@ PyMethodDef methods[] = {
     {"completion_events", completion_events, METH_VARARGS, "Latest-witness completion events."},
     {"completion_window_counts", completion_window_counts, METH_VARARGS, "Streaming productive completion counts by W."},
     {"response_min_spans", response_min_spans, METH_VARARGS, "Dense exact minimum witness span per response row."},
+    {"bounded_span_order", bounded_span_order, METH_VARARGS, "Stable counting order for bounded completion spans."},
+    {"sorted_unique_union", sorted_unique_union, METH_VARARGS, "Merge sorted unique row arrays without sorting."},
     {nullptr, nullptr, 0, nullptr},
 };
 

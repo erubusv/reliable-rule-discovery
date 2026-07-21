@@ -28,6 +28,7 @@ from .native import (
     moments,
     moments_batch,
     nonnegative_quadratic_gains,
+    sorted_unique_union,
     sparse_joint_moments,
 )
 from .objective import ObjectiveSpec, SupportRecord, support_score
@@ -194,6 +195,10 @@ class SearchDiagnostics:
     pricing_memory_budget_bytes: int = 0
     pricing_peak_reserved_bytes: int = 0
     pricing_max_task_bytes: int = 0
+    lazy_skeleton_bound_audits: int = 0
+    lazy_skeleton_profiles: int = 0
+    lazy_skeleton_profiles_avoided: int = 0
+    lazy_skeleton_activations: int = 0
 
 
 @dataclass(frozen=True)
@@ -291,15 +296,18 @@ def _nonnegative_quadratic_solution(
 class SupportOptimizer:
     """Exact fixed-support fits with profiled rule-block score search.
 
-    Each antecedent skeleton owns exactly one W/sign identity profiled once at
-    the D_fit baseline.  Empty and every objective-admissible single-skeleton
-    root then ascend a shared support DAG over that frozen dictionary.  Every
+    Each antecedent skeleton that survives an exact-safe upper bound owns one
+    W/sign identity profiled against the D_fit baseline.  Deferred skeletons
+    receive that identical baseline profile if a later support can make any of
+    their identities relevant.  Empty and every objective-admissible
+    single-skeleton root then ascend a shared support DAG.  Every
     score-positive inactive identity is either removed by a verified upper bound
     or receives a restricted exact audit; every active drop is audited exactly.
     Every accepted move improves the fully refitted MDL objective.  Positive
     atoms and all unique terminals reach certification.  The terminal claim is
-    frozen-dictionary block-score restricted add/drop stationarity, not
-    all-identity one-exchange stationarity or a global optimum.
+    frozen-dictionary block-score restricted add/drop stationarity, with every
+    unresolved identity safely certified non-improving at a terminal; it is not
+    exact one-exchange stationarity or a global optimum.
     """
 
     def __init__(self, context: Context, config: RunConfig):
@@ -361,7 +369,9 @@ class SupportOptimizer:
             1, min(50_000, config.cache_bytes // 4096)
         )
         self._skeleton_witnesses: dict[Antecedent, tuple[float, RuleIdentity]] = {}
+        self._profiled_by_antecedent: dict[Antecedent, RuleIdentity] = {}
         self._profiled_dictionary: tuple[RuleIdentity, ...] | None = None
+        self._baseline_safe_screened: set[Antecedent] = set()
         self._working_antecedents: set[Antecedent] = set()
         self._restricted_add_scores: dict[Support, dict[RuleIdentity, float]] = {}
         self._restricted_add_fits: dict[Support, dict[RuleIdentity, FitResult]] = {}
@@ -964,6 +974,9 @@ class SupportOptimizer:
     @staticmethod
     def _union_rows(parts: list[np.ndarray]) -> np.ndarray:
         nonempty = [part for part in parts if len(part)]
+        compiled = sorted_unique_union(nonempty)
+        if compiled is not None:
+            return compiled
         return (
             np.unique(np.concatenate(nonempty))
             if nonempty
@@ -1890,26 +1903,34 @@ class SupportOptimizer:
         blocks: tuple[SparseBlock, ...],
         *,
         device: str,
+        row_lookup: np.ndarray | None = None,
     ) -> tuple[np.ndarray, np.ndarray]:
         """Return profiled score moments for one W using bounded row tiles."""
         dimension = len(blocks) * self.config.knot_count
         nonempty_rows = [block.rows for block in blocks if len(block.rows)]
-        maximum_rows = (
-            np.unique(np.concatenate(nonempty_rows))
-            if nonempty_rows
-            else np.zeros(0, dtype=np.int64)
-        )
+        maximum_rows = sorted_unique_union(nonempty_rows)
+        if maximum_rows is None:
+            maximum_rows = (
+                np.unique(np.concatenate(nonempty_rows))
+                if nonempty_rows
+                else np.zeros(0, dtype=np.int64)
+            )
         if not len(maximum_rows):
             return (
                 np.zeros(dimension, dtype=np.float64),
                 np.zeros((dimension, dimension), dtype=np.float64),
             )
-        row_lookup: np.ndarray | None = None
-        if self.context.n_grid <= max(64_000_000, 8 * len(maximum_rows)):
-            row_lookup = np.full(self.context.n_grid, -1, dtype=np.int32)
+        if row_lookup is not None:
+            if row_lookup.dtype != np.int32 or row_lookup.shape != (
+                self.context.n_grid,
+            ):
+                raise ValueError("reusable hierarchy row lookup shape mismatch")
             row_lookup[maximum_rows] = np.arange(
                 len(maximum_rows), dtype=np.int32
             )
+        elif self.context.n_grid <= max(64_000_000, 8 * len(maximum_rows)):
+            row_lookup = np.empty(self.context.n_grid, dtype=np.int32)
+            row_lookup[maximum_rows] = np.arange(len(maximum_rows), dtype=np.int32)
         indices, inverse = self._pricing_components(current)
         gradient = np.zeros(dimension, dtype=np.float64)
         hessian = np.zeros((dimension, dimension), dtype=np.float64)
@@ -2030,6 +2051,15 @@ class SupportOptimizer:
         if not nested_windows:
             return output
 
+        # Every sparse access below is restricted to the current W union, whose
+        # positions are overwritten before use.  Reusing this dense map avoids
+        # allocating and initializing one n_grid-sized array for every W.
+        row_lookup = (
+            np.empty(self.context.n_grid, dtype=np.int32)
+            if self.context.n_grid <= 64_000_000
+            else None
+        )
+
         block_requests: dict[Antecedent, set[int]] = {antecedent: set(nested_windows)}
         for window in nested_windows:
             for term in specifications[window][0]:
@@ -2067,7 +2097,7 @@ class SupportOptimizer:
                 block_for(term.antecedent, term.window) for term in closure
             ) + (block_for(antecedent, window),)
             gradient, hessian = self._joint_hierarchy_moments(
-                current, joint_blocks, device=device
+                current, joint_blocks, device=device, row_lookup=row_lookup
             )
             dimension = len(joint_blocks) * self.config.knot_count
             closure_dimension = dimension - self.config.knot_count
@@ -2201,14 +2231,15 @@ class SupportOptimizer:
             )
 
         def price_group(
-            indexed: tuple[int, tuple[Antecedent, tuple[int, ...]]],
+            assigned: tuple[
+                int, tuple[Antecedent, tuple[int, ...]], str
+            ],
         ) -> tuple[
             Antecedent,
             dict[int, tuple[float, float, float, float, int, bool]],
         ]:
             configure_cpu_threads(1)
-            index, (antecedent, windows) = indexed
-            device = device_schedule[index % len(device_schedule)]
+            _, (antecedent, windows), device = assigned
             reserved = memory_gate.acquire(task_bytes[antecedent])
             try:
                 return antecedent, self._price_hierarchy_skeleton(
@@ -2217,16 +2248,54 @@ class SupportOptimizer:
             finally:
                 memory_gate.release(reserved)
 
-        if len(groups) > 1:
+        component_items: list[
+            tuple[
+                Antecedent,
+                dict[int, tuple[float, float, float, float, int, bool]],
+            ]
+        ] = []
+        indexed_groups = list(enumerate(groups))
+        if devices:
+            # Triplets dominate both time and memory.  Assign every admitted
+            # triplet wave directly to the two GPUs instead of pinning four of
+            # every six static task indices to CPU.  Waves preserve a fixed,
+            # deterministic device mapping and the byte gate still enforces
+            # the physical-memory bound.
+            heavy = [item for item in indexed_groups if len(item[1][0]) == 3]
+            light = [item for item in indexed_groups if len(item[1][0]) < 3]
+        else:
+            heavy = []
+            light = indexed_groups
+
+        light_assignments = [
+            (index, group, device_schedule[position % len(device_schedule)])
+            for position, (index, group) in enumerate(light)
+        ]
+        if len(light_assignments) > 1:
             with ThreadPoolExecutor(
-                # Two GPU feeders plus byte-budgeted CPU producers keep both
-                # devices busy without materializing a full W family.
-                max_workers=min(worker_count, len(groups)),
+                max_workers=min(worker_count, len(light_assignments)),
                 thread_name_prefix="crbstpp-block-score",
             ) as executor:
-                component_items = list(executor.map(price_group, enumerate(groups)))
-        else:
-            component_items = [price_group(item) for item in enumerate(groups)]
+                component_items.extend(
+                    executor.map(price_group, light_assignments)
+                )
+        elif light_assignments:
+            component_items.append(price_group(light_assignments[0]))
+
+        for start in range(0, len(heavy), len(devices) if devices else 1):
+            wave = heavy[start : start + len(devices)]
+            assignments = [
+                (index, group, devices[position])
+                for position, (index, group) in enumerate(wave)
+            ]
+            if len(assignments) > 1:
+                with ThreadPoolExecutor(
+                    max_workers=len(assignments),
+                    thread_name_prefix="crbstpp-gpu-triplet",
+                ) as executor:
+                    component_items.extend(executor.map(price_group, assignments))
+            elif assignments:
+                component_items.append(price_group(assignments[0]))
         with self._state_lock:
             self.diagnostics.pricing_peak_reserved_bytes = max(
                 self.diagnostics.pricing_peak_reserved_bytes,
@@ -2328,6 +2397,42 @@ class SupportOptimizer:
         with self._state_lock:
             self.diagnostics.profiled_skeletons += len(profiled)
         return sorted(profiled, key=lambda item: (-item[0], item[2]))
+
+    def _baseline_profile_skeletons(
+        self, antecedents: set[Antecedent]
+    ) -> list[tuple[float, float, RuleIdentity]]:
+        """Exactly freeze W/sign for previously unresolved skeletons.
+
+        Profiling is always performed against the same empty D_fit model, so
+        lazy activation produces exactly the identity that eager baseline
+        profiling would have produced.  Only *when* its full M-knot kernels are
+        built changes.
+        """
+        unresolved = {
+            antecedent
+            for antecedent in antecedents
+            if antecedent not in self._profiled_by_antecedent
+        }
+        if not unresolved:
+            return []
+        identities = tuple(
+            rule for rule in self.dictionary if rule.antecedent in unresolved
+        )
+        ranked = self._rank_profiled_identities(
+            self.records[EMPTY_SUPPORT], identities
+        )
+        selected = {item[2].antecedent: item[2] for item in ranked}
+        if set(selected) != unresolved:
+            raise AssertionError("lazy baseline W/sign profile is incomplete")
+        self._profiled_by_antecedent.update(selected)
+        self._profiled_dictionary = tuple(
+            self._profiled_by_antecedent[antecedent]
+            for antecedent in self.skeletons
+            if antecedent in self._profiled_by_antecedent
+        )
+        with self._state_lock:
+            self.diagnostics.lazy_skeleton_profiles += len(unresolved)
+        return ranked
 
     def _reliability_survivors(
         self, current: SupportRecord, rules: tuple[RuleIdentity, ...]
@@ -2435,20 +2540,70 @@ class SupportOptimizer:
         return sorted(candidates.values(), key=lambda item: (-item[0], item[2]))
 
     def _expand_working_set(self, current: SupportRecord) -> bool:
-        """Run one complete delayed-column audit and activate every violation."""
+        """Run one complete exact-safe delayed-column audit.
+
+        Resolved skeletons are audited at their baseline-frozen identity.
+        Unresolved skeletons are first tested over *all* W/sign identities by
+        a valid full-refit upper bound.  Only a possible violator receives the
+        full-M-knot baseline profile, after which the same frozen-identity block
+        score used by the eager algorithm decides activation.
+        """
         existing = set(current.support.antecedents)
-        dictionary = self._profiled_dictionary or self.dictionary
-        outside = tuple(
+        resolved = tuple(
             rule
-            for rule in dictionary
+            for rule in (self._profiled_dictionary or ())
             if rule.antecedent not in existing
             and rule.antecedent not in self._working_antecedents
         )
-        if not outside:
+        unresolved_antecedents = {
+            antecedent
+            for antecedent in self.skeletons
+            if antecedent not in existing
+            and antecedent not in self._working_antecedents
+            and antecedent not in self._profiled_by_antecedent
+        }
+        # These skeletons were already safely rejected at this exact empty
+        # state by the specialized histogram bound.
+        if current.support == EMPTY_SUPPORT:
+            unresolved_antecedents -= self._baseline_safe_screened
+        unresolved = tuple(
+            rule
+            for rule in self.dictionary
+            if rule.antecedent in unresolved_antecedents
+        )
+        audit_identities = resolved + unresolved
+        if not audit_identities:
             return False
         with self._state_lock:
             self.diagnostics.full_dictionary_audits += 1
-        profiled = self._rank_profiled_identities(current, outside)
+
+        safe = set(
+            self._safe_identity_survivors(
+                current, audit_identities, current.score
+            )
+        )
+        with self._state_lock:
+            self.diagnostics.lazy_skeleton_bound_audits += len(
+                {rule.antecedent for rule in audit_identities}
+            )
+        candidate_resolved = tuple(rule for rule in resolved if rule in safe)
+        activated_unresolved = {
+            rule.antecedent for rule in unresolved if rule in safe
+        }
+        if activated_unresolved:
+            self._baseline_profile_skeletons(activated_unresolved)
+            candidate_resolved += tuple(
+                self._profiled_by_antecedent[antecedent]
+                for antecedent in sorted(activated_unresolved)
+            )
+            with self._state_lock:
+                self.diagnostics.lazy_skeleton_activations += len(
+                    activated_unresolved
+                )
+        if not candidate_resolved:
+            return False
+
+        profiled = self._rank_profiled_identities(current, candidate_resolved)
         additions = {
             item[2].antecedent
             for item in profiled
@@ -2466,10 +2621,9 @@ class SupportOptimizer:
         self, support: Support, antecedents: set[Antecedent] | None = None
     ) -> tuple[RuleIdentity, ...]:
         existing = set(support.antecedents)
-        dictionary = self._profiled_dictionary or self.dictionary
         return tuple(
             rule
-            for rule in dictionary
+            for rule in (self._profiled_dictionary or ())
             if rule.antecedent not in existing
             and (antecedents is None or rule.antecedent in antecedents)
         )
@@ -3412,14 +3566,35 @@ class SupportOptimizer:
         the baseline MDL and its exact closure-only null; otherwise automatic
         hierarchy nuisance, rather than the reported branch, created the gain.
         """
-        ranked = self._rank_profiled_identities(empty, self.dictionary)
-        self._profiled_dictionary = tuple(
-            self._skeleton_witnesses[antecedent][1]
-            for antecedent in self.skeletons
-            if antecedent in self._skeleton_witnesses
-        )
-        if len(self._profiled_dictionary) != len(self.skeletons):
-            raise AssertionError("baseline W/sign profile did not cover every skeleton")
+        grouped_identities: dict[Antecedent, list[RuleIdentity]] = {
+            antecedent: [] for antecedent in self.skeletons
+        }
+        for rule in self.dictionary:
+            grouped_identities[rule.antecedent].append(rule)
+        possible: set[Antecedent] = set()
+        for antecedent in self.skeletons:
+            identities = tuple(grouped_identities[antecedent])
+            globally_possible = tuple(
+                rule
+                for rule in identities
+                if self.saturated_upper_score(Support.of((rule,)))
+                > self.config.search_tolerance
+            )
+            survivors = self._safe_standalone_survivors(
+                empty, antecedent, globally_possible
+            )
+            if survivors:
+                possible.add(antecedent)
+            else:
+                self._baseline_safe_screened.add(antecedent)
+        ranked = self._baseline_profile_skeletons(possible)
+        if self._profiled_dictionary is None:
+            self._profiled_dictionary = ()
+        with self._state_lock:
+            self.diagnostics.lazy_skeleton_bound_audits += len(self.skeletons)
+            self.diagnostics.lazy_skeleton_profiles_avoided += len(
+                self._baseline_safe_screened
+            )
         admissible = self._objective_root_candidates(ranked)
         if admissible:
             safe_rules = set(
@@ -3491,8 +3666,9 @@ class SupportOptimizer:
         block score.  Every positive profiled identity is then either safely
         bounded below the incumbent or audited with common effects frozen; every
         active drop is audited.  Terminal states are profiled block-score
-        restricted add/drop fixed points, not exact one-exchange optima: an
-        unprofiled identity or later W/sign replacement is not certified.
+        restricted add/drop fixed points, not exact one-exchange optima.  A
+        skeleton without a frozen identity has instead passed an all-W/sign
+        exact-safe full-refit upper bound at that terminal.
         """
         # Delayed column generation prices only the finite basin working set
         # during coordinate moves.  A complete outside-dictionary audit is

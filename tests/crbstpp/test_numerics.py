@@ -16,12 +16,14 @@ from crbstpp.likelihood import (
 from crbstpp.native import (
     aggregate_design_rows,
     aggregate_design_rows_with_groups,
+    bounded_span_order,
     completion_events,
     cpu_available,
     cuda_available,
     moments,
     moments_batch,
     nonnegative_quadratic_gains,
+    sorted_unique_union,
 )
 from crbstpp.response import Context, ResponseEngine
 from crbstpp.config import RunConfig
@@ -40,6 +42,28 @@ from tests.crbstpp.test_core import synthetic_dataset
 
 
 class NumericalParityTests(unittest.TestCase):
+    def test_native_bounded_span_order_is_stable_and_exact(self) -> None:
+        spans = np.array([3, 1, 5, 1, 0, 3, 2], dtype=np.int64)
+        actual = bounded_span_order(spans, 3)
+        if actual is None:
+            self.skipTest("compiled CPU operators unavailable")
+        admitted = np.flatnonzero(spans <= 3)
+        expected = admitted[np.argsort(spans[admitted], kind="stable")]
+        np.testing.assert_array_equal(actual, expected)
+
+    def test_native_sorted_unique_union_matches_numpy(self) -> None:
+        parts = [
+            np.array([1, 3, 7, 11], dtype=np.int64),
+            np.array([], dtype=np.int64),
+            np.array([0, 3, 4, 11], dtype=np.int64),
+            np.array([2, 9], dtype=np.int64),
+        ]
+        actual = sorted_unique_union(parts)
+        if actual is None:
+            self.skipTest("compiled CPU operators unavailable")
+        expected = np.unique(np.concatenate(parts))
+        np.testing.assert_array_equal(actual, expected)
+
     def test_sparse_grid_derivatives_match_dense_weights(self) -> None:
         eta = np.linspace(-4.0, 2.0, 31)
         rows = np.asarray([1, 7, 19, 30], dtype=np.int64)
@@ -1102,6 +1126,86 @@ class NumericalParityTests(unittest.TestCase):
                 ranked = optimizer._rank_block_identities(empty, (rule,))
             self.assertLess(ranked[0][0], 0.0)
 
+    def test_triplet_pricing_waves_use_both_gpus_not_static_cpu_slots(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            data = synthetic_dataset(Path(directory) / "data", 45)
+            fit_codes, _, _ = data.split((0.6, 0.2, 0.2), 111)
+            config = RunConfig(
+                dataset=str(data.root),
+                q_max=3,
+                impact_lag=3,
+                knot_count=2,
+                formation_windows=(0, 1),
+                cache_bytes=16 * 1024**2,
+                early_warning_horizon=3,
+                pricing_workers=6,
+                pricing_devices=("cuda:0", "cuda:1"),
+            )
+            optimizer = SupportOptimizer(Context.make(data, fit_codes), config)
+            empty = optimizer.records[Support(())]
+            identities = tuple(
+                RuleIdentity(antecedent, 0, 1)
+                for antecedent in (
+                    (0,),
+                    (0, 1),
+                    (0, 1, 2),
+                    (0, 1, 3),
+                    (0, 2, 3),
+                )
+            )
+            calls: list[tuple[tuple[int, ...], str]] = []
+
+            def fake_price(current, antecedent, windows, *, device):
+                del current
+                calls.append((antecedent, device))
+                return {
+                    window: (0.0, 0.0, 0.0, 0.0, 0, True)
+                    for window in windows
+                }
+
+            with mock.patch.object(
+                optimizer, "_price_hierarchy_skeleton", side_effect=fake_price
+            ):
+                optimizer._rank_block_identities(empty, identities)
+            triplet_devices = {
+                device for antecedent, device in calls if len(antecedent) == 3
+            }
+            self.assertEqual(triplet_devices, {"cuda:0", "cuda:1"})
+            self.assertFalse(
+                any(
+                    device == "cpu"
+                    for antecedent, device in calls
+                    if len(antecedent) == 3
+                )
+            )
+
+    def test_lazy_baseline_profile_selects_the_eager_w_sign_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            data = synthetic_dataset(Path(directory) / "data", 60)
+            fit_codes, _, _ = data.split((0.6, 0.2, 0.2), 111)
+            config = RunConfig(
+                dataset=str(data.root),
+                q_max=2,
+                impact_lag=3,
+                knot_count=2,
+                formation_windows=(0, 1, 2),
+                cache_bytes=16 * 1024**2,
+                early_warning_horizon=3,
+                pricing_devices=(),
+            )
+            eager = SupportOptimizer(Context.make(data, fit_codes), config)
+            eager_ranked = eager._rank_profiled_identities(
+                eager.records[Support(())], eager.dictionary
+            )
+            expected = {item[2].antecedent: item[2] for item in eager_ranked}
+
+            lazy = SupportOptimizer(Context.make(data, fit_codes), config)
+            first = {lazy.skeletons[0]}
+            lazy._baseline_profile_skeletons(first)
+            self.assertEqual(set(lazy._profiled_by_antecedent), first)
+            lazy._baseline_profile_skeletons(set(lazy.skeletons) - first)
+            self.assertEqual(lazy._profiled_by_antecedent, expected)
+
     def test_dual_geometry_is_shared_across_signs(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             data = synthetic_dataset(Path(directory) / "data", 75)
@@ -1204,6 +1308,37 @@ class NumericalParityTests(unittest.TestCase):
                 self.assertAlmostEqual(
                     generic_upper[rule], histogram_upper[rule], places=10
                 )
+
+    def test_reused_hierarchy_row_lookup_preserves_exact_moments(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            data = synthetic_dataset(Path(directory) / "data", 60)
+            fit_codes, _, _ = data.split((0.6, 0.2, 0.2), 111)
+            config = RunConfig(
+                dataset=str(data.root),
+                q_max=2,
+                impact_lag=3,
+                knot_count=2,
+                formation_windows=(0, 1, 2),
+                cache_bytes=16 * 1024**2,
+                early_warning_horizon=3,
+                pricing_devices=(),
+            )
+            optimizer = SupportOptimizer(Context.make(data, fit_codes), config)
+            empty = optimizer.records[Support(())]
+            blocks = (
+                optimizer.engine.block(optimizer.context, (0,), 0),
+                optimizer.engine.block(optimizer.context, (1,), 0),
+                optimizer.engine.block(optimizer.context, (0, 1), 2),
+            )
+            expected = optimizer._joint_hierarchy_moments(
+                empty, blocks, device="cpu"
+            )
+            lookup = np.full(optimizer.context.n_grid, 1_234_567, dtype=np.int32)
+            actual = optimizer._joint_hierarchy_moments(
+                empty, blocks, device="cpu", row_lookup=lookup
+            )
+            np.testing.assert_allclose(actual[0], expected[0], rtol=0, atol=0)
+            np.testing.assert_allclose(actual[1], expected[1], rtol=0, atol=0)
 
     def test_parallel_exact_batch_matches_serial_solver(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

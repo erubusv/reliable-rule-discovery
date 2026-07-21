@@ -171,11 +171,11 @@ class LikelihoodSolverTests(unittest.TestCase):
             self.assertGreater(len(result.terminals), 0)
             self.assertIsNotNone(optimizer._profiled_dictionary)
             self.assertEqual(
-                len(optimizer._profiled_dictionary), len(optimizer.skeletons)
-            )
-            self.assertEqual(
                 len({rule.antecedent for rule in optimizer._profiled_dictionary}),
-                len(optimizer.skeletons),
+                len(optimizer._profiled_dictionary),
+            )
+            self.assertLessEqual(
+                len(optimizer._profiled_dictionary), len(optimizer.skeletons)
             )
             frozen = set(optimizer._profiled_dictionary)
             self.assertTrue(
