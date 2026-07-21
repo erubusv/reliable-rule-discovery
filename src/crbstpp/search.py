@@ -48,7 +48,12 @@ from .rules import (
     hierarchy_closure,
     skeletons,
 )
-from .solver import FitResult, fit_model_matrix, fit_offset_design
+from .solver import (
+    FitResult,
+    fit_model_matrix,
+    fit_model_matrix_continued,
+    fit_offset_design_continued,
+)
 
 
 @dataclass(frozen=True)
@@ -203,6 +208,7 @@ class SearchDiagnostics:
     ragged_gpu_batches: int = 0
     ragged_gpu_candidates: int = 0
     ragged_gpu_fail_open: int = 0
+    nonattained_exact_rejections: int = 0
 
 
 @dataclass(frozen=True)
@@ -409,7 +415,7 @@ class SupportOptimizer:
             1, min(200_000, config.cache_bytes // max(1, 64 * config.knot_count))
         )
         baseline_matrix = self.engine.model_matrix(context, EMPTY_SUPPORT)
-        baseline_fit = fit_model_matrix(
+        baseline_fit = fit_model_matrix_continued(
             baseline_matrix,
             likelihood=context.dataset.likelihood,
             tolerance=config.solver_tolerance,
@@ -606,6 +612,67 @@ class SupportOptimizer:
         )
         return output
 
+    def _project_nested_matrix(
+        self,
+        source: SupportRecord,
+        support: Support,
+        closure: tuple[ClosureTerm, ...],
+    ) -> tuple[ModelMatrix, np.ndarray] | None:
+        """Derive an exact nested null without rebuilding any response block."""
+        closure = tuple(sorted(closure))
+        source_closure, source_rules = self._block_map(source.matrix)
+        if any(term not in source_closure for term in closure) or any(
+            rule not in source_rules for rule in support.rules
+        ):
+            return None
+        baseline_dimension = (
+            source.matrix.free_dimension - source.matrix.closure_dimension
+        )
+        columns: list[int] = list(range(baseline_dimension))
+        for term in closure:
+            block = source_closure[term]
+            columns.extend(range(block.start, block.stop))
+        for rule in support.rules:
+            block = source_rules[rule]
+            columns.extend(range(block.start, block.stop))
+        indices = np.asarray(columns, dtype=np.int64)
+        projected = np.ascontiguousarray(source.matrix.x[:, indices])
+        projected, exposure, noevent, event = aggregate_design_rows(
+            projected,
+            source.matrix.exposure_weight.copy(),
+            source.matrix.noevent_weight.copy(),
+            source.matrix.event_weight.copy(),
+            copy_input=False,
+        )
+        closure_dimension = len(closure) * self.config.knot_count
+        free_dimension = baseline_dimension + closure_dimension
+        rule_slices = tuple(
+            slice(
+                free_dimension + index * self.config.knot_count,
+                free_dimension + (index + 1) * self.config.knot_count,
+            )
+            for index in range(len(support.rules))
+        )
+        empty = np.zeros(0, dtype=np.int64)
+        matrix = ModelMatrix(
+            x=projected,
+            exposure_weight=exposure,
+            noevent_weight=noevent,
+            event_weight=event,
+            free_dimension=free_dimension,
+            closure_dimension=closure_dimension,
+            rule_slices=rule_slices,
+            support=support,
+            closure=closure,
+            active_rows=empty,
+            active_design_groups=empty,
+            active_age_bins=empty,
+            aggregate_bins=empty,
+        )
+        warm = np.ascontiguousarray(source.fit.coefficients[indices])
+        warm[free_dimension:] = np.maximum(warm[free_dimension:], 0.0)
+        return matrix, warm
+
     def fit(
         self,
         support: Support,
@@ -645,7 +712,7 @@ class SupportOptimizer:
         )
         if warm is not None and warm.shape != (matrix.dimension,):
             raise ValueError("warm-start override dimension does not match model")
-        fit = fit_model_matrix(
+        fit = fit_model_matrix_continued(
             matrix,
             likelihood=self.context.dataset.likelihood,
             tolerance=self.config.solver_tolerance,
@@ -728,23 +795,32 @@ class SupportOptimizer:
         source: SupportRecord | None = None,
     ) -> tuple[ModelMatrix, FitResult]:
         """Fit a forced-closure model with a shared certification cache."""
-        key = (support, tuple(closure))
+        closure = tuple(sorted(closure))
+        key = (support, closure)
         with self._state_lock:
             cached = self._forced_fits.get(key)
             natural = self._stored_records.get(support)
-            if cached is None and tuple(closure) == hierarchy_closure(support):
+            if cached is None and closure == hierarchy_closure(support):
                 cached = None if natural is None else natural.fit
                 if cached is not None:
                     self._forced_fits[key] = cached
-        matrix = self.engine.model_matrix(
-            self.context, support, forced_closure=tuple(closure)
+        projected = (
+            None
+            if source is None
+            else self._project_nested_matrix(source, support, closure)
         )
+        if projected is None:
+            matrix = self.engine.model_matrix(
+                self.context, support, forced_closure=closure
+            )
+            warm = None if source is None else self.warm_start(source, matrix)
+        else:
+            matrix, warm = projected
         if cached is not None:
             with self._state_lock:
                 self.diagnostics.forced_fit_cache_hits += 1
             return matrix, cached
-        warm = None if source is None else self.warm_start(source, matrix)
-        fit = fit_model_matrix(
+        fit = fit_model_matrix_continued(
             matrix,
             likelihood=self.context.dataset.likelihood,
             tolerance=self.config.solver_tolerance,
@@ -810,49 +886,13 @@ class SupportOptimizer:
         device: str,
     ) -> FitResult:
         """Fit a closure null by losslessly projecting its fitted full matrix."""
-        closure = tuple(record.matrix.closure)
-        key = (EMPTY_SUPPORT, closure)
-        with self._state_lock:
-            cached = self._forced_fits.get(key)
-            if cached is not None:
-                self.diagnostics.forced_fit_cache_hits += 1
-                return cached
-        if not closure:
-            return self._stored_records[EMPTY_SUPPORT].fit
-        dimension = record.matrix.free_dimension
-        projected = np.ascontiguousarray(record.matrix.x[:, :dimension])
-        projected, exposure, noevent, event = aggregate_design_rows(
-            projected,
-            record.matrix.exposure_weight,
-            record.matrix.noevent_weight,
-            record.matrix.event_weight,
-            copy_input=True,
-        )
-        empty_i64 = np.zeros(0, dtype=np.int64)
-        matrix = ModelMatrix(
-            x=projected,
-            exposure_weight=exposure,
-            noevent_weight=noevent,
-            event_weight=event,
-            free_dimension=dimension,
-            closure_dimension=len(closure) * self.config.knot_count,
-            rule_slices=(),
-            support=EMPTY_SUPPORT,
-            closure=closure,
-            active_rows=empty_i64,
-            active_design_groups=empty_i64,
-            active_age_bins=empty_i64,
-            aggregate_bins=empty_i64,
-        )
-        fit = fit_model_matrix(
-            matrix,
-            likelihood=self.context.dataset.likelihood,
-            tolerance=self.config.solver_tolerance,
-            max_iter=self.config.solver_max_iter,
+        _, fit = self.fit_fixed(
+            EMPTY_SUPPORT,
+            tuple(record.matrix.closure),
             device=device,
+            source=record,
         )
-        with self._state_lock:
-            return self._forced_fits.setdefault(key, fit)
+        return fit
 
     def _fit_embedded_closure_nulls(
         self, records: list[SupportRecord]
@@ -3336,29 +3376,35 @@ class SupportOptimizer:
                 current, rule, device=devices[audited % len(devices)]
             )
             audited += 1
-            if score > best_score + self.config.search_tolerance or (
-                best_rule is not None
-                and abs(score - best_score) <= self.config.search_tolerance
-                and rule < best_rule
-            ):
-                best_score = score
-                best_rule = rule
-                best_exact = None
+            if score > acceptance + self.config.search_tolerance:
+                # A restricted optimum is an improving feasible point only if
+                # the corresponding full model has an attained finite MLE.  It
+                # must not become a pruning incumbent before that exact check:
+                # a separated/recession candidate could otherwise hide a
+                # later well-posed add.
+                record = self._full_refit_after_restricted_add(current, rule)
+                if not record.fit.converged:
+                    with self._state_lock:
+                        self.diagnostics.nonattained_exact_rejections += 1
+                    continue
+                if record.score <= acceptance + self.config.search_tolerance:
+                    raise AssertionError(
+                        "full refit degraded an improving restricted add block: "
+                        f"current={current.support!r}, rule={rule!r}, "
+                        f"restricted_score={score:.17g}, "
+                        f"full_score={record.score:.17g}, fit={record.fit!r}"
+                    )
+                if record.score > best_score + self.config.search_tolerance or (
+                    best_rule is not None
+                    and abs(record.score - best_score) <= self.config.search_tolerance
+                    and rule < best_rule
+                ):
+                    best_score = record.score
+                    best_rule = rule
+                    best_exact = record
         with self._state_lock:
             self.diagnostics.restricted_add_audits += audited
-        if best_rule is None:
-            return None
-        if best_exact is not None:
-            return best_exact
-        record = self._full_refit_after_restricted_add(current, best_rule)
-        if record.score <= acceptance + self.config.search_tolerance:
-            raise AssertionError(
-                "full refit degraded an improving restricted add block: "
-                f"current={current.support!r}, rule={best_rule!r}, "
-                f"restricted_score={best_score:.17g}, "
-                f"full_score={record.score:.17g}, fit={record.fit!r}"
-            )
-        return record
+        return best_exact
 
     def _full_refit_after_restricted_add(
         self, current: SupportRecord, rule: RuleIdentity
@@ -3729,7 +3775,7 @@ class SupportOptimizer:
                             self.diagnostics.reliability_warm_starts += 1
                         break
                     candidate *= 0.5
-        fit = fit_offset_design(
+        fit = fit_offset_design_continued(
             design,
             problem.offset,
             problem.exposure,

@@ -48,18 +48,19 @@ PERFORMANCE_COLUMNS = (
 )
 
 PREDICATES = (
-    "pred_eltv_enters_high_ltv",
-    "pred_eltv_exits_high_ltv",
+    "pred_eltv_enters_80_100_band",
+    "pred_eltv_returns_below_80",
     "pred_eltv_enters_negative_equity",
     "pred_eltv_exits_negative_equity",
-    "pred_eltv_deterioration_starts_within_band",
-    "pred_eltv_improvement_starts_within_band",
+    "pred_eltv_increase_starts_below_80",
+    "pred_eltv_decrease_starts_below_80",
+    "pred_eltv_increase_starts_within_80_100",
+    "pred_eltv_decrease_starts_within_80_100",
+    "pred_eltv_increase_starts_above_100",
+    "pred_eltv_decrease_starts_above_100",
     "pred_upb_increase_starts",
     "pred_upb_flat_starts",
-    "pred_upb_paydown_resumes",
-    "pred_upb_paydown_acceleration_starts",
-    "pred_upb_paydown_deceleration_starts",
-    "pred_upb_paydown_steady_starts",
+    "pred_upb_decrease_starts",
 )
 
 
@@ -151,11 +152,12 @@ def _prefix(frame: pd.DataFrame, *, max_observation_months: int = 36) -> pd.Data
 
 
 def _predicate_matrix(frame: pd.DataFrame) -> pd.DataFrame:
-    prev1, prev2, prev3 = (_contiguous(frame, lag) for lag in (1, 2, 3))
+    prev1, prev2 = (_contiguous(frame, lag) for lag in (1, 2))
     eltv = frame["eltv_num"]
     e1, e2 = eltv.shift(), eltv.shift(2)
     valid = eltv.notna() & eltv.ne(999)
-    valid1, valid2 = e1.notna() & e1.ne(999), e2.notna() & e2.ne(999)
+    valid1 = e1.notna() & e1.ne(999)
+    valid2 = e2.notna() & e2.ne(999)
 
     def band(values: pd.Series) -> pd.Series:
         return pd.Series(
@@ -169,37 +171,71 @@ def _predicate_matrix(frame: pd.DataFrame) -> pd.DataFrame:
 
     b0, b1, b2 = band(eltv), band(e1), band(e2)
     epair = prev1 & valid & valid1
-    prior_rise = prev2 & valid1 & valid2 & b1.eq(b2) & e1.gt(e2)
-    prior_fall = prev2 & valid1 & valid2 & b1.eq(b2) & e1.lt(e2)
-    upb, u1, u2, u3 = (
+    etriple = prev2 & valid & valid1 & valid2
+    eltv_delta, previous_eltv_delta = eltv - e1, e1 - e2
+    upb, u1, u2 = (
         frame["upb"],
         frame["upb"].shift(),
         frame["upb"].shift(2),
-        frame["upb"].shift(3),
     )
-    pair = prev1 & upb.gt(0) & u1.gt(0)
-    triple = pair & prev2 & u2.gt(0)
-    quad = triple & prev3 & u3.gt(0)
-    d0, d1, d2 = u1 - upb, u2 - u1, u3 - u2
+    upb_valid = prev2 & upb.gt(0) & u1.gt(0) & u2.gt(0)
+    delta, previous_delta = upb - u1, u1 - u2
     out = pd.DataFrame(index=frame.index)
     out[PREDICATES[0]] = epair & b1.eq(0) & b0.eq(1)
     out[PREDICATES[1]] = epair & b1.eq(1) & b0.eq(0)
     out[PREDICATES[2]] = epair & b1.lt(2) & b0.eq(2)
     out[PREDICATES[3]] = epair & b1.eq(2) & b0.lt(2)
-    out[PREDICATES[4]] = epair & b0.eq(b1) & eltv.gt(e1) & ~prior_rise
-    out[PREDICATES[5]] = epair & b0.eq(b1) & eltv.lt(e1) & ~prior_fall
-    out[PREDICATES[6]] = triple & upb.gt(u1) & u1.le(u2)
-    out[PREDICATES[7]] = triple & upb.eq(u1) & u1.ne(u2)
-    out[PREDICATES[8]] = triple & upb.lt(u1) & u1.ge(u2)
-    accelerating = quad & d0.gt(0) & d1.gt(0) & d0.gt(d1)
-    prior_accelerating = quad & d1.gt(0) & d2.gt(0) & d1.gt(d2)
-    decelerating = quad & d0.gt(0) & d1.gt(0) & d0.lt(d1)
-    prior_decelerating = quad & d1.gt(0) & d2.gt(0) & d1.lt(d2)
-    steady = quad & d0.gt(0) & d1.gt(0) & d0.eq(d1)
-    prior_steady = quad & d1.gt(0) & d2.gt(0) & d1.eq(d2)
-    out[PREDICATES[9]] = accelerating & ~prior_accelerating
-    out[PREDICATES[10]] = decelerating & ~prior_decelerating
-    out[PREDICATES[11]] = steady & ~prior_steady
+    out[PREDICATES[4]] = (
+        etriple
+        & b0.eq(0)
+        & b1.eq(0)
+        & b2.eq(0)
+        & eltv_delta.gt(0)
+        & previous_eltv_delta.le(0)
+    )
+    out[PREDICATES[5]] = (
+        etriple
+        & b0.eq(0)
+        & b1.eq(0)
+        & b2.eq(0)
+        & eltv_delta.lt(0)
+        & previous_eltv_delta.ge(0)
+    )
+    out[PREDICATES[6]] = (
+        etriple
+        & b0.eq(1)
+        & b1.eq(1)
+        & b2.eq(1)
+        & eltv_delta.gt(0)
+        & previous_eltv_delta.le(0)
+    )
+    out[PREDICATES[7]] = (
+        etriple
+        & b0.eq(1)
+        & b1.eq(1)
+        & b2.eq(1)
+        & eltv_delta.lt(0)
+        & previous_eltv_delta.ge(0)
+    )
+    out[PREDICATES[8]] = (
+        etriple
+        & b0.eq(2)
+        & b1.eq(2)
+        & b2.eq(2)
+        & eltv_delta.gt(0)
+        & previous_eltv_delta.le(0)
+    )
+    out[PREDICATES[9]] = (
+        etriple
+        & b0.eq(2)
+        & b1.eq(2)
+        & b2.eq(2)
+        & eltv_delta.lt(0)
+        & previous_eltv_delta.ge(0)
+    )
+    out[PREDICATES[10]] = upb_valid & delta.gt(0) & previous_delta.le(0)
+    out[PREDICATES[11]] = upb_valid & delta.eq(0) & previous_delta.ne(0)
+    out[PREDICATES[12]] = upb_valid & delta.lt(0) & previous_delta.ge(0)
     return out.fillna(False).astype(np.uint8)
 
 
@@ -458,10 +494,15 @@ def preprocess_freddie(
             "independent_certification_units": True,
         },
         provenance={
-            "preprocessor": "crbstpp.preprocess.freddie.v3",
+            "preprocessor": "crbstpp.preprocess.freddie.v6",
             "vintages": [name for name, _, _ in paths],
             "source_sha256": source_digests,
-            "predicate_definition": "primitive ELTV-band and UPB-direction transition onsets",
+            "predicate_definition": (
+                "13 primitive events: four ELTV band transitions, six mutually "
+                "exclusive within-band ELTV direction onsets and three UPB "
+                "direction onsets; no magnitude thresholds or target-status "
+                "predicates"
+            ),
             "environment_definition": "Freddie acquisition quarter",
             "partition_definition": (
                 {

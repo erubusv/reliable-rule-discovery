@@ -129,7 +129,10 @@ class PipelineContractTests(unittest.TestCase):
                 knot_count=1,
                 formation_windows=(0,),
                 solver_tolerance=1e-7,
-                solver_max_iter=100,
+                # A single iteration is deliberately only a continuation
+                # checkpoint; exact search/certification fits must still
+                # reach their KKT-certified optima.
+                solver_max_iter=1,
                 cache_bytes=8 * 1024**2,
                 early_warning_horizon=3,
                 pricing_devices=(),
@@ -139,6 +142,12 @@ class PipelineContractTests(unittest.TestCase):
             self.assertEqual(report.schema, RESULT_SCHEMA)
             self.assertIn("f0", report.result["certification"]["all"][0]["certificate"])
             self.assertIn("f3", report.result["certification"]["all"][0]["certificate"])
+            self.assertGreater(
+                report.result["search"]["diagnostics"][
+                    "nonattained_exact_rejections"
+                ],
+                0,
+            )
             resumed = run(config, run_dir=run_dir, resume=True)
             self.assertEqual(resumed.result, report.result)
             repeated = run(config, run_dir=root / "run-repeat")

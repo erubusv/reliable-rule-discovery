@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import math
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import numpy as np
 from scipy.optimize import linprog
@@ -376,6 +376,59 @@ def fit_model_matrix(
     )
 
 
+def fit_model_matrix_continued(
+    matrix: ModelMatrix,
+    *,
+    likelihood: str,
+    tolerance: float,
+    max_iter: int,
+    warm_start: np.ndarray | None = None,
+    device: str = "cpu",
+) -> FitResult:
+    """Continue an exact Newton fit across iteration windows until certified.
+
+    ``max_iter`` is a checkpoint interval, not a statistical rejection rule.
+    A finite, full-rank convex model must not become uncertifiable merely
+    because it needed one more Newton window.  Genuine recession, rank failure,
+    line-search failure and nonfinite arithmetic still fail closed.  Repeated
+    identical terminal states are reported as numerical stagnation rather than
+    looping indefinitely.
+    """
+    total_iterations = 0
+    start = warm_start
+    previous: tuple[float, float, bytes] | None = None
+    repeated = 0
+    while True:
+        fit = fit_model_matrix(
+            matrix,
+            likelihood=likelihood,
+            tolerance=tolerance,
+            max_iter=max_iter,
+            warm_start=start,
+            device=device,
+        )
+        total_iterations += fit.iterations
+        if fit.converged or fit.message != "maximum iterations reached":
+            return replace(fit, iterations=total_iterations)
+        state = (
+            float(fit.nll),
+            float(fit.projected_kkt),
+            np.ascontiguousarray(fit.coefficients).tobytes(),
+        )
+        if previous == state:
+            repeated += 1
+            if repeated >= 2:
+                return replace(
+                    fit,
+                    iterations=total_iterations,
+                    message="continued Newton stagnation before KKT convergence",
+                )
+        else:
+            repeated = 0
+        previous = state
+        start = fit.coefficients
+
+
 def fit_offset_design(
     x: np.ndarray,
     offset: np.ndarray,
@@ -577,6 +630,64 @@ def fit_offset_design(
     )
 
 
+def fit_offset_design_continued(
+    x: np.ndarray,
+    offset: np.ndarray,
+    exposure_weight: np.ndarray,
+    noevent_weight: np.ndarray,
+    event_weight: np.ndarray,
+    *,
+    likelihood: str,
+    free_dimension: int,
+    tolerance: float,
+    max_iter: int,
+    device: str = "cpu",
+    warm_start: np.ndarray | None = None,
+) -> FitResult:
+    """Continue an exact restricted-block fit beyond a checkpoint window."""
+    total_iterations = 0
+    start = warm_start
+    previous: tuple[float, float, bytes] | None = None
+    repeated = 0
+    while True:
+        fit = fit_offset_design(
+            x,
+            offset,
+            exposure_weight,
+            noevent_weight,
+            event_weight,
+            likelihood=likelihood,
+            free_dimension=free_dimension,
+            tolerance=tolerance,
+            max_iter=max_iter,
+            device=device,
+            warm_start=start,
+        )
+        total_iterations += fit.iterations
+        if fit.converged or fit.message != "offset-block maximum iterations reached":
+            return replace(fit, iterations=total_iterations)
+        state = (
+            float(fit.nll),
+            float(fit.projected_kkt),
+            np.ascontiguousarray(fit.coefficients).tobytes(),
+        )
+        if previous == state:
+            repeated += 1
+            if repeated >= 2:
+                return replace(
+                    fit,
+                    iterations=total_iterations,
+                    message=(
+                        "continued offset-block Newton stagnation before "
+                        "KKT convergence"
+                    ),
+                )
+        else:
+            repeated = 0
+        previous = state
+        start = fit.coefficients
+
+
 def fit_model_matrices(
     matrices: list[ModelMatrix] | tuple[ModelMatrix, ...],
     *,
@@ -602,7 +713,7 @@ def fit_model_matrices(
     ) -> FitResult:
         configure_cpu_threads(max(1, int(cpu_threads_per_worker)))
         index, matrix, warm = item
-        return fit_model_matrix(
+        return fit_model_matrix_continued(
             matrix,
             likelihood=likelihood,
             tolerance=tolerance,

@@ -186,51 +186,12 @@ def _holm_adjust(pvalues: list[float]) -> list[float]:
     return adjusted
 
 
-def _prefit_family_nulls(
-    optimizer: SupportOptimizer,
-    family: tuple[SupportRecord, ...],
-) -> None:
-    """Warm and cache every unique D_fit null in bounded parallel waves.
-
-    Certification used to launch a separate fit wave inside every support,
-    leaving two of the three exact workers idle for singleton models.  The
-    models and optima are identical; only their deterministic execution order
-    and warm starts change.  Wave-local matrices are released before the next
-    wave so peak memory remains bounded by ``exact_workers``.
-    """
-    jobs: dict[
-        tuple[Support, tuple[ClosureTerm, ...]], SupportRecord
-    ] = {}
-    for record in family:
-        # F1 and support-level F3 ask whether the complete predictive support
-        # improves on the pre-registered empty baseline.  Closure-only models
-        # are reserved for hierarchy-preserving branch tests below; using one
-        # as the support null both duplicated F2 and allowed a nuisance-model
-        # failure to abort the overall predictive comparison.
-        jobs.setdefault((EMPTY_SUPPORT, ()), record)
-        for root in record.support.rules:
-            drop_support = _branch_drop(record.support, root)
-            drop_closure = _branch_null_closure(
-                record.matrix.closure, drop_support, root
-            )
-            jobs.setdefault((drop_support, drop_closure), record)
-    ordered = sorted(jobs, key=lambda item: (item[0].rules, item[1]))
-    width = max(1, optimizer.config.exact_workers)
-    for start in range(0, len(ordered), width):
-        wave = ordered[start : start + width]
-        optimizer.fit_fixed_many(
-            list(wave),
-            sources=[jobs[item] for item in wave],
-        )
-
-
 def certify_family(
     optimizer: SupportOptimizer,
     certification_context: Context,
     family: tuple[SupportRecord, ...],
     config: RunConfig,
 ) -> CertificationResult:
-    _prefit_family_nulls(optimizer, family)
     cert_engine = ResponseEngine(
         certification_context.dataset,
         lag=config.impact_lag,
@@ -257,9 +218,21 @@ def certify_family(
         full_matrix, full_entity = _evaluate_frozen(
             cert_engine, certification_context, record.matrix, record.fit
         )
-        null_matrix, null_fit = _fit_on_discovery(
-            optimizer, EMPTY_SUPPORT, closure=(), source=record
+        branch_specifications = []
+        for root in record.support.rules:
+            drop_support = _branch_drop(record.support, root)
+            drop_closure = _branch_null_closure(
+                record.matrix.closure, drop_support, root
+            )
+            branch_specifications.append((drop_support, drop_closure))
+        # Build and fit every nested comparison exactly once.  Each null is a
+        # lossless column projection of the already fitted full matrix inside
+        # SupportOptimizer, so certification never reconstructs its kernels.
+        comparison_models = optimizer.fit_fixed_many(
+            [(EMPTY_SUPPORT, ()), *branch_specifications],
+            sources=[record] * (1 + len(branch_specifications)),
         )
+        (null_matrix, null_fit), *branch_models = comparison_models
         if not null_fit.converged:
             reasons.append("baseline_null_nonconvergence")
             interim.append((record, 1.0, diagnostics, tuple(reasons)))
@@ -298,17 +271,6 @@ def certify_family(
         if not support_f3:
             if distribution_shift_testable:
                 reasons.append("f3_support_robust_gain_below_mdl")
-        branch_specifications = []
-        for root in record.support.rules:
-            drop_support = _branch_drop(record.support, root)
-            drop_closure = _branch_null_closure(
-                record.matrix.closure, drop_support, root
-            )
-            branch_specifications.append((drop_support, drop_closure))
-        branch_models = optimizer.fit_fixed_many(
-            branch_specifications,
-            sources=[record] * len(branch_specifications),
-        )
         rule_pvalues: list[float] = []
         rule_diagnostics: list[dict[str, object]] = []
         rule_f3: list[bool] = []

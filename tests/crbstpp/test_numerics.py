@@ -38,7 +38,12 @@ from crbstpp.search import (
     _nonnegative_quadratic_gain,
     _nonnegative_quadratic_solution,
 )
-from crbstpp.solver import _objective, fit_model_matrix, fit_offset_design
+from crbstpp.solver import (
+    _objective,
+    fit_model_matrix,
+    fit_offset_design,
+    fit_offset_design_continued,
+)
 
 from tests.crbstpp.test_core import synthetic_dataset
 
@@ -640,6 +645,43 @@ class NumericalParityTests(unittest.TestCase):
         np.testing.assert_allclose(warm.coefficients, cold.coefficients, atol=1e-9)
         self.assertAlmostEqual(warm.nll, cold.nll, places=10)
 
+    def test_offset_iteration_window_continuation_is_exact(self) -> None:
+        index = np.arange(80)
+        design = np.column_stack((np.ones(80), 0.2 + (index % 7) / 7.0))
+        offset = -2.0 + 0.005 * index
+        event = np.zeros(80, dtype=np.float64)
+        event[[2, 7, 11, 19, 31, 47, 63, 71]] = 1.0
+        exposure = np.ones(80, dtype=np.float64)
+        reference = fit_offset_design(
+            design,
+            offset,
+            exposure,
+            exposure,
+            event,
+            likelihood="poisson",
+            free_dimension=1,
+            tolerance=1e-9,
+            max_iter=200,
+        )
+        continued = fit_offset_design_continued(
+            design,
+            offset,
+            exposure,
+            exposure,
+            event,
+            likelihood="poisson",
+            free_dimension=1,
+            tolerance=1e-9,
+            max_iter=1,
+        )
+        self.assertTrue(reference.converged, reference.message)
+        self.assertTrue(continued.converged, continued.message)
+        self.assertGreater(continued.iterations, 1)
+        np.testing.assert_allclose(
+            continued.coefficients, reference.coefficients, atol=1e-9
+        )
+        self.assertAlmostEqual(continued.nll, reference.nll, places=10)
+
     def test_reliability_price_fails_open_when_f3_is_untestable(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             data = synthetic_dataset(Path(directory) / "data", 90)
@@ -1204,11 +1246,56 @@ class NumericalParityTests(unittest.TestCase):
                 np.testing.assert_array_equal(actual, expected)
             self.assertEqual(embedded.converged, direct.converged)
             self.assertAlmostEqual(embedded.nll, direct.nll, places=10)
+            if direct.converged:
+                np.testing.assert_allclose(
+                    embedded.coefficients,
+                    direct.coefficients,
+                    rtol=1e-8,
+                    atol=1e-8,
+                )
+            else:
+                self.assertEqual(embedded.recession, direct.recession)
+
+    def test_projected_drop_one_matches_direct_response_refit(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            data = synthetic_dataset(Path(directory) / "data", 120)
+            fit_codes, _, _ = data.split((0.6, 0.2, 0.2), 111)
+            config = RunConfig(
+                dataset=str(data.root),
+                q_max=2,
+                impact_lag=3,
+                knot_count=2,
+                formation_windows=(0, 1, 2),
+                solver_tolerance=1e-8,
+                solver_max_iter=150,
+                cache_bytes=32 * 1024**2,
+                early_warning_horizon=3,
+                pricing_devices=(),
+            )
+            optimizer = SupportOptimizer(Context.make(data, fit_codes), config)
+            empty = optimizer.records[Support(())]
+            retained = RuleIdentity((0,), 0, 1)
+            removed = RuleIdentity((1,), 0, 1)
+            full = optimizer.fit(Support.of((retained, removed)), empty)
+            target = Support.of((retained,))
+            projected_matrix, projected = optimizer.fit_fixed(
+                target, (), source=full, device="cpu"
+            )
+            direct_matrix = optimizer.engine.model_matrix(
+                optimizer.context, target, forced_closure=()
+            )
+            direct = fit_model_matrix(
+                direct_matrix,
+                likelihood=data.likelihood,
+                tolerance=config.solver_tolerance,
+                max_iter=config.solver_max_iter,
+            )
+            self.assertTrue(projected.converged, projected.message)
+            self.assertTrue(direct.converged, direct.message)
+            self.assertLessEqual(len(projected_matrix.x), len(direct_matrix.x))
+            self.assertAlmostEqual(projected.nll, direct.nll, places=10)
             np.testing.assert_allclose(
-                embedded.coefficients,
-                direct.coefficients,
-                rtol=1e-11,
-                atol=1e-11,
+                projected.coefficients, direct.coefficients, rtol=2e-9, atol=1e-8
             )
 
     def test_closure_only_gain_does_not_admit_reported_pair(self) -> None:

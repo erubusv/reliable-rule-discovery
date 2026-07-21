@@ -10,7 +10,7 @@ from .config import RunConfig
 from .likelihood import cloglog_event_terms
 from .response import Context, ModelMatrix, ResponseEngine
 from .rules import EMPTY_SUPPORT, Support
-from .solver import FitResult, fit_model_matrices, fit_model_matrix
+from .solver import FitResult, fit_model_matrices, fit_model_matrix_continued
 
 
 @dataclass(frozen=True)
@@ -223,7 +223,7 @@ def fit_ensemble(
         cache_bytes=config.cache_bytes,
     )
     baseline_matrix = engine.model_matrix(dataset_context, EMPTY_SUPPORT)
-    baseline_fit = fit_model_matrix(
+    baseline_fit = fit_model_matrix_continued(
         baseline_matrix,
         likelihood=dataset_context.dataset.likelihood,
         tolerance=config.solver_tolerance,

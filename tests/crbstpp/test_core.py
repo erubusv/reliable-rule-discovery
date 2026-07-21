@@ -20,7 +20,7 @@ from crbstpp.rules import (
     one_exchange_neighbors,
 )
 from crbstpp.search import SupportOptimizer, support_key
-from crbstpp.solver import fit_model_matrix
+from crbstpp.solver import fit_model_matrix, fit_model_matrix_continued
 
 
 def synthetic_dataset(
@@ -132,6 +132,25 @@ class DataRuleTests(unittest.TestCase):
 
 
 class LikelihoodSolverTests(unittest.TestCase):
+    def test_iteration_window_continuation_reaches_same_exact_fit(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            data = synthetic_dataset(Path(directory) / "data")
+            context = Context.make(data, np.arange(60, dtype=np.int32))
+            engine = ResponseEngine(data, lag=3, knot_count=2, cache_bytes=8 * 1024**2)
+            matrix = engine.model_matrix(
+                context, Support.of((RuleIdentity((0,), 0, 1),))
+            )
+            reference = fit_model_matrix(
+                matrix, likelihood=data.likelihood, tolerance=1e-8, max_iter=150
+            )
+            continued = fit_model_matrix_continued(
+                matrix, likelihood=data.likelihood, tolerance=1e-8, max_iter=1
+            )
+            self.assertTrue(reference.converged, reference.message)
+            self.assertTrue(continued.converged, continued.message)
+            self.assertGreater(continued.iterations, 1)
+            self.assertAlmostEqual(continued.nll, reference.nll, places=10)
+
     def test_cloglog_derivatives(self) -> None:
         eta = np.linspace(-5, 3, 21)
         value, first, second = cloglog_event_terms(eta)

@@ -4,11 +4,14 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 from crbstpp.data import Dataset
 from crbstpp.preprocess.freddie import (
     PERFORMANCE_COLUMNS,
+    PREDICATES,
+    _predicate_matrix,
     _prefix,
     preprocess_freddie,
 )
@@ -16,6 +19,32 @@ from crbstpp.preprocess.ibm import preprocess_ibm
 
 
 class PreprocessingTests(unittest.TestCase):
+    def test_freddie_predicates_are_explicit_transition_events(self) -> None:
+        rows = []
+
+        def add(loan: str, eltv: list[int], upb: list[int]) -> None:
+            for index, (ratio, balance) in enumerate(
+                zip(eltv, upb, strict=True), start=1
+            ):
+                rows.append(
+                    {
+                        "loan_id": loan,
+                        "time": index,
+                        "eltv_num": ratio,
+                        "upb": balance,
+                    }
+                )
+
+        add("cross", [70, 85, 105, 95, 75], [100] * 5)
+        add("low", [70, 70, 75, 72], [100] * 4)
+        add("high", [85, 85, 90, 87], [100] * 4)
+        add("negative", [105, 105, 110, 108], [100] * 4)
+        add("upb", [70] * 5, [100, 100, 101, 101, 100])
+        frame = pd.DataFrame(rows)
+        matrix = _predicate_matrix(frame)
+        self.assertEqual(tuple(matrix.columns), PREDICATES)
+        np.testing.assert_array_equal(matrix.sum(axis=0).to_numpy(), np.ones(13))
+
     def test_freddie_prefix_obeys_absorbing_gap_and_horizon_stops(self) -> None:
         rows: list[dict[str, object]] = []
         for loan, times, target, termination in (
