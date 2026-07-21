@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import threading
 from collections import OrderedDict
+from collections.abc import Iterator
 from dataclasses import dataclass
 
 import numpy as np
@@ -580,15 +581,43 @@ class ResponseEngine:
         *,
         retain: bool = True,
     ) -> dict[int, SparseBlock]:
-        """Build every nested W block after one pass over completions.
+        """Materialize every nested W block after one pass over completions.
+
+        Discovery pricing must use :meth:`iter_blocks_many` instead: collecting
+        a dense Freddie W family here intentionally keeps every snapshot alive
+        and can require tens of GiB.  This collecting API remains for small
+        callers and exact parity tests.
+        """
+        return dict(
+            self.iter_blocks_many(
+                context,
+                antecedent,
+                windows,
+                retain=retain,
+            )
+        )
+
+    def iter_blocks_many(
+        self,
+        context: Context,
+        antecedent: Antecedent,
+        windows: tuple[int, ...],
+        *,
+        retain: bool = False,
+    ) -> Iterator[tuple[int, SparseBlock]]:
+        """Yield exact nested W blocks while retaining only one snapshot.
 
         Newly admitted completions are accumulated exactly once.  A compact
         global-row lookup maps them into the maximum-W footprint, after which
         each requested block is a deterministic snapshot of the accumulator.
+        The caller consumes that snapshot before advancing the iterator, so
+        memory is ``O(max-W footprint)`` rather than the sum of all W
+        footprints.  Accumulation order and returned arrays are identical to
+        :meth:`blocks_many`; only their lifetime differs.
         """
         requested = tuple(sorted(set(map(int, windows))))
         if not requested:
-            return {}
+            return
         keys = {window: (id(context), antecedent, window) for window in requested}
         with self._lock:
             cached = {
@@ -599,7 +628,9 @@ class ResponseEngine:
             for window in cached:
                 self._cache.move_to_end(keys[window])
         if len(cached) == len(requested):
-            return cached
+            for window in requested:
+                yield window, cached[window]
+            return
         group_key = (id(context), antecedent, retain, *requested)
         with self._compute_lock("blocks-many", group_key):
             with self._lock:
@@ -611,7 +642,9 @@ class ResponseEngine:
                 for window in cached:
                     self._cache.move_to_end(keys[window])
             if len(cached) == len(requested):
-                return cached
+                for window in requested:
+                    yield window, cached[window]
+                return
             maximum_window = max(requested)
             threshold_rows, minimum_spans = self.response_row_thresholds(
                 context, antecedent, maximum_window
@@ -621,10 +654,12 @@ class ResponseEngine:
                     np.zeros(0, dtype=np.int64),
                     np.zeros((0, self.knot_count), dtype=np.float64),
                 )
-                return {
-                    window: self._retain_block(keys[window], empty) if retain else empty
-                    for window in requested
-                }
+                for window in requested:
+                    result = (
+                        self._retain_block(keys[window], empty) if retain else empty
+                    )
+                    yield window, result
+                return
             # A dense global-row lookup is the fastest exact representation on
             # ordinary grids.  On fine continuous-time grids it can dwarf the
             # actual response footprint, so use exact sorted-row lookup there.
@@ -652,7 +687,6 @@ class ResponseEngine:
             )
             order = np.argsort(spans, kind="stable")
             entities, times, spans = entities[order], times[order], spans[order]
-            output: dict[int, SparseBlock] = {}
             left = 0
             for window in requested:
                 window_ticks = window * self.dataset.ticks_per_unit
@@ -731,10 +765,10 @@ class ResponseEngine:
                 rows = threshold_rows[footprint]
                 values = accumulator[footprint].copy()
                 result = SparseBlock(rows, values)
-                output[window] = (
+                result = (
                     self._retain_block(keys[window], result) if retain else result
                 )
-            return output
+                yield window, result
 
     def model_matrix(
         self,

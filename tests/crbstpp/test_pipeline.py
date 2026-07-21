@@ -5,6 +5,8 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
 
 import numpy as np
 
@@ -14,10 +16,11 @@ from crbstpp.certification import (
     _multinomial_l1_radius,
     _worst_case_total_variation_mean,
 )
+from crbstpp.cli import _supervised_fit
 from crbstpp.config import RunConfig
 from crbstpp.data import Dataset
 from crbstpp.checkpoint import RESULT_SCHEMA, load_checkpoint
-from crbstpp.pipeline import run
+from crbstpp.pipeline import inspect_run, run
 from crbstpp.response import Context, ResponseEngine
 from crbstpp.rules import EMPTY_SUPPORT, RuleIdentity, Support
 from crbstpp.solver import fit_model_matrix
@@ -26,6 +29,33 @@ from tests.crbstpp.test_core import synthetic_dataset
 
 
 class PipelineContractTests(unittest.TestCase):
+    def test_supervisor_records_oom_sigkill(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            run_dir = root / "run"
+            with (
+                mock.patch(
+                    "crbstpp.cli._oom_kills", side_effect=(21, 22)
+                ),
+                mock.patch(
+                    "crbstpp.cli.subprocess.run",
+                    return_value=SimpleNamespace(returncode=-9),
+                ),
+            ):
+                code = _supervised_fit(root / "config.yaml", run_dir)
+            self.assertEqual(code, -9)
+            failure = json.loads(
+                (run_dir / "failure.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(failure["reason"], "oom_kill")
+            self.assertEqual(failure["signal"], 9)
+            self.assertEqual(failure["oom_kill_delta"], 1)
+            self.assertTrue((run_dir / "stderr.log").is_file())
+            inspected = inspect_run(run_dir)
+            self.assertFalse(inspected["complete"])
+            self.assertIsNone(inspected["manifest"])
+            self.assertEqual(inspected["failure"], failure)
+
     def test_f3_total_variation_worst_case_is_exact(self) -> None:
         values = np.asarray([1.0, 3.0])
         probabilities = np.asarray([0.5, 0.5])

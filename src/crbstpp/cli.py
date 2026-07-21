@@ -2,8 +2,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import subprocess
+import sys
+import time
 from pathlib import Path
 
+from .checkpoint import atomic_json
 from .config import RunConfig
 from .pipeline import inspect_run, run
 from .preprocess.freddie import preprocess_freddie
@@ -36,6 +41,81 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _oom_kills() -> int | None:
+    for path in (
+        Path("/sys/fs/cgroup/memory.events.local"),
+        Path("/sys/fs/cgroup/memory.events"),
+    ):
+        try:
+            values = {
+                key: int(value)
+                for key, value in (
+                    line.split() for line in path.read_text(encoding="utf-8").splitlines()
+                )
+            }
+        except (OSError, ValueError):
+            continue
+        if "oom_kill" in values:
+            return values["oom_kill"]
+    return None
+
+
+def _supervised_fit(config_path: Path, run_dir: Path) -> int:
+    """Run the memory-owning worker while preserving fatal exit evidence."""
+    run_dir = Path(run_dir)
+    stderr_path = run_dir.with_name(f"{run_dir.name}.stderr.log")
+    stderr_path.parent.mkdir(parents=True, exist_ok=True)
+    command = [
+        sys.executable,
+        "-m",
+        "crbstpp.cli",
+        "fit",
+        "--config",
+        str(config_path),
+        "--run-dir",
+        str(run_dir),
+    ]
+    environment = os.environ.copy()
+    environment["CRBSTPP_SUPERVISED_WORKER"] = "1"
+    before = _oom_kills()
+    started = time.time()
+    with stderr_path.open("w", encoding="utf-8") as stderr:
+        completed = subprocess.run(
+            command,
+            env=environment,
+            stderr=stderr,
+            check=False,
+        )
+    after = _oom_kills()
+    run_dir.mkdir(parents=True, exist_ok=True)
+    final_stderr = run_dir / "stderr.log"
+    os.replace(stderr_path, final_stderr)
+    if completed.returncode != 0:
+        oom_delta = (
+            None if before is None or after is None else max(0, after - before)
+        )
+        signal_number = -completed.returncode if completed.returncode < 0 else None
+        atomic_json(
+            run_dir / "failure.json",
+            {
+                "schema": "crbstpp.failure.v1",
+                "returncode": completed.returncode,
+                "signal": signal_number,
+                "reason": (
+                    "oom_kill"
+                    if signal_number == 9 and oom_delta is not None and oom_delta > 0
+                    else "worker_failure"
+                ),
+                "oom_kill_before": before,
+                "oom_kill_after": after,
+                "oom_kill_delta": oom_delta,
+                "elapsed_seconds": time.time() - started,
+                "stderr": str(final_stderr),
+            },
+        )
+    return int(completed.returncode)
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     if args.command == "preprocess":
@@ -55,6 +135,11 @@ def main(argv: list[str] | None = None) -> int:
         print(output)
         return 0
     if args.command == "fit":
+        if (
+            args.run_dir is not None
+            and os.environ.get("CRBSTPP_SUPERVISED_WORKER") != "1"
+        ):
+            return _supervised_fit(args.config, args.run_dir)
         config = RunConfig.from_yaml(args.config)
         report = run(config, run_dir=args.run_dir)
         print(json.dumps(report.to_dict(), indent=2, sort_keys=True))

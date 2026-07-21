@@ -787,6 +787,12 @@ class NumericalParityTests(unittest.TestCase):
             }
             engine.clear_caches()
             blocks = engine.blocks_many(context, (0, 1), windows)
+            engine.clear_caches()
+            streamed = dict(
+                engine.iter_blocks_many(
+                    context, (0, 1), windows, retain=False
+                )
+            )
             for window in windows:
                 expected = rows[minimum_spans <= window * data.ticks_per_unit]
                 np.testing.assert_array_equal(batched[window], expected)
@@ -796,6 +802,15 @@ class NumericalParityTests(unittest.TestCase):
                 )
                 np.testing.assert_allclose(
                     blocks[window].values,
+                    reference[window].values,
+                    rtol=0,
+                    atol=0,
+                )
+                np.testing.assert_array_equal(
+                    streamed[window].rows, reference[window].rows
+                )
+                np.testing.assert_allclose(
+                    streamed[window].values,
                     reference[window].values,
                     rtol=0,
                     atol=0,
@@ -937,9 +952,14 @@ class NumericalParityTests(unittest.TestCase):
             )
             optimizer = SupportOptimizer(Context.make(data, fit_codes), config)
             empty = optimizer.records[Support(())]
-            prices = optimizer._price_hierarchy_skeleton(
-                empty, (0, 1), (0, 1, 2), device="cpu"
-            )
+            with mock.patch.object(
+                optimizer.engine,
+                "blocks_many",
+                side_effect=AssertionError("pricing materialized a W family"),
+            ):
+                prices = optimizer._price_hierarchy_skeleton(
+                    empty, (0, 1), (0, 1, 2), device="cpu"
+                )
             for window in (0, 1, 2):
                 positive = RuleIdentity((0, 1), window, 1)
                 matrix = optimizer.engine.model_matrix(

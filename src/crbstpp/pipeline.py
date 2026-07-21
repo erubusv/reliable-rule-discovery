@@ -324,6 +324,11 @@ def run(
                 },
             )
 
+        # Persist a valid restart boundary before the expensive W/sign profile.
+        # The profile itself is deterministic and will be replayed on resume,
+        # while accepted support paths recorded later remain reusable.
+        if checkpoint is None:
+            save_search_progress((), None)
         search_result = optimizer.search(
             completed_paths=resumed_paths,
             active_path=resumed_active,
@@ -467,17 +472,23 @@ def run(
 
 def inspect_run(run_dir: str | Path) -> dict[str, object]:
     run_dir = Path(run_dir)
-    manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
+    manifest_path = run_dir / "manifest.json"
     result_path = run_dir / "result.json"
     checkpoint_path = run_dir / "checkpoint.json"
+    failure_path = run_dir / "failure.json"
     return {
         "run_dir": str(run_dir),
-        "manifest": manifest,
+        "manifest": json.loads(manifest_path.read_text(encoding="utf-8"))
+        if manifest_path.is_file()
+        else None,
         "complete": result_path.is_file(),
         "result": json.loads(result_path.read_text(encoding="utf-8"))
         if result_path.is_file()
         else None,
         "checkpoint": json.loads(checkpoint_path.read_text(encoding="utf-8"))
         if checkpoint_path.is_file()
+        else None,
+        "failure": json.loads(failure_path.read_text(encoding="utf-8"))
+        if failure_path.is_file()
         else None,
     }

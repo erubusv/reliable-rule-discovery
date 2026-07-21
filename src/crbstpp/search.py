@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import os
 import threading
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
@@ -90,6 +91,42 @@ class _ReliabilityPrice:
     direction: np.ndarray
 
 
+class _WeightedSemaphore:
+    """FIFO-agnostic byte budget for exact concurrent pricing tasks."""
+
+    def __init__(self, capacity: int):
+        self.capacity = max(1, int(capacity))
+        self._used = 0
+        self.peak = 0
+        self._condition = threading.Condition()
+
+    def acquire(self, amount: int) -> int:
+        reserved = min(self.capacity, max(1, int(amount)))
+        with self._condition:
+            while self._used and self._used + reserved > self.capacity:
+                self._condition.wait()
+            self._used += reserved
+            self.peak = max(self.peak, self._used)
+        return reserved
+
+    def release(self, reserved: int) -> None:
+        with self._condition:
+            self._used -= int(reserved)
+            if self._used < 0:
+                raise AssertionError("pricing memory reservation underflow")
+            self._condition.notify_all()
+
+
+def _available_memory_bytes() -> int | None:
+    """Best-effort physical-memory availability without an optional package."""
+    try:
+        pages = int(os.sysconf("SC_AVPHYS_PAGES"))
+        page_size = int(os.sysconf("SC_PAGE_SIZE"))
+    except (OSError, TypeError, ValueError):
+        return None
+    return pages * page_size if pages > 0 and page_size > 0 else None
+
+
 @dataclass
 class SearchDiagnostics:
     exact_fits: int = 0
@@ -154,6 +191,9 @@ class SearchDiagnostics:
     reliability_untestable_fail_open: int = 0
     reliability_numeric_fail_open: int = 0
     reliability_warm_starts: int = 0
+    pricing_memory_budget_bytes: int = 0
+    pricing_peak_reserved_bytes: int = 0
+    pricing_max_task_bytes: int = 0
 
 
 @dataclass(frozen=True)
@@ -1844,6 +1884,123 @@ class SupportOptimizer:
         )
         return closure_gain + rule_gain, rule_gain
 
+    def _joint_hierarchy_moments(
+        self,
+        current: SupportRecord,
+        blocks: tuple[SparseBlock, ...],
+        *,
+        device: str,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Return profiled score moments for one W using bounded row tiles."""
+        dimension = len(blocks) * self.config.knot_count
+        nonempty_rows = [block.rows for block in blocks if len(block.rows)]
+        maximum_rows = (
+            np.unique(np.concatenate(nonempty_rows))
+            if nonempty_rows
+            else np.zeros(0, dtype=np.int64)
+        )
+        if not len(maximum_rows):
+            return (
+                np.zeros(dimension, dtype=np.float64),
+                np.zeros((dimension, dimension), dtype=np.float64),
+            )
+        row_lookup: np.ndarray | None = None
+        if self.context.n_grid <= max(64_000_000, 8 * len(maximum_rows)):
+            row_lookup = np.full(self.context.n_grid, -1, dtype=np.int32)
+            row_lookup[maximum_rows] = np.arange(
+                len(maximum_rows), dtype=np.int32
+            )
+        indices, inverse = self._pricing_components(current)
+        gradient = np.zeros(dimension, dtype=np.float64)
+        hessian = np.zeros((dimension, dimension), dtype=np.float64)
+        cross = np.zeros((len(indices), dimension), dtype=np.float64)
+        baseline_only = (
+            current.matrix.dimension == 1
+            and len(indices) == 1
+            and int(indices[0]) == 0
+        )
+        sparse_cells = sum(
+            len(block.rows) * self.config.knot_count for block in blocks
+        )
+        sparse_density = sparse_cells / max(1, len(maximum_rows) * dimension)
+        if baseline_only and row_lookup is not None and sparse_density <= 0.25:
+            _, first, second = self._pricing_rows(current, maximum_rows)
+            sparse = sparse_joint_moments(
+                [(block.rows, block.values) for block in blocks],
+                row_lookup,
+                first,
+                second,
+            )
+            if sparse is not None:
+                gradient, hessian, intercept_cross = sparse
+                cross[0] = intercept_cross
+                return gradient, hessian - cross.T @ inverse @ cross
+
+        tile_rows = max(
+            1_024,
+            min(65_536, 128 * 1024**2 // max(8, 8 * dimension)),
+        )
+        fill_blocks = [(block.rows, block.values) for block in blocks]
+        fill_batches = np.zeros(len(blocks), dtype=np.int64)
+        fill_columns = np.arange(len(blocks), dtype=np.int64) * self.config.knot_count
+        for start in range(0, len(maximum_rows), tile_rows):
+            rows = maximum_rows[start : start + tile_rows]
+            _, first, second = self._pricing_rows(current, rows)
+            candidate_batch = np.zeros(
+                (1, len(rows), dimension), dtype=np.float64
+            )
+            compiled_fill = fill_candidate_batch(
+                candidate_batch,
+                maximum_rows,
+                row_lookup,
+                fill_blocks,
+                fill_batches,
+                fill_columns,
+                start,
+            )
+            if not compiled_fill:
+                candidate = candidate_batch[0]
+                for block_index, block in enumerate(blocks):
+                    if not len(block.rows):
+                        continue
+                    left = int(np.searchsorted(block.rows, rows[0], side="left"))
+                    right = int(np.searchsorted(block.rows, rows[-1], side="right"))
+                    if right <= left:
+                        continue
+                    block_rows = block.rows[left:right]
+                    positions = np.searchsorted(rows, block_rows)
+                    if (
+                        np.any(positions >= len(rows))
+                        or not np.array_equal(rows[positions], block_rows)
+                    ):
+                        raise AssertionError("hierarchy block row missing from union")
+                    column = block_index * self.config.knot_count
+                    candidate[
+                        positions, column : column + self.config.knot_count
+                    ] = block.values[left:right]
+            batch_moments = moments_batch(
+                candidate_batch,
+                first,
+                second,
+                device=device,
+                return_second_gradient=baseline_only,
+            )
+            gradient += batch_moments[0][0]
+            hessian += batch_moments[1][0]
+            if len(indices):
+                if baseline_only:
+                    cross[0] += batch_moments[2][0]
+                else:
+                    active_design = self.engine.design_at_rows_with_context(
+                        self.context, current.matrix, rows
+                    )[:, indices]
+                    cross += active_design.T @ (
+                        second[:, None] * candidate_batch[0]
+                    )
+        if len(indices):
+            hessian = hessian - cross.T @ inverse @ cross
+        return gradient, hessian
+
     def _price_hierarchy_skeleton(
         self,
         current: SupportRecord,
@@ -1852,7 +2009,7 @@ class SupportOptimizer:
         *,
         device: str,
     ) -> dict[int, tuple[float, float, float, float, int, bool]]:
-        """Joint closure+rule prices for every W and both signs in one pass."""
+        """Joint closure+rule prices with one live W snapshot per block family."""
         requested = tuple(sorted(set(map(int, windows))))
         old_closure = set(current.matrix.closure)
         specifications: dict[int, tuple[tuple[ClosureTerm, ...], bool]] = {}
@@ -1877,225 +2034,42 @@ class SupportOptimizer:
         for window in nested_windows:
             for term in specifications[window][0]:
                 block_requests.setdefault(term.antecedent, set()).add(term.window)
-        blocks: dict[tuple[Antecedent, int], SparseBlock] = {}
+        fixed_blocks: dict[tuple[Antecedent, int], SparseBlock] = {}
+        streams = {}
         for block_antecedent, block_windows in sorted(block_requests.items()):
-            built = self.engine.blocks_many(
-                self.context,
-                block_antecedent,
-                tuple(sorted(block_windows)),
-                # A lower-order W family is reused as hierarchy nuisance by
-                # many higher-order skeletons.  Retain it under the bounded
-                # block LRU; the candidate's own losing W blocks are still
-                # transient.  This removes repeated pair reconstruction across
-                # triplets without changing a single response value.
-                retain=(block_antecedent != antecedent or len(block_windows) == 1),
-            )
-            blocks.update(
-                ((block_antecedent, window), block) for window, block in built.items()
-            )
-        maximal_blocks = [
-            blocks[(block_antecedent, max(block_windows))]
-            for block_antecedent, block_windows in sorted(block_requests.items())
-        ]
-        nonempty_rows = [block.rows for block in maximal_blocks if len(block.rows)]
-        maximum_rows = (
-            np.unique(np.concatenate(nonempty_rows))
-            if nonempty_rows
-            else np.zeros(0, dtype=np.int64)
-        )
-        row_lookup: np.ndarray | None = None
-        if self.context.n_grid <= max(64_000_000, 8 * len(maximum_rows)):
-            row_lookup = np.full(self.context.n_grid, -1, dtype=np.int32)
-            row_lookup[maximum_rows] = np.arange(
-                len(maximum_rows), dtype=np.int32
-            )
-        dimensions = {
-            window: (len(specifications[window][0]) + 1) * self.config.knot_count
-            for window in nested_windows
-        }
-        maximum_dimension = max(dimensions.values())
-        gradients = {
-            window: np.zeros(maximum_dimension, dtype=np.float64)
-            for window in nested_windows
-        }
-        hessians = {
-            window: np.zeros((maximum_dimension, maximum_dimension), dtype=np.float64)
-            for window in nested_windows
-        }
-        indices, inverse = self._pricing_components(current)
-        crosses = {
-            window: np.zeros((len(indices), maximum_dimension), dtype=np.float64)
-            for window in nested_windows
-        }
-        batch_size = len(nested_windows)
-        tile_rows = max(
-            1_024,
-            min(
-                65_536,
-                128 * 1024**2 // max(8, 8 * batch_size * maximum_dimension),
-            ),
-        )
-
-        def insert(
-            destination: np.ndarray,
-            rows: np.ndarray,
-            block: SparseBlock,
-            column: int,
-        ) -> None:
-            if not len(block.rows) or not len(rows):
-                return
-            left = int(np.searchsorted(block.rows, rows[0], side="left"))
-            right = int(np.searchsorted(block.rows, rows[-1], side="right"))
-            if right <= left:
-                return
-            block_rows = block.rows[left:right]
-            positions = (
-                row_lookup[block_rows].astype(np.int64, copy=False)
-                if row_lookup is not None
-                else np.searchsorted(rows, block_rows) + int(
-                    np.searchsorted(maximum_rows, rows[0])
+            ordered = tuple(sorted(block_windows))
+            if len(ordered) == 1:
+                fixed_blocks[(block_antecedent, ordered[0])] = self.engine.block(
+                    self.context, block_antecedent, ordered[0]
                 )
-            )
-            tile_origin = int(np.searchsorted(maximum_rows, rows[0]))
-            destination[
-                positions - tile_origin,
-                column : column + self.config.knot_count,
-            ] = block.values[left:right]
-
-        fill_blocks: list[tuple[np.ndarray, np.ndarray]] = []
-        fill_batches: list[int] = []
-        fill_columns: list[int] = []
-        for batch_index, window in enumerate(nested_windows):
-            closure = specifications[window][0]
-            for term_index, term in enumerate(closure):
-                block = blocks[(term.antecedent, term.window)]
-                fill_blocks.append((block.rows, block.values))
-                fill_batches.append(batch_index)
-                fill_columns.append(term_index * self.config.knot_count)
-            block = blocks[(antecedent, window)]
-            fill_blocks.append((block.rows, block.values))
-            fill_batches.append(batch_index)
-            fill_columns.append(len(closure) * self.config.knot_count)
-        fill_batch_array = np.asarray(fill_batches, dtype=np.int64)
-        fill_column_array = np.asarray(fill_columns, dtype=np.int64)
-
-        baseline_only = (
-            current.matrix.dimension == 1
-            and len(indices) == 1
-            and int(indices[0]) == 0
-        )
-        sparse_cells = sum(len(rows) * self.config.knot_count for rows, _ in fill_blocks)
-        dense_cells = batch_size * len(maximum_rows) * maximum_dimension
-        sparse_density = sparse_cells / max(1, dense_cells)
-        tile_starts: range | tuple[int, ...] = range(
-            0, len(maximum_rows), tile_rows
-        )
-        # This routing changes representation only.  Sparse intersection costs
-        # scale with nonzero block cells, whereas fused dense CUDA costs scale
-        # with the padded joint tensor.  Use the exact sparse algebra only when
-        # it removes at least 75% of those cells; both paths are parity-tested.
-        if baseline_only and row_lookup is not None and sparse_density <= 0.25:
-            _, all_first, all_second = self._pricing_rows(current, maximum_rows)
-            sparse_complete = True
-            for window in nested_windows:
-                closure = specifications[window][0]
-                joint_blocks = [
-                    (
-                        blocks[(term.antecedent, term.window)].rows,
-                        blocks[(term.antecedent, term.window)].values,
-                    )
-                    for term in closure
-                ]
-                rule_block = blocks[(antecedent, window)]
-                joint_blocks.append((rule_block.rows, rule_block.values))
-                sparse = sparse_joint_moments(
-                    joint_blocks, row_lookup, all_first, all_second
-                )
-                if sparse is None:
-                    sparse_complete = False
-                    break
-                gradient, hessian, cross = sparse
-                dimension = dimensions[window]
-                gradients[window][:dimension] = gradient
-                hessians[window][:dimension, :dimension] = hessian
-                crosses[window][0, :dimension] = cross
-            if sparse_complete:
-                tile_starts = ()
-
-        for start in tile_starts:
-            rows = maximum_rows[start : start + tile_rows]
-            _, first, second = self._pricing_rows(current, rows)
-            if baseline_only:
-                active_design = np.ones((len(rows), 1), dtype=np.float64)
-            elif len(indices):
-                active_design = self.engine.design_at_rows_with_context(
-                    self.context, current.matrix, rows
-                )[:, indices]
             else:
-                active_design = np.zeros((len(rows), 0), dtype=np.float64)
-            candidate_batch = np.zeros(
-                (batch_size, len(rows), maximum_dimension), dtype=np.float64
-            )
-            compiled_fill = fill_candidate_batch(
-                candidate_batch,
-                maximum_rows,
-                row_lookup,
-                fill_blocks,
-                fill_batch_array,
-                fill_column_array,
-                start,
-            )
-            if not compiled_fill:
-                for batch_index, window in enumerate(nested_windows):
-                    closure = specifications[window][0]
-                    for term_index, term in enumerate(closure):
-                        insert(
-                            candidate_batch[batch_index],
-                            rows,
-                            blocks[(term.antecedent, term.window)],
-                            term_index * self.config.knot_count,
-                        )
-                    insert(
-                        candidate_batch[batch_index],
-                        rows,
-                        blocks[(antecedent, window)],
-                        len(closure) * self.config.knot_count,
+                streams[block_antecedent] = iter(
+                    self.engine.iter_blocks_many(
+                        self.context,
+                        block_antecedent,
+                        ordered,
+                        retain=False,
                     )
-            batch_moments = moments_batch(
-                candidate_batch,
-                first,
-                second,
-                device=device,
-                return_second_gradient=baseline_only,
-            )
-            tile_gradients, tile_hessians = batch_moments[:2]
-            tile_crosses = np.zeros(
-                (batch_size, len(indices), maximum_dimension), dtype=np.float64
-            )
-            if len(indices):
-                if baseline_only:
-                    tile_crosses[:, 0, :] = batch_moments[2]
-                else:
-                    tile_crosses = np.einsum(
-                        "ri,r,brd->bid",
-                        active_design,
-                        second,
-                        candidate_batch,
-                        optimize=True,
-                    )
-            for batch_index, window in enumerate(nested_windows):
-                gradients[window] += tile_gradients[batch_index]
-                hessians[window] += tile_hessians[batch_index]
-                if len(indices):
-                    crosses[window] += tile_crosses[batch_index]
+                )
+
+        def block_for(block_antecedent: Antecedent, window: int) -> SparseBlock:
+            fixed = fixed_blocks.get((block_antecedent, window))
+            if fixed is not None:
+                return fixed
+            produced_window, block = next(streams[block_antecedent])
+            if produced_window != window:
+                raise AssertionError("nested W stream advanced out of order")
+            return block
 
         for window in nested_windows:
-            dimension = dimensions[window]
-            gradient = gradients[window][:dimension]
-            hessian = hessians[window][:dimension, :dimension]
-            if len(indices):
-                cross = crosses[window][:, :dimension]
-                hessian = hessian - cross.T @ inverse @ cross
+            closure = specifications[window][0]
+            joint_blocks = tuple(
+                block_for(term.antecedent, term.window) for term in closure
+            ) + (block_for(antecedent, window),)
+            gradient, hessian = self._joint_hierarchy_moments(
+                current, joint_blocks, device=device
+            )
+            dimension = len(joint_blocks) * self.config.knot_count
             closure_dimension = dimension - self.config.knot_count
             closure_gain, rule_gradient, rule_hessian, valid = (
                 self._profile_hierarchy_geometry(
@@ -2147,6 +2121,29 @@ class SupportOptimizer:
             self.diagnostics.fused_skeleton_pricing_passes += 1
         return output
 
+    def _pricing_task_memory_upper_bound(self, antecedent: Antecedent) -> int:
+        """Conservative live-byte bound for one streamed hierarchy price.
+
+        Pair pricing has one varying-W accumulator.  A triplet additionally
+        owns the three varying pair-closure accumulators.  Singleton closure
+        blocks are immutable LRU entries and therefore are not charged once per
+        task.  Per row we reserve completion metadata, threshold metadata, a
+        dense lookup, one accumulator and one live sparse snapshot.  The 25%
+        margin covers allocator alignment and temporary index arrays.
+        """
+        varying_families = 1 + (3 if len(antecedent) == 3 else 0)
+        per_row = (
+            20  # completion entity, time and span
+            + 16  # response row and minimum admitting span
+            + 4  # dense int32 row lookup
+            + 8 * self.config.knot_count  # incremental accumulator
+            + 8
+            + 8 * self.config.knot_count  # one sparse W snapshot
+        )
+        streamed = varying_families * self.context.n_grid * per_row
+        tiled_moments = 256 * 1024**2
+        return int(1.25 * streamed) + tiled_moments
+
     def _rank_block_identities(
         self, current: SupportRecord, identities: tuple[RuleIdentity, ...]
     ) -> list[tuple[float, float, RuleIdentity, bool]]:
@@ -2167,11 +2164,8 @@ class SupportOptimizer:
         ]
         devices = self.config.pricing_devices
         if devices:
-            # Each full-W hierarchy task retains exact nested block snapshots.
-            # Bound producer concurrency to half the physical cores so those
-            # snapshots cannot exhaust RAM; the remaining cores are available
-            # to BLAS/native work.  This scheduling bound changes neither the
-            # candidate family nor any accumulated float64 objective.
+            # Extra CPU producers feed the two GPUs.  The independent byte
+            # gate below, rather than this thread count, limits live scratch.
             worker_count = min(
                 self.config.pricing_workers,
                 max(len(devices), self.config.pricing_workers // 2),
@@ -2183,6 +2177,28 @@ class SupportOptimizer:
         else:
             worker_count = self.config.pricing_workers
             device_schedule = ("cpu",) * worker_count
+        task_bytes = {
+            antecedent: self._pricing_task_memory_upper_bound(antecedent)
+            for antecedent, _ in groups
+        }
+        # ``cache_bytes`` is the explicit run-level memory scale.  Treat one
+        # such unit as the scratch budget and admit tasks by their exact
+        # structural order.  Oversized tasks reserve the whole budget and run
+        # alone.  Scheduling never removes or changes a candidate.
+        configured_budget = max(512 * 1024**2, self.config.cache_bytes)
+        available_memory = _available_memory_bytes()
+        memory_budget = (
+            configured_budget
+            if available_memory is None
+            else min(configured_budget, max(512 * 1024**2, available_memory // 2))
+        )
+        memory_gate = _WeightedSemaphore(memory_budget)
+        with self._state_lock:
+            self.diagnostics.pricing_memory_budget_bytes = memory_gate.capacity
+            self.diagnostics.pricing_max_task_bytes = max(
+                self.diagnostics.pricing_max_task_bytes,
+                max(task_bytes.values(), default=0),
+            )
 
         def price_group(
             indexed: tuple[int, tuple[Antecedent, tuple[int, ...]]],
@@ -2193,20 +2209,29 @@ class SupportOptimizer:
             configure_cpu_threads(1)
             index, (antecedent, windows) = indexed
             device = device_schedule[index % len(device_schedule)]
-            return antecedent, self._price_hierarchy_skeleton(
-                current, antecedent, windows, device=device
-            )
+            reserved = memory_gate.acquire(task_bytes[antecedent])
+            try:
+                return antecedent, self._price_hierarchy_skeleton(
+                    current, antecedent, windows, device=device
+                )
+            finally:
+                memory_gate.release(reserved)
 
         if len(groups) > 1:
             with ThreadPoolExecutor(
-                # Two GPU feeders plus bounded CPU producers keep both devices
-                # busy without retaining a full W family on every core.
+                # Two GPU feeders plus byte-budgeted CPU producers keep both
+                # devices busy without materializing a full W family.
                 max_workers=min(worker_count, len(groups)),
                 thread_name_prefix="crbstpp-block-score",
             ) as executor:
                 component_items = list(executor.map(price_group, enumerate(groups)))
         else:
             component_items = [price_group(item) for item in enumerate(groups)]
+        with self._state_lock:
+            self.diagnostics.pricing_peak_reserved_bytes = max(
+                self.diagnostics.pricing_peak_reserved_bytes,
+                memory_gate.peak,
+            )
         components = dict(component_items)
         ranked: list[tuple[float, float, RuleIdentity, bool]] = []
         for rule in identities:
