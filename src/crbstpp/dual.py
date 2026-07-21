@@ -72,6 +72,77 @@ def dual_geometry(matrix: ModelMatrix) -> DualGeometry:
     return design_dual_geometry(matrix.x, matrix.free_dimension)
 
 
+def natural_dual_certificate(
+    dual: np.ndarray,
+    gradient: np.ndarray,
+    *,
+    free_dimension: int,
+    likelihood: str,
+    exposure_weight: np.ndarray,
+    noevent_weight: np.ndarray,
+    event_weight: np.ndarray,
+    tolerance: float,
+) -> DualCertificate:
+    """Check the likelihood-gradient dual without a projection pass.
+
+    At a primal point ``u = f'(X beta)`` already satisfies the conjugate domain
+    and Fenchel equality row by row.  ``gradient = X.T @ u`` therefore contains
+    every remaining dual constraint: free coordinates must be zero and cone
+    coordinates nonnegative.  Reusing it avoids another large design-matrix
+    multiplication after a conditional Newton step.
+    """
+    dual = np.asarray(dual, dtype=np.float64)
+    gradient = np.asarray(gradient, dtype=np.float64)
+    event_weight = np.asarray(event_weight, dtype=np.float64)
+    noevent_weight = np.asarray(noevent_weight, dtype=np.float64)
+    exposure_weight = np.asarray(exposure_weight, dtype=np.float64)
+    if (
+        dual.shape != event_weight.shape
+        or dual.shape != noevent_weight.shape
+        or dual.shape != exposure_weight.shape
+        or not 0 <= int(free_dimension) <= len(gradient)
+    ):
+        raise ValueError("natural dual state shape mismatch")
+    equality = (
+        float(np.max(np.abs(gradient[: int(free_dimension)])))
+        if free_dimension
+        else 0.0
+    )
+    inequality = (
+        float(np.min(gradient[int(free_dimension) :]))
+        if int(free_dimension) < len(gradient)
+        else math.inf
+    )
+    domain_margin = float(np.min(dual + event_weight)) if len(dual) else math.inf
+    if likelihood == "first_event_cloglog" and np.any(noevent_weight == 0.0):
+        domain_margin = min(
+            domain_margin,
+            float(np.min(-dual[noevent_weight == 0.0])),
+        )
+    value = conjugate_sum(
+        dual,
+        likelihood=likelihood,
+        exposure_weight=exposure_weight,
+        noevent_weight=noevent_weight,
+        event_weight=event_weight,
+    )
+    lower_bound = -value
+    feasible = bool(
+        math.isfinite(lower_bound)
+        and equality <= tolerance
+        and inequality >= -tolerance
+        and domain_margin >= -tolerance
+    )
+    return DualCertificate(
+        feasible,
+        lower_bound if feasible else -math.inf,
+        equality,
+        inequality,
+        domain_margin,
+        0,
+    )
+
+
 def _clip_domain(
     dual: np.ndarray,
     *,
@@ -194,6 +265,20 @@ def offset_dual_certificate(
     initial_inequality = float(np.min(cone.T @ dual)) if cone.shape[1] else math.inf
     if initial_equality <= tolerance and initial_inequality >= -tolerance:
         return make_certificate(dual, initial_equality, initial_inequality, 0)
+    if int(max_iter) <= 0:
+        # Natural-gradient dual checks are used by conditional one-step search.
+        # When the current point is not yet KKT-feasible, another primal Newton
+        # correction is substantially cheaper than constructing and iterating a
+        # candidate-specific N x rank projection.  Returning fail-open here
+        # preserves validity while avoiding that hidden full-matrix bottleneck.
+        return DualCertificate(
+            False,
+            -math.inf,
+            initial_equality,
+            initial_inequality,
+            -math.inf,
+            0,
+        )
     # Projection onto the free-column orthogonal complement used to build an
     # N x rank left-singular-vector matrix for every proposal.  The same exact
     # projection can be represented by the tiny, column-scaled Gram matrix.

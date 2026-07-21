@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import itertools
 import tempfile
 import unittest
 from pathlib import Path
@@ -17,7 +16,6 @@ from crbstpp.rules import (
     RuleIdentity,
     Support,
     hierarchy_closure,
-    one_exchange_neighbors,
 )
 from crbstpp.search import SupportOptimizer, support_key
 from crbstpp.solver import fit_model_matrix, fit_model_matrix_continued
@@ -183,7 +181,7 @@ class LikelihoodSolverTests(unittest.TestCase):
             self.assertTrue(certificate.feasible)
             self.assertLessEqual(certificate.nll_lower_bound, fit.nll + 1e-6)
 
-    def test_small_block_search_matches_exhaustive_stationary_reference(self) -> None:
+    def test_small_block_search_has_exact_conditional_score_terminals(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             data = synthetic_dataset(Path(directory) / "data")
             fit_codes, _, _ = data.split((0.6, 0.2, 0.2), 111)
@@ -241,43 +239,40 @@ class LikelihoodSolverTests(unittest.TestCase):
                     len(record.support.antecedents),
                     len(set(record.support.antecedents)),
                 )
-            empty = optimizer.records[Support(())]
-            groups = [
-                [
-                    None,
-                    *[
-                        rule
-                        for rule in optimizer.dictionary
-                        if rule.antecedent == antecedent
-                    ],
-                ]
-                for antecedent in optimizer.skeletons
-            ]
-            supports = [
-                Support.of(rule for rule in choice if rule is not None)
-                for choice in itertools.product(*groups)
-            ]
-            exhaustive = [
-                record
-                for record in optimizer.fit_many(supports, empty)
-                if record.fit.converged
-            ]
-            best = max(exhaustive, key=lambda record: record.score)
             for terminal in result.terminals:
+                self.assertTrue(terminal.fit.converged, terminal.fit.message)
                 self.assertIsNone(optimizer._best_profiled_move(terminal))
-                neighbours = optimizer.fit_many(
-                    list(one_exchange_neighbors(terminal.support, optimizer.dictionary)),
-                    terminal,
+                inactive = tuple(
+                    rule
+                    for rule in (optimizer._profiled_dictionary or ())
+                    if rule.antecedent not in terminal.support.antecedents
                 )
-                self.assertFalse(
-                    any(
-                        record.fit.converged
-                        and record.score
-                        > terminal.score + config.search_tolerance
-                        for record in neighbours
+                score_admissible = tuple(
+                    item[2]
+                    for item in optimizer._rank_profiled_identities(
+                        terminal, inactive
                     )
+                    if item[0] > config.search_tolerance
                 )
-                self.assertAlmostEqual(terminal.score, best.score, places=8)
+                trials = [terminal.support.add(rule) for rule in score_admissible]
+                trials.extend(
+                    terminal.support.drop(rule) for rule in terminal.support.rules
+                )
+                for trial in trials:
+                    proposal = optimizer._conditional_one_step(terminal, trial)
+                    self.assertLessEqual(
+                        proposal.lower_score,
+                        terminal.score + config.search_tolerance,
+                    )
+                    exact = optimizer.fit(trial, terminal)
+                    if exact.fit.converged:
+                        slack = 1e-6 * max(1.0, abs(exact.score))
+                        self.assertLessEqual(
+                            proposal.lower_score, exact.score + slack
+                        )
+                        self.assertGreaterEqual(
+                            proposal.upper_score + slack, exact.score
+                        )
 
     def test_parallel_search_matches_serial_family(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

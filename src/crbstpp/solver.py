@@ -38,6 +38,15 @@ class FitResult:
         }
 
 
+@dataclass(frozen=True)
+class OneStepState:
+    """Feasible Newton point plus derivatives reused by its dual check."""
+
+    fit: FitResult
+    dual_vector: np.ndarray
+    gradient: np.ndarray
+
+
 def _objective(
     matrix: ModelMatrix,
     likelihood: str,
@@ -248,6 +257,191 @@ def _failed_fit(
 
 def _checked_rank(hessian: np.ndarray) -> int:
     return int(np.linalg.matrix_rank(hessian))
+
+
+def one_step_model_matrix(
+    matrix: ModelMatrix,
+    *,
+    likelihood: str,
+    warm_start: np.ndarray,
+    tolerance: float,
+    device: str = "cpu",
+) -> OneStepState:
+    """Take exactly one feasible projected-Newton step on a full support.
+
+    This routine is deliberately *not* an optimizer.  It supplies a cheap,
+    feasible primal point for conditional add/drop proposals.  Callers attach a
+    Fenchel certificate to the returned point and keep it outside the exact-fit
+    cache.  Consequently a one-step proposal can never be mistaken for a
+    converged fixed-support estimator.
+
+    The step is the same active-set Newton direction and monotone Armijo search
+    used by :func:`fit_model_matrix`.  If the warm point already satisfies KKT,
+    it is returned unchanged, but ``converged`` remains false by construction;
+    only the full solver may create an exact cached result.
+    """
+    beta = np.asarray(warm_start, dtype=np.float64).copy()
+    if beta.shape != (matrix.dimension,) or not np.all(np.isfinite(beta)):
+        raise ValueError("one-step warm start does not match the model matrix")
+    if matrix.dimension > matrix.free_dimension:
+        beta[matrix.free_dimension :] = np.maximum(
+            beta[matrix.free_dimension :], 0.0
+        )
+    nll, gradient, hessian, _ = _objective(
+        matrix, likelihood, beta, device=device
+    )
+    if not (
+        math.isfinite(nll)
+        and np.all(np.isfinite(gradient))
+        and np.all(np.isfinite(hessian))
+    ):
+        return OneStepState(
+            FitResult(
+                beta,
+                math.inf,
+                False,
+                0,
+                math.inf,
+                0,
+                False,
+                "nonfinite conditional one-step derivatives",
+            ),
+            np.zeros(len(matrix.x), dtype=np.float64),
+            np.full(matrix.dimension, math.inf, dtype=np.float64),
+        )
+    initial_kkt = projected_kkt(beta, gradient, matrix.free_dimension)
+    if initial_kkt <= tolerance:
+        eta = matrix.x @ beta
+        _, dual_vector, _ = loss_rows(
+            eta,
+            likelihood=likelihood,
+            exposure_weight=matrix.exposure_weight,
+            noevent_weight=matrix.noevent_weight,
+            event_weight=matrix.event_weight,
+        )
+        return OneStepState(
+            FitResult(
+                beta,
+                nll,
+                False,
+                0,
+                initial_kkt,
+                _checked_rank(hessian),
+                False,
+                "conditional one-step warm point already satisfies KKT",
+            ),
+            np.asarray(dual_vector, dtype=np.float64),
+            gradient,
+        )
+
+    active = np.arange(matrix.dimension) < matrix.free_dimension
+    active |= (beta > 1.0e-12) | (gradient < 0.0)
+    indices = np.flatnonzero(active)
+    if not len(indices):
+        eta = matrix.x @ beta
+        _, dual_vector, _ = loss_rows(
+            eta,
+            likelihood=likelihood,
+            exposure_weight=matrix.exposure_weight,
+            noevent_weight=matrix.noevent_weight,
+            event_weight=matrix.event_weight,
+        )
+        return OneStepState(
+            FitResult(
+                beta,
+                nll,
+                False,
+                0,
+                initial_kkt,
+                0,
+                False,
+                "empty conditional one-step active set",
+            ),
+            np.asarray(dual_vector, dtype=np.float64),
+            gradient,
+        )
+    sub_hessian = hessian[np.ix_(indices, indices)]
+    try:
+        active_direction = np.linalg.solve(sub_hessian, -gradient[indices])
+    except np.linalg.LinAlgError:
+        active_direction = np.linalg.lstsq(
+            sub_hessian, -gradient[indices], rcond=None
+        )[0]
+    direction = np.zeros(matrix.dimension, dtype=np.float64)
+    direction[indices] = active_direction
+    if float(gradient @ direction) >= 0.0:
+        direction = -gradient
+        direction[matrix.free_dimension :] = np.where(
+            (beta[matrix.free_dimension :] <= 1.0e-12)
+            & (direction[matrix.free_dimension :] < 0.0),
+            0.0,
+            direction[matrix.free_dimension :],
+        )
+    step = 1.0
+    accepted = False
+    for _ in range(60):
+        trial = beta + step * direction
+        trial[matrix.free_dimension :] = np.maximum(
+            trial[matrix.free_dimension :], 0.0
+        )
+        trial_nll = _value(matrix, likelihood, trial)
+        displacement = trial - beta
+        if math.isfinite(trial_nll) and trial_nll <= nll + 1.0e-4 * float(
+            gradient @ displacement
+        ):
+            beta = trial
+            accepted = True
+            break
+        step *= 0.5
+    if not accepted:
+        eta = matrix.x @ beta
+        _, dual_vector, _ = loss_rows(
+            eta,
+            likelihood=likelihood,
+            exposure_weight=matrix.exposure_weight,
+            noevent_weight=matrix.noevent_weight,
+            event_weight=matrix.event_weight,
+        )
+        return OneStepState(
+            FitResult(
+                beta,
+                nll,
+                False,
+                0,
+                initial_kkt,
+                _checked_rank(hessian),
+                False,
+                "conditional one-step line search failed",
+            ),
+            np.asarray(dual_vector, dtype=np.float64),
+            gradient,
+        )
+
+    final_nll, final_gradient, final_hessian, final_eta = _objective(
+        matrix, likelihood, beta, device=device
+    )
+    _, dual_vector, _ = loss_rows(
+        final_eta,
+        likelihood=likelihood,
+        exposure_weight=matrix.exposure_weight,
+        noevent_weight=matrix.noevent_weight,
+        event_weight=matrix.event_weight,
+    )
+    final_kkt = projected_kkt(beta, final_gradient, matrix.free_dimension)
+    return OneStepState(
+        FitResult(
+            beta,
+            final_nll,
+            False,
+            1,
+            final_kkt,
+            _checked_rank(final_hessian),
+            False,
+            "conditional one-step feasible point",
+        ),
+        np.asarray(dual_vector, dtype=np.float64),
+        final_gradient,
+    )
 
 
 def fit_model_matrix(

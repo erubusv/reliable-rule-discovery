@@ -32,7 +32,7 @@ from crbstpp.native import (
 from crbstpp.response import Context, ResponseEngine
 from crbstpp.config import RunConfig
 from crbstpp.data import Dataset, write_dataset
-from crbstpp.dual import offset_dual_certificate
+from crbstpp.dual import natural_dual_certificate, offset_dual_certificate
 from crbstpp.rules import RuleIdentity, Support, hierarchy_closure
 from crbstpp.search import (
     SupportOptimizer,
@@ -52,6 +52,120 @@ from tests.crbstpp.test_core import synthetic_dataset
 
 
 class NumericalParityTests(unittest.TestCase):
+    def test_natural_dual_reuses_exact_kkt_derivatives(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            data = synthetic_dataset(Path(directory) / "data", 120)
+            context = Context.make(data, np.arange(data.n_entities, dtype=np.int32))
+            engine = ResponseEngine(data, lag=3, knot_count=2, cache_bytes=8 * 1024**2)
+            matrix = engine.model_matrix(
+                context, Support.of((RuleIdentity((0,), 0, 1),))
+            )
+            fit = fit_model_matrix(
+                matrix,
+                likelihood=data.likelihood,
+                tolerance=1e-9,
+                max_iter=150,
+            )
+            self.assertTrue(fit.converged, fit.message)
+            nll, gradient, _, eta = _objective(
+                matrix, data.likelihood, fit.coefficients
+            )
+            _, dual, _ = loss_rows(
+                eta,
+                likelihood=data.likelihood,
+                exposure_weight=matrix.exposure_weight,
+                noevent_weight=matrix.noevent_weight,
+                event_weight=matrix.event_weight,
+            )
+            certificate = natural_dual_certificate(
+                dual,
+                gradient,
+                free_dimension=matrix.free_dimension,
+                likelihood=data.likelihood,
+                exposure_weight=matrix.exposure_weight,
+                noevent_weight=matrix.noevent_weight,
+                event_weight=matrix.event_weight,
+                tolerance=1e-8,
+            )
+            self.assertTrue(certificate.feasible)
+            self.assertLessEqual(certificate.nll_lower_bound, nll + 1e-7)
+            self.assertAlmostEqual(certificate.nll_lower_bound, nll, places=6)
+
+    def test_conditional_one_step_intervals_contain_exact_add_and_drop(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            data = synthetic_dataset(Path(directory) / "data", 120)
+            fit_codes, _, _ = data.split((0.6, 0.2, 0.2), 111)
+            config = RunConfig(
+                dataset=str(data.root),
+                q_max=2,
+                impact_lag=3,
+                knot_count=2,
+                formation_windows=(0, 1, 2),
+                solver_tolerance=1e-8,
+                solver_max_iter=150,
+                cache_bytes=32 * 1024**2,
+                early_warning_horizon=3,
+                pricing_devices=(),
+            )
+            optimizer = SupportOptimizer(Context.make(data, fit_codes), config)
+            empty = optimizer.records[Support(())]
+            a = RuleIdentity((0,), 0, 1)
+            b = RuleIdentity((1,), 0, 1)
+            current = optimizer.fit(Support.of((a,)), empty)
+
+            add_support = current.support.add(b)
+            add = optimizer._conditional_one_step(current, add_support)
+            self.assertFalse(add.record.fit.converged)
+            self.assertNotIn(add_support, optimizer._stored_records)
+            exact_add = optimizer.fit(add_support, current)
+            self.assertTrue(exact_add.fit.converged, exact_add.fit.message)
+            slack = 1e-6 * max(1.0, abs(exact_add.score))
+            self.assertLessEqual(add.lower_score, exact_add.score + slack)
+            self.assertGreaterEqual(add.upper_score + slack, exact_add.score)
+
+            drop_support = exact_add.support.drop(a)
+            drop = optimizer._conditional_one_step(exact_add, drop_support)
+            self.assertFalse(drop.record.fit.converged)
+            self.assertNotIn(drop_support, optimizer._stored_records)
+            exact_drop = optimizer.fit(drop_support, exact_add)
+            self.assertTrue(exact_drop.fit.converged, exact_drop.fit.message)
+            slack = 1e-6 * max(1.0, abs(exact_drop.score))
+            self.assertLessEqual(drop.lower_score, exact_drop.score + slack)
+            self.assertGreaterEqual(drop.upper_score + slack, exact_drop.score)
+
+    def test_search_caches_only_exact_terminal_corrections(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            data = synthetic_dataset(Path(directory) / "data", 90)
+            fit_codes, _, _ = data.split((0.6, 0.2, 0.2), 111)
+            config = RunConfig(
+                dataset=str(data.root),
+                q_max=2,
+                impact_lag=3,
+                knot_count=2,
+                formation_windows=(0, 1, 2),
+                solver_tolerance=1e-8,
+                solver_max_iter=150,
+                cache_bytes=32 * 1024**2,
+                early_warning_horizon=3,
+                pricing_devices=(),
+            )
+            optimizer = SupportOptimizer(Context.make(data, fit_codes), config)
+            result = optimizer.search()
+            self.assertGreater(result.diagnostics.conditional_one_steps, 0)
+            self.assertGreater(result.diagnostics.conditional_full_refits_avoided, 0)
+            self.assertTrue(all(item.fit.converged for item in result.terminals))
+            self.assertTrue(
+                all(item.fit.converged for item in result.family),
+                "a conditional path state leaked into the certification family",
+            )
+            self.assertTrue(
+                all("terminal_block_audit" in path for path in result.paths)
+            )
+            for path in result.paths:
+                for item in path["terminal_block_audit"]:
+                    self.assertIn(item["move"], {"add", "drop"})
+                    self.assertFalse(item["primal_improves"])
+
     def test_vectorized_axis_recession_matches_coordinate_reference(self) -> None:
         rng = np.random.default_rng(781)
 

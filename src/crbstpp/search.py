@@ -17,6 +17,7 @@ from .dual import (
     DualGeometry,
     dual_certificate,
     dual_geometry,
+    natural_dual_certificate,
     offset_dual_certificate,
 )
 from .likelihood import loss_rows
@@ -50,9 +51,11 @@ from .rules import (
 )
 from .solver import (
     FitResult,
+    OneStepState,
     fit_model_matrix,
     fit_model_matrix_continued,
     fit_offset_design_continued,
+    one_step_model_matrix,
 )
 
 
@@ -75,6 +78,28 @@ class _RestrictedAddBounds:
     lower_gain: float
     upper_gain: float
     dual: DualCertificate | None
+
+
+@dataclass(frozen=True)
+class _ConditionalProposal:
+    """One feasible full-support Newton step and its exact-optimum sandwich."""
+
+    record: SupportRecord
+    lower_score: float
+    upper_score: float
+    certificate: DualCertificate | None
+
+    @property
+    def score_gap(self) -> float:
+        return max(0.0, float(self.upper_score - self.lower_score))
+
+
+@dataclass(frozen=True)
+class _ConditionalAudit:
+    lower_score: float
+    upper_score: float
+    certificate_feasible: bool
+    projected_kkt: float
 
 
 @dataclass(frozen=True)
@@ -209,6 +234,19 @@ class SearchDiagnostics:
     ragged_gpu_candidates: int = 0
     ragged_gpu_fail_open: int = 0
     nonattained_exact_rejections: int = 0
+    conditional_one_steps: int = 0
+    conditional_certificate_successes: int = 0
+    conditional_certificate_failures: int = 0
+    conditional_certified_rejections: int = 0
+    conditional_unresolved_rejections: int = 0
+    conditional_add_audits: int = 0
+    conditional_drop_audits: int = 0
+    terminal_exact_refits: int = 0
+    terminal_exact_corrections: int = 0
+    cycle_exact_corrections: int = 0
+    conditional_full_refits_avoided: int = 0
+    maximum_conditional_score_gap: float = 0.0
+    maximum_unresolved_score_gap: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -304,20 +342,20 @@ def _nonnegative_quadratic_solution(
 
 
 class SupportOptimizer:
-    """Exact fixed-support fits with profiled rule-block score search.
+    """Exact terminal fits with profiled conditional one-step support search.
 
     Each antecedent skeleton that survives an exact-safe upper bound owns one
     W/sign identity profiled against the D_fit baseline.  Deferred skeletons
     receive that identical baseline profile if a later support can make any of
     their identities relevant.  Empty and every objective-admissible
     single-skeleton root then ascend a shared support DAG.  Every
-    score-positive inactive identity is either removed by a verified upper bound
-    or receives a restricted exact audit; every active drop is audited exactly.
-    Every accepted move improves the fully refitted MDL objective.  Positive
-    atoms and all unique terminals reach certification.  The terminal claim is
-    frozen-dictionary block-score restricted add/drop stationarity, with every
-    unresolved identity safely certified non-improving at a terminal; it is not
-    exact one-exchange stationarity or a global optimum.
+    score-positive add and every active drop receives a feasible conditional
+    Newton step plus a candidate-specific Fenchel error interval.  Intermediate
+    path states are never entered into the exact cache.  A provisional terminal
+    is fully optimized once and repriced; only an exact KKT point with no
+    improving conditional add/drop step reaches certification.  The resulting
+    claim is frozen-dictionary conditional block-score stationarity, not exact
+    one-exchange stationarity or a global optimum.
     """
 
     def __init__(self, context: Context, config: RunConfig):
@@ -398,6 +436,14 @@ class SupportOptimizer:
         self._restricted_add_events: dict[
             tuple[Support, Antecedent, int], threading.Event
         ] = {}
+        # Conditional audits are path-state specific: the same support can be
+        # reached with different one-step coefficients from different roots.
+        # Only scalar intervals are retained; candidate ModelMatrix objects stay
+        # local so this report cache cannot grow by gigabytes.
+        self._conditional_audits: dict[
+            tuple[int, Support], _ConditionalAudit
+        ] = {}
+        self._conditional_forbidden: set[Support] = set()
         self._restricted_geometries: OrderedDict[
             tuple[tuple[ClosureTerm, ...], Antecedent, int],
             _RestrictedGeometry | None,
@@ -471,6 +517,7 @@ class SupportOptimizer:
         self._restricted_drop_scores.clear()
         self._restricted_add_problems.clear()
         self._restricted_add_events.clear()
+        self._conditional_audits.clear()
         self._restricted_geometries.clear()
         self._restricted_geometry_events.clear()
         self._restricted_geometry_bytes = 0
@@ -502,6 +549,7 @@ class SupportOptimizer:
         self._restricted_drop_scores.clear()
         self._restricted_add_problems.clear()
         self._restricted_add_events.clear()
+        self._conditional_audits.clear()
         self._restricted_geometries.clear()
         self._restricted_geometry_events.clear()
         self._restricted_geometry_bytes = 0
@@ -603,14 +651,315 @@ class SupportOptimizer:
             origin = source_closure.get(term)
             if origin is not None:
                 output[destination] = source.fit.coefficients[origin]
+                continue
+            # Dropping a reported lower-order rule can promote its identical
+            # unsigned response block to free hierarchy nuisance.  Mapping the
+            # signed coefficient preserves the current predictor exactly.
+            promoted = next(
+                (
+                    (rule, block)
+                    for rule, block in source_rules.items()
+                    if rule.antecedent == term.antecedent
+                    and rule.window == term.window
+                ),
+                None,
+            )
+            if promoted is not None:
+                rule, block = promoted
+                output[destination] = (
+                    float(rule.sign) * source.fit.coefficients[block]
+                )
         for rule, destination in target_rules.items():
             origin = source_rules.get(rule)
             if origin is not None:
                 output[destination] = source.fit.coefficients[origin]
+                continue
+            # Conversely, reporting a block that was previously free nuisance
+            # is predictor preserving whenever its coefficient has the chosen
+            # sign.  Opposite-signed components project to the cone boundary.
+            nuisance = source_closure.get(
+                ClosureTerm(rule.antecedent, rule.window)
+            )
+            if nuisance is not None:
+                output[destination] = np.maximum(
+                    float(rule.sign) * source.fit.coefficients[nuisance], 0.0
+                )
         output[target.free_dimension :] = np.maximum(
             output[target.free_dimension :], 0.0
         )
         return output
+
+    def _discard_support_pricing_state(self, support: Support) -> None:
+        """Discard coefficient-dependent caches before reusing a support key.
+
+        Exact fits are canonical by support, whereas a conditional path state is
+        intentionally path dependent.  The response blocks and safe structural
+        bounds remain reusable; only quantities that depend on fitted
+        coefficients are removed.
+        """
+        with self._state_lock:
+            pricing = self._pricing_state.pop(support, None)
+            if pricing is not None:
+                self._pricing_cache_bytes -= pricing[0].nbytes + pricing[1].nbytes
+            eta = self._row_eta_state.pop(support, None)
+            if eta is not None:
+                self._row_eta_cache_bytes -= eta.nbytes
+            for key in tuple(self._block_price_cache):
+                if key[0] == support:
+                    self._block_price_cache.pop(key, None)
+            for key in tuple(self._hierarchy_rule_geometries):
+                if key[0] == support:
+                    self._hierarchy_rule_geometries.pop(key, None)
+            self._restricted_add_scores.pop(support, None)
+            self._restricted_add_fits.pop(support, None)
+            self._restricted_add_bounds.pop(support, None)
+            self._restricted_drop_scores.pop(support, None)
+            self._restricted_add_problems.pop(support, None)
+            for key in tuple(self._reliability_prices):
+                if key[0] == support:
+                    self._reliability_prices.pop(key, None)
+
+    def _conditional_matrix_and_warm(
+        self, current: SupportRecord, trial: Support
+    ) -> tuple[ModelMatrix, np.ndarray]:
+        """Build one neighboring support and embed the current feasible point."""
+        if set(current.support.rules).issubset(trial.rules) and set(
+            current.matrix.closure
+        ).issubset(hierarchy_closure(trial)):
+            matrix = self.engine.extend_model_matrix(
+                self.context, trial, current.matrix
+            )
+        else:
+            # Projected null matrices intentionally omit grid-to-group lookup
+            # metadata and are suitable only for an isolated fit.  A path state
+            # must retain that metadata for the next sparse pricing pass, so a
+            # drop or a hierarchy promotion uses the canonical matrix here.
+            matrix = self.engine.model_matrix(self.context, trial)
+        return matrix, self.warm_start(current, matrix)
+
+    def _conditional_one_step(
+        self,
+        current: SupportRecord,
+        trial: Support,
+        *,
+        device: str | None = None,
+    ) -> _ConditionalProposal:
+        """Return a candidate-specific primal/dual MDL interval after one step.
+
+        ``record.score`` is the MDL of an actual feasible parameter vector and
+        is therefore a lower bound on the fully optimized support score.  A
+        feasible Fenchel dual gives the matching upper bound.  This proposal is
+        deliberately excluded from ``records`` and ``_stored_records``.
+        """
+        matrix, warm = self._conditional_matrix_and_warm(current, trial)
+        step = one_step_model_matrix(
+            matrix,
+            likelihood=self.context.dataset.likelihood,
+            warm_start=warm,
+            tolerance=self.config.solver_tolerance,
+            device=device or (self.config.pricing_devices or ("cpu",))[0],
+        )
+        proposal = self._certify_conditional_step(trial, matrix, step)
+        with self._state_lock:
+            self._conditional_audits[(id(current), trial)] = _ConditionalAudit(
+                lower_score=proposal.lower_score,
+                upper_score=proposal.upper_score,
+                certificate_feasible=proposal.certificate is not None,
+                projected_kkt=proposal.record.fit.projected_kkt,
+            )
+        return proposal
+
+    def _certify_conditional_step(
+        self, trial: Support, matrix: ModelMatrix, state: OneStepState
+    ) -> _ConditionalProposal:
+        """Attach a verified full-support MDL interval to one feasible step."""
+        step = state.fit
+        penalty = self.objective.penalty(
+            trial, matrix, self.baseline_dimension
+        )
+        valid_primal = math.isfinite(step.nll) and step.rank == matrix.dimension
+        lower_score = (
+            support_score(
+                baseline_nll=self.baseline_nll,
+                fit_nll=step.nll,
+                penalty=penalty,
+            )
+            if valid_primal
+            else -math.inf
+        )
+        certificate: DualCertificate | None = None
+        upper_score = self.safe_upper_score(trial)
+        if valid_primal:
+            attempted = natural_dual_certificate(
+                state.dual_vector,
+                state.gradient,
+                free_dimension=matrix.free_dimension,
+                likelihood=self.context.dataset.likelihood,
+                exposure_weight=matrix.exposure_weight,
+                noevent_weight=matrix.noevent_weight,
+                event_weight=matrix.event_weight,
+                # A fixed float64 feasibility tolerance avoids demanding a
+                # projection residual orders of magnitude below the solver's
+                # accumulated matrix-product error on large sparse grids.
+                tolerance=max(1.0e-9, self.config.solver_tolerance),
+            )
+            slack = 1.0e-7 * max(1.0, abs(step.nll))
+            if (
+                attempted.feasible
+                and attempted.nll_lower_bound <= step.nll + slack
+            ):
+                certificate = attempted
+                dual_upper = support_score(
+                    baseline_nll=self.baseline_nll,
+                    # Numerical dual feasibility is checked to float64
+                    # tolerance rather than exact arithmetic.  Moving the NLL
+                    # bound downward by the same sandwich slack keeps the MDL
+                    # endpoint conservative under accumulated dot-product error.
+                    fit_nll=attempted.nll_lower_bound - slack,
+                    penalty=penalty,
+                )
+                upper_score = min(upper_score, dual_upper)
+        consistency = 1.0e-7 * max(
+            1.0,
+            abs(lower_score) if math.isfinite(lower_score) else 1.0,
+            abs(upper_score) if math.isfinite(upper_score) else 1.0,
+        )
+        if upper_score + consistency < lower_score:
+            # A numerically inconsistent certificate cannot participate in a
+            # decision.  The independently valid structural relaxation remains
+            # as a fail-open upper bound.
+            certificate = None
+            upper_score = self.safe_upper_score(trial)
+        state_fit = FitResult(
+            coefficients=step.coefficients,
+            nll=step.nll,
+            converged=False,
+            iterations=step.iterations,
+            projected_kkt=step.projected_kkt,
+            rank=step.rank,
+            recession=False,
+            message="conditional one-step path state",
+        )
+        record = SupportRecord(trial, matrix, state_fit, penalty, lower_score)
+        proposal = _ConditionalProposal(
+            record=record,
+            lower_score=lower_score,
+            upper_score=max(lower_score, upper_score),
+            certificate=certificate,
+        )
+        with self._state_lock:
+            self.diagnostics.conditional_one_steps += 1
+            if certificate is None:
+                self.diagnostics.conditional_certificate_failures += 1
+            else:
+                self.diagnostics.conditional_certificate_successes += 1
+            self.diagnostics.maximum_conditional_score_gap = max(
+                self.diagnostics.maximum_conditional_score_gap,
+                proposal.score_gap,
+            )
+        return proposal
+
+    def _exactify_path_state(self, current: SupportRecord) -> SupportRecord:
+        """Fully optimize one provisional terminal and only then cache it."""
+        if current.fit.converged:
+            return current
+        with self._state_lock:
+            stored = self._stored_records.get(current.support)
+        if stored is not None and stored.fit.converged:
+            record = SupportRecord(
+                current.support,
+                current.matrix,
+                stored.fit,
+                stored.penalty,
+                stored.score,
+            )
+            with self._state_lock:
+                self.diagnostics.fit_cache_hits += 1
+                self.diagnostics.terminal_exact_refits += 1
+                return self._retain_record(record)
+        fit = fit_model_matrix_continued(
+            current.matrix,
+            likelihood=self.context.dataset.likelihood,
+            tolerance=self.config.solver_tolerance,
+            max_iter=self.config.solver_max_iter,
+            warm_start=current.fit.coefficients,
+            device=(self.config.pricing_devices or ("cpu",))[0],
+        )
+        score = (
+            support_score(
+                baseline_nll=self.baseline_nll,
+                fit_nll=fit.nll,
+                penalty=current.penalty,
+            )
+            if fit.converged
+            else -math.inf
+        )
+        record = SupportRecord(
+            current.support, current.matrix, fit, current.penalty, score
+        )
+        with self._state_lock:
+            self.diagnostics.terminal_exact_refits += 1
+            self.diagnostics.exact_fits += 1
+            if fit.converged:
+                self._stored_records[current.support] = _StoredRecord(
+                    fit, current.penalty, score
+                )
+                return self._retain_record(record)
+        return record
+
+    def _conditional_audit_summary(
+        self, current: SupportRecord
+    ) -> tuple[dict[str, object], ...]:
+        """Serialize candidate-level error intervals for a terminal report."""
+        entries: list[dict[str, object]] = []
+        with self._state_lock:
+            proposals = [
+                (trial, audit)
+                for (record_id, trial), audit in self._conditional_audits.items()
+                if record_id == id(current)
+            ]
+        current_rules = set(current.support.rules)
+        for trial, audit in sorted(proposals, key=lambda item: item[0].rules):
+            trial_rules = set(trial.rules)
+            if len(trial_rules) > len(current_rules):
+                move = "add"
+                changed = sorted(trial_rules - current_rules)
+            else:
+                move = "drop"
+                changed = sorted(current_rules - trial_rules)
+            lower = float(audit.lower_score)
+            upper = float(audit.upper_score)
+            gap = max(0.0, upper - lower)
+            kkt = float(audit.projected_kkt)
+            entries.append(
+                {
+                    "move": move,
+                    "rules": [
+                        {
+                            "antecedent": list(rule.antecedent),
+                            "window": int(rule.window),
+                            "sign": int(rule.sign),
+                        }
+                        for rule in changed
+                    ],
+                    "trial": support_key(trial),
+                    "lower_score": lower if math.isfinite(lower) else None,
+                    "upper_score": upper if math.isfinite(upper) else None,
+                    "score_gap": gap if math.isfinite(gap) else None,
+                    "incumbent_score": float(current.score),
+                    "primal_improves": bool(
+                        audit.lower_score
+                        > current.score + self.config.search_tolerance
+                    ),
+                    "certified_nonimproving": bool(
+                        audit.upper_score
+                        <= current.score + self.config.search_tolerance
+                    ),
+                    "certificate_feasible": audit.certificate_feasible,
+                    "projected_kkt": kkt if math.isfinite(kkt) else None,
+                }
+            )
+        return tuple(entries)
 
     def _project_nested_matrix(
         self,
@@ -3272,6 +3621,140 @@ class SupportOptimizer:
                 self._directional_upper_cache.popitem(last=False)
         return tuple(survivors)
 
+    def _best_conditional_addition(
+        self,
+        current: SupportRecord,
+        *,
+        antecedents: set[Antecedent],
+    ) -> SupportRecord | None:
+        """Select the best feasible conditional one-step add proposal.
+
+        Fisher pricing and the exact-safe structural relaxation are screening
+        layers only.  Every surviving skeleton receives one full-support Newton
+        step and its own primal/dual error interval.  The move uses the feasible
+        lower endpoint; an interval that still overlaps the incumbent is
+        recorded as the deliberate block-score (rather than exact-neighbour)
+        approximation.
+        """
+        acceptance = current.score
+        identities = self._inactive_identities(current.support, antecedents)
+        ranked = self._rank_profiled_identities(current, identities)
+        admissible = [
+            item for item in ranked if item[0] > self.config.search_tolerance
+        ]
+        if not admissible:
+            return None
+        rules = tuple(item[2] for item in admissible)
+        safe = set(self._safe_identity_survivors(current, rules, acceptance))
+        admissible = [item for item in admissible if item[2] in safe]
+        if not admissible:
+            return None
+        admissible_rules = self._reliability_survivors(
+            current, tuple(item[2] for item in admissible)
+        )
+        allowed = set(admissible_rules)
+        viable = [
+            (self.safe_upper_score(current.support.add(rule)), net, rule)
+            for net, _, rule in admissible
+            if rule in allowed
+            and current.support.add(rule) not in self._conditional_forbidden
+        ]
+        viable.sort(key=lambda item: (-item[0], -item[1], item[2]))
+        devices = self.config.pricing_devices or ("cpu",)
+        best: _ConditionalProposal | None = None
+        best_rule: RuleIdentity | None = None
+        audited = 0
+        for index, (analytic_upper, _, rule) in enumerate(viable):
+            incumbent = acceptance if best is None else best.lower_score
+            if analytic_upper <= incumbent + self.config.search_tolerance:
+                with self._state_lock:
+                    skipped = len(viable) - index
+                    self.diagnostics.lazy_exact_refits_avoided += skipped
+                    self.diagnostics.conditional_full_refits_avoided += skipped
+                    self.diagnostics.lazy_bound_stops += 1
+                break
+            proposal = self._conditional_one_step(
+                current,
+                current.support.add(rule),
+                device=devices[audited % len(devices)],
+            )
+            audited += 1
+            if proposal.upper_score <= acceptance + self.config.search_tolerance:
+                with self._state_lock:
+                    self.diagnostics.conditional_certified_rejections += 1
+                continue
+            if proposal.lower_score <= acceptance + self.config.search_tolerance:
+                with self._state_lock:
+                    self.diagnostics.conditional_unresolved_rejections += 1
+                    self.diagnostics.maximum_unresolved_score_gap = max(
+                        self.diagnostics.maximum_unresolved_score_gap,
+                        proposal.score_gap,
+                    )
+                continue
+            if (
+                best is None
+                or proposal.lower_score
+                > best.lower_score + self.config.search_tolerance
+                or (
+                    abs(proposal.lower_score - best.lower_score)
+                    <= self.config.search_tolerance
+                    and (best_rule is None or rule < best_rule)
+                )
+            ):
+                best = proposal
+                best_rule = rule
+        with self._state_lock:
+            self.diagnostics.conditional_add_audits += audited
+            self.diagnostics.conditional_full_refits_avoided += audited
+        return None if best is None else best.record
+
+    def _best_conditional_drop(
+        self, current: SupportRecord
+    ) -> SupportRecord | None:
+        """Select the best feasible one-step deletion without a joint refit."""
+        if not current.support.rules:
+            return None
+        devices = self.config.pricing_devices or ("cpu",)
+        best: _ConditionalProposal | None = None
+        best_trial: Support | None = None
+        audited = 0
+        for index, rule in enumerate(current.support.rules):
+            trial = current.support.drop(rule)
+            if trial in self._conditional_forbidden:
+                continue
+            proposal = self._conditional_one_step(
+                current, trial, device=devices[index % len(devices)]
+            )
+            audited += 1
+            if proposal.upper_score <= current.score + self.config.search_tolerance:
+                with self._state_lock:
+                    self.diagnostics.conditional_certified_rejections += 1
+                continue
+            if proposal.lower_score <= current.score + self.config.search_tolerance:
+                with self._state_lock:
+                    self.diagnostics.conditional_unresolved_rejections += 1
+                    self.diagnostics.maximum_unresolved_score_gap = max(
+                        self.diagnostics.maximum_unresolved_score_gap,
+                        proposal.score_gap,
+                    )
+                continue
+            if (
+                best is None
+                or proposal.lower_score
+                > best.lower_score + self.config.search_tolerance
+                or (
+                    abs(proposal.lower_score - best.lower_score)
+                    <= self.config.search_tolerance
+                    and (best_trial is None or trial.rules < best_trial.rules)
+                )
+            ):
+                best = proposal
+                best_trial = trial
+        with self._state_lock:
+            self.diagnostics.conditional_drop_audits += audited
+            self.diagnostics.conditional_full_refits_avoided += audited
+        return None if best is None else best.record
+
     def _best_restricted_addition(
         self,
         current: SupportRecord,
@@ -4048,15 +4531,15 @@ class SupportOptimizer:
         )
 
     def _best_profiled_move(self, current: SupportRecord) -> SupportRecord | None:
-        """Audit score-admissible adds and every active drop.
+        """Audit score-admissible adds and drops by certified one-step moves.
 
         Each inactive skeleton selects one W/sign under the conditional-Fisher
-        block score.  Every positive profiled identity is then either safely
-        bounded below the incumbent or audited with common effects frozen; every
-        active drop is audited.  Terminal states are profiled block-score
-        restricted add/drop fixed points, not exact one-exchange optima.  A
-        skeleton without a frozen identity has instead passed an all-W/sign
-        exact-safe full-refit upper bound at that terminal.
+        block score.  Every surviving add and every active drop is evaluated at
+        a feasible full-support conditional Newton point and receives a
+        candidate-specific primal/dual error interval.  Search terminals are
+        conditional one-step add/drop fixed points, not exact one-exchange
+        optima.  The search driver performs a full exact correction only at a
+        provisional terminal and repeats this audit from the corrected point.
         """
         # Delayed column generation prices only the finite basin working set
         # during coordinate moves.  A complete outside-dictionary audit is
@@ -4064,16 +4547,16 @@ class SupportOptimizer:
         # violating skeleton is activated at once.  Hence terminal states have
         # still passed the complete dictionary audit without paying for it at
         # every accepted move.
-        direct = self._best_restricted_addition(
+        direct = self._best_conditional_addition(
             current, antecedents=set(self._working_antecedents)
         )
         if direct is not None:
             return direct
-        dropped = self._best_restricted_drop(current)
+        dropped = self._best_conditional_drop(current)
         if dropped is not None:
             return dropped
         if self._expand_working_set(current):
-            direct = self._best_restricted_addition(
+            direct = self._best_conditional_addition(
                 current, antecedents=set(self._working_antecedents)
             )
             if direct is not None:
@@ -4116,9 +4599,11 @@ class SupportOptimizer:
         )
         starts = [empty, *root_records]
         self.diagnostics.multi_source_roots = len(starts)
-        transition_cache: dict[Support, Support | None] = {}
         resolved_terminal: dict[Support, Support] = {}
         terminals: dict[Support, SupportRecord] = {}
+        terminal_block_audits: dict[
+            Support, tuple[dict[str, object], ...]
+        ] = {}
         paths: list[dict[str, object]] = []
         completed: dict[Support, tuple[Support, dict[str, object]]] = {}
         valid_starts = {record.support for record in starts}
@@ -4128,6 +4613,11 @@ class SupportOptimizer:
             terminal_record = self.fit(terminal_support, empty)
             if terminal_record.score > self.config.search_tolerance:
                 terminals[terminal_support] = terminal_record
+            raw_audit = path.get("terminal_block_audit", [])
+            if isinstance(raw_audit, list):
+                terminal_block_audits[terminal_support] = tuple(
+                    item for item in raw_audit if isinstance(item, dict)
+                )
             completed[start_support] = (terminal_support, path)
             paths.append(path)
         resumed_active = (
@@ -4145,10 +4635,19 @@ class SupportOptimizer:
             else:
                 current = start_record
                 moves = []
-            visited: list[Support] = []
+            seen_in_path = {current.support}
+            terminal_block_audit: tuple[dict[str, object], ...] = ()
+            # Conditional states are path dependent and must never enter the
+            # support-only transition cache used by the former exact-refit
+            # search.  Only exact states may be compressed to an exact terminal.
+            visited_exact: list[Support] = []
             while True:
                 self.diagnostics.states += 1
-                compressed = resolved_terminal.get(current.support)
+                compressed = (
+                    resolved_terminal.get(current.support)
+                    if current.fit.converged
+                    else None
+                )
                 if compressed is not None:
                     self.diagnostics.path_compression_hits += 1
                     terminal_record = terminals[compressed]
@@ -4162,28 +4661,81 @@ class SupportOptimizer:
                             }
                         )
                     current = terminal_record
-                    break
-                visited.append(current.support)
-                if current.support in transition_cache:
-                    self.diagnostics.transition_cache_hits += 1
-                    next_support = transition_cache[current.support]
-                    if next_support is None:
-                        break
-                    next_record = self.fit(next_support, current)
-                else:
-                    next_record = self._best_profiled_move(current)
-                    transition_cache[current.support] = (
-                        None if next_record is None else next_record.support
+                    terminal_block_audit = terminal_block_audits.get(
+                        current.support, ()
                     )
-                    # This exact transition is now immutable in the shared DAG;
-                    # per-identity audit values for the state can be released.
-                    self._restricted_add_scores.pop(current.support, None)
-                    self._restricted_add_fits.pop(current.support, None)
-                    self._restricted_add_bounds.pop(current.support, None)
-                    self._restricted_drop_scores.pop(current.support, None)
-                    self._restricted_add_problems.pop(current.support, None)
-                    if next_record is None:
+                    break
+                if current.fit.converged:
+                    visited_exact.append(current.support)
+                next_record = self._best_profiled_move(current)
+                state_block_audit = self._conditional_audit_summary(current)
+                # Candidate intervals are tied to this exact coefficient vector
+                # or provisional path point and cannot be reused after moving.
+                for key in tuple(self._conditional_audits):
+                    if key[0] == id(current):
+                        self._conditional_audits.pop(key, None)
+                if next_record is None:
+                    if current.fit.converged:
+                        terminal_block_audit = state_block_audit
+                        terminal_block_audits[current.support] = state_block_audit
                         break
+                    provisional = current
+                    corrected = self._exactify_path_state(provisional)
+                    if not corrected.fit.converged:
+                        # A finite one-step point need not imply that an MLE is
+                        # attained.  Exclude this terminal, restart from the last
+                        # exact root, and let the finite dictionary choose the
+                        # next conditional path.  No failed state reaches F0--F3.
+                        self._conditional_forbidden.add(provisional.support)
+                        self.diagnostics.nonattained_exact_rejections += 1
+                        moves.append(
+                            {
+                                "from": support_key(provisional.support),
+                                "to": support_key(start_record.support),
+                                "gain": None,
+                                "terminal_exact_failure": corrected.fit.message,
+                            }
+                        )
+                        current = start_record
+                        seen_in_path = {current.support}
+                        self._discard_support_pricing_state(current.support)
+                        continue
+                    if corrected.score + self.config.search_tolerance < provisional.score:
+                        raise AssertionError(
+                            "terminal exact correction degraded a feasible one-step point"
+                        )
+                    self.diagnostics.terminal_exact_corrections += 1
+                    moves.append(
+                        {
+                            "from": support_key(provisional.support),
+                            "to": support_key(corrected.support),
+                            "gain": float(corrected.score - provisional.score),
+                            "terminal_exact_refit": True,
+                        }
+                    )
+                    current = corrected
+                    self._discard_support_pricing_state(current.support)
+                    # Repricing at the corrected KKT point is mandatory.  If it
+                    # exposes another add/drop, the previous point was only a
+                    # provisional terminal and the conditional path continues.
+                    continue
+                if next_record.support in seen_in_path:
+                    # Strictly increasing feasible scores do not alone imply
+                    # finite termination when approximate coefficients allow a
+                    # support to be revisited.  Canonicalize a repeated support
+                    # immediately; thereafter its unique exact J prevents a
+                    # support-cycle without imposing a support-size or restart
+                    # budget.
+                    corrected = self._exactify_path_state(next_record)
+                    self.diagnostics.cycle_exact_corrections += 1
+                    if not corrected.fit.converged:
+                        self._conditional_forbidden.add(next_record.support)
+                        self.diagnostics.nonattained_exact_rejections += 1
+                        current = start_record
+                        seen_in_path = {current.support}
+                        self._discard_support_pricing_state(current.support)
+                        continue
+                    next_record = corrected
                 gain = next_record.score - current.score
                 if gain <= self.config.search_tolerance:
                     raise AssertionError(
@@ -4198,6 +4750,8 @@ class SupportOptimizer:
                     }
                 )
                 current = next_record
+                seen_in_path.add(current.support)
+                self._discard_support_pricing_state(current.support)
                 if progress_callback is not None:
                     progress_callback(
                         tuple(
@@ -4207,13 +4761,16 @@ class SupportOptimizer:
                         (start_record.support, current.support, tuple(moves)),
                     )
             if current.score > 0:
+                if not current.fit.converged:
+                    raise AssertionError("non-exact terminal escaped correction")
                 terminals[current.support] = current
-                for support in visited:
+                for support in visited_exact:
                     resolved_terminal[support] = current.support
             path = {
                 "start": support_key(start_record.support),
                 "terminal": support_key(current.support),
                 "moves": moves,
+                "terminal_block_audit": list(terminal_block_audit),
             }
             paths.append(path)
             completed[start_record.support] = (current.support, path)
