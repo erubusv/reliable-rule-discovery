@@ -365,53 +365,6 @@ class ResponseEngine:
         if not windows:
             return ()
         ordered_windows = tuple(sorted(set(map(int, windows))))
-        # Structural screening and later hierarchy construction need the same
-        # singleton/pair completion streams.  Materialize those reusable exact
-        # streams once.  Triplet streams can be much larger and are not shared
-        # by other closures, so retain their allocation-free counting pass.
-        if len(antecedent) <= 2:
-            entities, times, spans = self.completions(context, antecedent)
-            if not len(entities):
-                return ()
-            productive = times < context.ends[entities]
-            maximum_ticks = (
-                max(ordered_windows) * self.dataset.ticks_per_unit
-            )
-            productive_spans = spans[
-                productive & (spans <= maximum_ticks)
-            ]
-            if not len(productive_spans):
-                return ()
-            previous = 0
-            effective: list[int] = []
-            cumulative = None
-            if maximum_ticks <= 1_000_000:
-                cumulative = np.cumsum(
-                    np.bincount(
-                        productive_spans.astype(np.int64, copy=False),
-                        minlength=maximum_ticks + 1,
-                    )
-                )
-            else:
-                productive_spans = np.sort(productive_spans)
-            for window in ordered_windows:
-                window_ticks = int(window) * self.dataset.ticks_per_unit
-                admitted = (
-                    int(cumulative[window_ticks])
-                    if cumulative is not None
-                    else int(
-                        np.searchsorted(
-                            productive_spans,
-                            window_ticks,
-                            side="right",
-                        )
-                    )
-                )
-                if admitted > previous:
-                    effective.append(int(window))
-                    previous = admitted
-            return tuple(effective)
-
         sources = [self._source(predicate, context) for predicate in antecedent]
         compiled_counts = completion_window_counts(
             sources,
