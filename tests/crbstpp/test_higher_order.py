@@ -23,6 +23,7 @@ F0 = {
     "direct_target_proxy_excluded": True,
     "strict_future_effect_required": True,
     "atomic_predicates": True,
+    "independent_certification_units": True,
 }
 
 

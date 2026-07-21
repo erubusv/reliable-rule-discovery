@@ -482,12 +482,17 @@ def certify_family(
             "atomic_predicates",
         )
     ) and optimizer.context.dataset.f0_contract.get(
-        "independent_certification_units", True
+        # Independence is a certification prerequisite, not a dataset-schema
+        # prerequisite (IBM is deliberately loadable but uncertifiable).  A
+        # missing declaration must therefore fail closed, never silently pass.
+        "independent_certification_units", False
     ) is True
     for (record, pvalue, diagnostics, reasons), adjusted_pvalue in zip(
         interim, adjusted, strict=True
     ):
         final_reasons = reasons if f0 else (*reasons, "f0_contract_failed")
+        if adjusted_pvalue > test_alpha:
+            final_reasons = (*final_reasons, "holm_family_not_significant")
         f1_pvalue = (
             float(diagnostics.get("f1", {}).get("pvalue", 1.0))
             if isinstance(diagnostics.get("f1"), dict)

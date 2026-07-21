@@ -28,6 +28,21 @@ class EnsembleResult:
     def to_dict(self) -> dict[str, object]:
         return {
             "support_count": len(self.supports),
+            # Positional weights are meaningless without the frozen support
+            # identity at the same index.  Persist the mapping explicitly so
+            # inspection and prediction cannot silently associate a weight
+            # with the wrong model.
+            "supports": [
+                [
+                    {
+                        "antecedent": list(rule.antecedent),
+                        "window": rule.window,
+                        "sign": rule.sign,
+                    }
+                    for rule in support.rules
+                ]
+                for support in self.supports
+            ],
             "weights": self.weights.tolist(),
             "baseline_weight": self.baseline_weight,
             "train_nll": self.train_nll,
