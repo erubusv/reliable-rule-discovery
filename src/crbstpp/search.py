@@ -2452,19 +2452,18 @@ class SupportOptimizer:
         # Build the shared O(n_grid) derivative vectors once before the two
         # device workers start, avoiding duplicate concurrent allocations.
         self._baseline_grid_derivatives(current)
-        parallelism = (
-            min(2, len(devices))
-            if devices and all(device.startswith("cuda") for device in devices[:2])
-            else 1
-        )
         chunks: list[tuple[tuple[Antecedent, tuple[int, ...]], ...]] = []
         for order in (1, 2, 3):
             ordered = [group for group in groups if len(group[0]) == order]
             # Equal-order candidates have 1, 3 and 7 joint M-knot blocks.
-            # Preserve the former total number of simultaneously live
-            # skeletons when two devices overlap: each device owns half a
-            # tile, so GPU overlap does not increase the host-memory peak.
-            batch_size = max(1, {1: 12, 2: 8, 3: 4}[order] // parallelism)
+            # These tile sizes bound the number of simultaneously live sparse
+            # snapshots while amortizing one GPU reduction.
+            # Freddie triplet construction is host-memory-bandwidth bound:
+            # four concurrent builders took >60 s whereas one warm-closure
+            # builder took 2.27 s on the target machine.  A single triplet tile
+            # also maximizes pair-block LRU reuse.  Smaller orders retain GPU
+            # batching because their sparse footprints are much lighter.
+            batch_size = {1: 12, 2: 8, 3: 1}[order]
             chunks.extend(
                 tuple(ordered[start : start + batch_size])
                 for start in range(0, len(ordered), batch_size)
@@ -2483,25 +2482,17 @@ class SupportOptimizer:
             ]
         ] = []
         assignments = [
-            (chunk, devices[index % parallelism])
+            (chunk, devices[index % len(devices)])
             for index, chunk in enumerate(chunks)
         ]
-        if parallelism == 1:
-            results = map(price, assignments)
-        else:
-            # Each worker releases ``_ragged_prepare_lock`` before its GPU
-            # reduction.  Thus one exact host producer overlaps one GPU with
-            # the other device, while host completion construction remains
-            # serialized and bounded.  ``executor.map`` preserves chunk order.
-            executor = ThreadPoolExecutor(
-                max_workers=parallelism,
-                thread_name_prefix="crbstpp-ragged-device",
-            )
-            try:
-                results = list(executor.map(price, assignments))
-            finally:
-                executor.shutdown(wait=True)
-        for result in results:
+        # ``iter_blocks_many`` intentionally holds a per-key single-flight lock
+        # across its yielded W snapshots.  Overlapping chunks that share a pair
+        # closure can therefore form a lock cycle with the bounded host-producer
+        # lock.  Kernel construction is also the measured dominant cost, so
+        # serialize that producer and alternate devices across completed tiles.
+        # This preserves every candidate and is faster than competing builders.
+        for assigned in assignments:
+            result = price(assigned)
             output.extend(result)
         return output
 
