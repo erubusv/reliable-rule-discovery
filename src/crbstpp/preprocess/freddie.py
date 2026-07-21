@@ -96,11 +96,20 @@ def _read(path: Path) -> pd.DataFrame:
     status = frame["current_loan_delinquency_status"].str.upper()
     numeric = pd.to_numeric(status.where(status.ne("RA")), errors="coerce")
     frame["target"] = (numeric.ge(3) | status.eq("RA")).fillna(False)
+    frame["termination"] = frame["zero_balance_code"].ne("")
     frame = frame.sort_values(["loan_id", "time"], kind="stable").reset_index(drop=True)
     if bool(frame.duplicated(["loan_id", "time"]).any()):
         raise ValueError(f"duplicated loan-month in {path}")
     return frame[
-        ["loan_id", "time", "upb", "loan_age_num", "eltv_num", "target"]
+        [
+            "loan_id",
+            "time",
+            "upb",
+            "loan_age_num",
+            "eltv_num",
+            "target",
+            "termination",
+        ]
     ].copy()
 
 
@@ -111,15 +120,19 @@ def _contiguous(frame: pd.DataFrame, lag: int) -> pd.Series:
     ).fillna(False)
 
 
-def _prefix(frame: pd.DataFrame) -> pd.DataFrame:
+def _prefix(frame: pd.DataFrame, *, max_observation_months: int = 36) -> pd.DataFrame:
+    if max_observation_months < 1:
+        raise ValueError("max_observation_months must be positive")
     frame = frame.copy()
     frame["position"] = frame.groupby("loan_id", sort=False).cumcount()
-    first_target = (
-        frame.loc[frame["target"], ["loan_id", "position"]]
+    first_absorbing = (
+        frame.loc[
+            frame["target"] | frame["termination"], ["loan_id", "position"]
+        ]
         .groupby("loan_id", sort=False)["position"]
         .min()
     )
-    stop = frame["loan_id"].map(first_target)
+    stop = frame["loan_id"].map(first_absorbing)
     frame = frame.loc[stop.isna() | frame["position"].le(stop)].copy()
     gap = frame["loan_id"].eq(frame["loan_id"].shift()) & ~frame["time"].eq(
         frame["time"].shift() + 1
@@ -131,6 +144,7 @@ def _prefix(frame: pd.DataFrame) -> pd.DataFrame:
     )
     gap_stop = frame["loan_id"].map(first_gap)
     frame = frame.loc[gap_stop.isna() | frame["position"].lt(gap_stop)].copy()
+    frame = frame.loc[frame["position"].lt(max_observation_months)].copy()
     if bool(frame.groupby("loan_id", sort=False)["target"].sum().gt(1).any()):
         raise AssertionError("first-event prefix retained multiple targets")
     return frame
@@ -224,11 +238,13 @@ def _read_first_payment(path: Path) -> tuple[pd.Series, str]:
 
 def _load_vintage(
     item: tuple[str, Path, Path],
+    *,
+    max_observation_months: int,
 ) -> tuple[str, pd.DataFrame, pd.DataFrame, pd.Series, str, str]:
     """Read, hash and derive one independent vintage deterministically."""
     vintage, performance_path, origination_path = item
     raw = _read(performance_path)
-    frame = _prefix(raw)
+    frame = _prefix(raw, max_observation_months=max_observation_months)
     del raw
     matrix = _predicate_matrix(frame)
     first_payment, origination_digest = _read_first_payment(origination_path)
@@ -251,8 +267,16 @@ def preprocess_freddie(
     output_root: str | Path,
     *,
     vintages: tuple[str, ...],
+    test_vintages: tuple[str, ...] = (),
+    development_fit_fraction: float = 0.75,
+    partition_seed: int = 111,
+    max_observation_months: int = 36,
     overwrite: bool = False,
 ) -> Path:
+    if not 0.0 < development_fit_fraction < 1.0:
+        raise ValueError("development_fit_fraction must lie strictly between 0 and 1")
+    if max_observation_months < 1:
+        raise ValueError("max_observation_months must be positive")
     input_root, output_root = Path(input_root), Path(output_root)
     if output_root.exists():
         if not overwrite:
@@ -280,6 +304,14 @@ def preprocess_freddie(
         )
     if not paths:
         raise FileNotFoundError("no Freddie performance files found")
+    available = {name for name, _, _ in paths}
+    held_out = set(test_vintages)
+    if held_out - available:
+        raise ValueError(
+            f"test vintages are not among requested vintages: {sorted(held_out - available)}"
+        )
+    if held_out and held_out == available:
+        raise ValueError("at least one development vintage is required")
     entity_parts, event_parts, target_parts = [], [], []
     entity_offset = 0
     source_digests: dict[str, str] = {}
@@ -289,7 +321,12 @@ def preprocess_freddie(
     with ThreadPoolExecutor(
         max_workers=min(3, len(paths)), thread_name_prefix="crbstpp-freddie"
     ) as executor:
-        derived = executor.map(_load_vintage, paths)
+        derived = executor.map(
+            lambda item: _load_vintage(
+                item, max_observation_months=max_observation_months
+            ),
+            paths,
+        )
         for (
             vintage,
             frame,
@@ -312,16 +349,43 @@ def preprocess_freddie(
                 entities["start_age"].isna().any() or (entities["start_age"] < 0).any()
             ):
                 raise ValueError("invalid Freddie start loan age")
-            entities["split_group"] = entities["entity_id"].map(first_payment)
-            if bool(entities["split_group"].isna().any()):
+            first_payment_time = entities["entity_id"].map(first_payment)
+            if bool(first_payment_time.isna().any()):
                 missing = entities.loc[
-                    entities["split_group"].isna(), "entity_id"
+                    first_payment_time.isna(), "entity_id"
                 ].head(5)
                 raise ValueError(
                     "performance loans are absent from Freddie origination data: "
                     f"{missing.tolist()}"
                 )
-            entities["split_group"] = entities["split_group"].astype(np.int64)
+            match = re.fullmatch(r"(\d{4})Q([1-4])", vintage)
+            if match is None:
+                raise ValueError(f"invalid Freddie vintage: {vintage}")
+            entities["split_group"] = (
+                int(match.group(1)) * 4 + int(match.group(2)) - 1
+            )
+            if held_out:
+                if vintage in held_out:
+                    entities["partition"] = np.int8(2)
+                else:
+                    threshold = int(development_fit_fraction * (1 << 64))
+                    partition = np.fromiter(
+                        (
+                            0
+                            if int.from_bytes(
+                                hashlib.sha256(
+                                    f"{partition_seed}:{entity_id}".encode("utf-8")
+                                ).digest()[:8],
+                                byteorder="big",
+                            )
+                            < threshold
+                            else 1
+                            for entity_id in entities["entity_id"]
+                        ),
+                        dtype=np.int8,
+                        count=len(entities),
+                    )
+                    entities["partition"] = partition
             entities["baseline_origin"] = entities["start_age"].astype(np.int64)
             entity_codes = pd.Series(
                 np.arange(len(entities), dtype=np.int32) + entity_offset,
@@ -348,17 +412,16 @@ def preprocess_freddie(
                     "multiplicity": np.ones(len(target_rows), dtype=np.int32),
                 }
             )
-            entity_parts.append(
-                entities[
-                    [
-                        "entity_id",
-                        "start_time",
-                        "end_time",
-                        "baseline_origin",
-                        "split_group",
-                    ]
-                ]
-            )
+            entity_columns = [
+                "entity_id",
+                "start_time",
+                "end_time",
+                "baseline_origin",
+                "split_group",
+            ]
+            if held_out:
+                entity_columns.append("partition")
+            entity_parts.append(entities[entity_columns])
             event_parts.append(events)
             target_parts.append(targets)
             entity_offset += len(entities)
@@ -395,10 +458,28 @@ def preprocess_freddie(
             "independent_certification_units": True,
         },
         provenance={
-            "preprocessor": "crbstpp.preprocess.freddie.v2",
+            "preprocessor": "crbstpp.preprocess.freddie.v3",
             "vintages": [name for name, _, _ in paths],
             "source_sha256": source_digests,
             "predicate_definition": "primitive ELTV-band and UPB-direction transition onsets",
-            "split_definition": "ordered Freddie first-payment-date cohorts",
+            "environment_definition": "Freddie acquisition quarter",
+            "partition_definition": (
+                {
+                    "development_vintages": sorted(available - held_out),
+                    "development_assignment": "SHA-256(seed:loan_id) threshold",
+                    "development_fit_fraction": development_fit_fraction,
+                    "partition_seed": int(partition_seed),
+                    "test_vintages": sorted(held_out),
+                }
+                if held_out
+                else "not pre-assigned; Dataset.split fallback"
+            ),
+            "observation_definition": {
+                "maximum_months": int(max_observation_months),
+                "right_censoring": "last contiguous performance month",
+                "absorbing_stops": ["first adverse target", "zero-balance termination"],
+                "absorbing_row_included": True,
+                "post_gap_rows_excluded": True,
+            },
         },
     )

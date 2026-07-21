@@ -65,6 +65,7 @@ class Dataset:
     end_times: np.ndarray
     baseline_origins: np.ndarray
     split_groups: np.ndarray
+    partitions: np.ndarray | None
     predicate_names: tuple[str, ...]
     event_entities: np.ndarray
     event_times: np.ndarray
@@ -134,7 +135,10 @@ class Dataset:
         ]
         expected_events = ["entity_code", "time", "predicate_code"]
         expected_targets = ["entity_code", "time", "multiplicity"]
-        if entities.columns.tolist() != expected_entities:
+        if entities.columns.tolist() not in (
+            expected_entities,
+            [*expected_entities, "partition"],
+        ):
             raise ValueError("invalid entities schema")
         if events.columns.tolist() != expected_events:
             raise ValueError("invalid events schema")
@@ -152,6 +156,11 @@ class Dataset:
             end_times=entities["end_time"].to_numpy(dtype=np.int64),
             baseline_origins=entities["baseline_origin"].to_numpy(dtype=np.int64),
             split_groups=entities["split_group"].to_numpy(dtype=np.int64),
+            partitions=(
+                entities["partition"].to_numpy(dtype=np.int8)
+                if "partition" in entities.columns
+                else None
+            ),
             predicate_names=predicate_names,
             event_entities=events["entity_code"].to_numpy(dtype=np.int32),
             event_times=events["time"].to_numpy(dtype=np.int64),
@@ -180,6 +189,13 @@ class Dataset:
             raise ValueError("invalid entity arrays")
         if self.split_groups.shape != (n,) or np.any(self.end_times < self.start_times):
             raise ValueError("invalid observation bounds")
+        if self.partitions is not None:
+            if self.partitions.shape != (n,) or not np.all(
+                np.isin(self.partitions, (0, 1, 2))
+            ):
+                raise ValueError("explicit partition must contain only fit/cert/test codes")
+            if not np.array_equal(np.unique(self.partitions), np.array([0, 1, 2])):
+                raise ValueError("explicit partition must contain fit, cert and test entities")
         if len(set(self.entity_ids.tolist())) != n:
             raise ValueError("entity IDs must be unique")
         if not self.adverse_event_name:
@@ -263,8 +279,13 @@ class Dataset:
     def split(
         self, fractions: tuple[float, float, float], seed: int
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """Split complete entities; ordered groups are used when nonconstant."""
-        if len(np.unique(self.split_groups)) > 1:
+        """Return a disjoint entity split, preferring a pre-registered partition."""
+        if self.partitions is not None:
+            parts = tuple(
+                np.flatnonzero(self.partitions == code).astype(np.int32)
+                for code in (0, 1, 2)
+            )
+        elif len(np.unique(self.split_groups)) > 1:
             groups, counts = np.unique(self.split_groups, return_counts=True)
             if len(groups) < 3:
                 raise ValueError("ordered entity split requires at least three cohorts")
@@ -322,9 +343,16 @@ def write_dataset(
     if root.exists() and any(root.iterdir()):
         raise FileExistsError(f"output directory is not empty: {root}")
     root.mkdir(parents=True, exist_ok=True)
-    entities = entities[
-        ["entity_id", "start_time", "end_time", "baseline_origin", "split_group"]
-    ].copy()
+    entity_columns = [
+        "entity_id",
+        "start_time",
+        "end_time",
+        "baseline_origin",
+        "split_group",
+    ]
+    if "partition" in entities.columns:
+        entity_columns.append("partition")
+    entities = entities[entity_columns].copy()
     events = events[["entity_code", "time", "predicate_code"]].copy()
     targets = targets[["entity_code", "time", "multiplicity"]].copy()
     entities.to_parquet(root / "entities.parquet", index=False)

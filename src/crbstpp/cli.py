@@ -24,6 +24,10 @@ def _parser() -> argparse.ArgumentParser:
     freddie.add_argument("--input-root", type=Path, default=Path("data/freddiemac"))
     freddie.add_argument("--output-root", type=Path, required=True)
     freddie.add_argument("--vintage", action="append", default=[])
+    freddie.add_argument("--test-vintage", action="append", default=[])
+    freddie.add_argument("--development-fit-fraction", type=float, default=0.75)
+    freddie.add_argument("--partition-seed", type=int, default=111)
+    freddie.add_argument("--max-observation-months", type=int, default=36)
     freddie.add_argument("--overwrite", action="store_true")
     ibm = datasets.add_parser("ibm")
     ibm.add_argument(
@@ -124,6 +128,10 @@ def main(argv: list[str] | None = None) -> int:
                 args.input_root,
                 args.output_root,
                 vintages=tuple(args.vintage),
+                test_vintages=tuple(args.test_vintage),
+                development_fit_fraction=args.development_fit_fraction,
+                partition_seed=args.partition_seed,
+                max_observation_months=args.max_observation_months,
                 overwrite=args.overwrite,
             )
         else:

@@ -23,7 +23,9 @@ from crbstpp.search import SupportOptimizer, support_key
 from crbstpp.solver import fit_model_matrix
 
 
-def synthetic_dataset(root: Path, n_entities: int = 90) -> Dataset:
+def synthetic_dataset(
+    root: Path, n_entities: int = 90, *, explicit_partition: bool = False
+) -> Dataset:
     entities = pd.DataFrame(
         {
             "entity_id": [f"e{index:04d}" for index in range(n_entities)],
@@ -33,6 +35,8 @@ def synthetic_dataset(root: Path, n_entities: int = 90) -> Dataset:
             "split_group": np.zeros(n_entities, dtype=np.int64),
         }
     )
+    if explicit_partition:
+        entities["partition"] = np.arange(n_entities, dtype=np.int64) * 3 // n_entities
     events = []
     targets = []
     for entity in range(n_entities):
@@ -80,6 +84,17 @@ class DataRuleTests(unittest.TestCase):
             split = data.split((0.6, 0.2, 0.2), 111)
             self.assertEqual(sum(map(len, split)), 90)
             self.assertEqual(len(set(np.concatenate(split).tolist())), 90)
+
+    def test_explicit_partition_overrides_fraction_and_seed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            data = synthetic_dataset(
+                Path(directory) / "data", explicit_partition=True
+            )
+            first = data.split((0.98, 0.01, 0.01), 1)
+            second = data.split((0.1, 0.1, 0.8), 999)
+            for code, (left, right) in enumerate(zip(first, second, strict=True)):
+                np.testing.assert_array_equal(left, right)
+                self.assertTrue(np.all(data.partitions[left] == code))
 
     def test_hierarchy_closure(self) -> None:
         a = RuleIdentity((0,), 0, 1)

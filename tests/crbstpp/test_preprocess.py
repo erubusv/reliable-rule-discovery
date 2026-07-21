@@ -7,11 +7,42 @@ from pathlib import Path
 import pandas as pd
 
 from crbstpp.data import Dataset
-from crbstpp.preprocess.freddie import PERFORMANCE_COLUMNS, preprocess_freddie
+from crbstpp.preprocess.freddie import (
+    PERFORMANCE_COLUMNS,
+    _prefix,
+    preprocess_freddie,
+)
 from crbstpp.preprocess.ibm import preprocess_ibm
 
 
 class PreprocessingTests(unittest.TestCase):
+    def test_freddie_prefix_obeys_absorbing_gap_and_horizon_stops(self) -> None:
+        rows: list[dict[str, object]] = []
+        for loan, times, target, termination in (
+            ("target", range(1, 6), 3, None),
+            ("termination", range(1, 6), 4, 2),
+            ("gap", (1, 2, 4, 5), None, None),
+            ("horizon", range(1, 41), None, None),
+        ):
+            for time in times:
+                rows.append(
+                    {
+                        "loan_id": loan,
+                        "time": time,
+                        "target": time == target,
+                        "termination": time == termination,
+                    }
+                )
+        prefixed = _prefix(pd.DataFrame(rows), max_observation_months=36)
+        observed = {
+            loan: group["time"].tolist()
+            for loan, group in prefixed.groupby("loan_id", sort=False)
+        }
+        self.assertEqual(observed["target"], [1, 2, 3])
+        self.assertEqual(observed["termination"], [1, 2])
+        self.assertEqual(observed["gap"], [1, 2])
+        self.assertEqual(observed["horizon"], list(range(1, 37)))
+
     def test_freddie_first_event_risk_set_and_manifest(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
