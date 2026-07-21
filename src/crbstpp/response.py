@@ -17,6 +17,7 @@ from .native import (
     future_rows,
     kernel_contributions,
     response_min_spans,
+    sorted_unique_union,
 )
 from .rules import Antecedent, ClosureTerm, RuleIdentity, Support, hierarchy_closure
 
@@ -874,51 +875,195 @@ class ResponseEngine:
         ]
         active_parts = [source.active_rows]
         active_parts.extend(block.rows for block in blocks if len(block.rows))
-        union = np.unique(np.concatenate(active_parts))
+        union = sorted_unique_union(active_parts)
+        if union is None:
+            union = np.unique(np.concatenate(active_parts))
         baseline_dim = source.free_dimension - source.closure_dimension
         dimension = baseline_dim + self.knot_count * (
             len(closure) + len(support.rules)
         )
-        old_design = self.design_at_rows_with_context(context, source, union)
-        x_active = np.zeros((len(union), dimension), dtype=np.float64)
-        x_active[:, :baseline_dim] = old_design[:, :baseline_dim]
         closure_index = {term: index for index, term in enumerate(closure)}
-        for old_index, term in enumerate(source.closure):
-            old_left = baseline_dim + old_index * self.knot_count
-            new_left = baseline_dim + closure_index[term] * self.knot_count
-            x_active[:, new_left : new_left + self.knot_count] = old_design[
-                :, old_left : old_left + self.knot_count
-            ]
         new_free = baseline_dim + len(closure) * self.knot_count
         rule_index = {rule: index for index, rule in enumerate(support.rules)}
-        for rule, old_slice in zip(
-            source.support.rules, source.rule_slices, strict=True
-        ):
-            new_left = new_free + rule_index[rule] * self.knot_count
-            x_active[:, new_left : new_left + self.knot_count] = old_design[
-                :, old_slice
-            ]
-        for block, (_, _, sign, kind, identity) in zip(
-            blocks, specifications, strict=True
+        local, times = context.rows_to_entity_time(union)
+        ages = context.baseline_origins[local] + times - context.starts[local]
+        age_bins = np.minimum(ages // self.lag, baseline_dim - 1).astype(np.int64)
+        return self._finalize_extended_model_matrix(
+            context=context,
+            support=support,
+            closure=closure,
+            source=source,
+            union=union,
+            age_bins=age_bins,
+            specifications=specifications,
+            blocks=blocks,
+            closure_index=closure_index,
+            rule_index=rule_index,
+            dimension=dimension,
+            baseline_dim=baseline_dim,
+            new_free=new_free,
+        )
+
+    def _finalize_extended_model_matrix(
+        self,
+        *,
+        context: Context,
+        support: Support,
+        closure: tuple[ClosureTerm, ...],
+        source: ModelMatrix,
+        union: np.ndarray,
+        age_bins: np.ndarray,
+        specifications: list[tuple[Antecedent, int, float, str, object]],
+        blocks: list[SparseBlock],
+        closure_index: dict[ClosureTerm, int],
+        rule_index: dict[RuleIdentity, int],
+        dimension: int,
+        baseline_dim: int,
+        new_free: int,
+    ) -> ModelMatrix:
+        """Split existing sufficient-statistic groups only by new blocks.
+
+        A monotone add leaves every old design column unchanged.  Therefore an
+        old aggregate-group id plus the newly appended block values is a
+        lossless key for the complete enlarged design.  Sorting this narrow key
+        avoids rebuilding and sorting millions of rows across all old columns.
+        """
+        active_count = len(union)
+        total_by_age = self._baseline_totals(context)
+        active_by_age = np.bincount(
+            age_bins, minlength=self.baseline_dimension
+        ).astype(np.float64)
+        inactive_by_age = total_by_age - active_by_age
+        aggregate_bins = np.flatnonzero(inactive_by_age > 0)
+
+        positions = np.searchsorted(source.active_rows, union)
+        matched = positions < len(source.active_rows)
+        if len(source.active_rows):
+            safe = np.minimum(positions, len(source.active_rows) - 1)
+            matched &= source.active_rows[safe] == union
+        source_group_count = source.x.shape[0]
+        old_groups = source_group_count + age_bins.astype(np.int64)
+        if np.any(matched):
+            old_groups[matched] = source.active_design_groups[positions[matched]]
+
+        new_width = len(specifications) * self.knot_count
+        keys = np.zeros(
+            (active_count + len(aggregate_bins), 1 + new_width), dtype=np.float64
+        )
+        keys[:active_count, 0] = old_groups
+        keys[active_count:, 0] = source_group_count + aggregate_bins
+        for index, (block, specification) in enumerate(
+            zip(blocks, specifications, strict=True)
         ):
             if not len(block.rows):
                 continue
-            positions = np.searchsorted(union, block.rows)
+            sign = float(specification[2])
+            destination = slice(
+                1 + index * self.knot_count,
+                1 + (index + 1) * self.knot_count,
+            )
+            block_positions = np.searchsorted(union, block.rows)
+            keys[block_positions, destination] = sign * block.values
+
+        target_position = np.searchsorted(union, context.target_rows)
+        target_matched = target_position < len(union)
+        if len(union):
+            safe = np.minimum(target_position, len(union) - 1)
+            target_matched &= union[safe] == context.target_rows
+        if len(context.target_rows) and not np.all(target_matched):
+            raise AssertionError("target row missing from extended active union")
+        event_active = np.zeros(active_count, dtype=np.float64)
+        if np.any(target_matched):
+            np.add.at(
+                event_active,
+                target_position[target_matched],
+                context.target_counts[target_matched],
+            )
+        event_weight = np.concatenate(
+            [event_active, np.zeros(len(aggregate_bins), dtype=np.float64)]
+        )
+        exposure_weight = self.tick_exposure * np.concatenate(
+            [np.ones(active_count), inactive_by_age[aggregate_bins]]
+        )
+        noevent_weight = (
+            exposure_weight - event_weight
+            if context.dataset.likelihood == "first_event_cloglog"
+            else exposure_weight.copy()
+        )
+        (
+            grouped_keys,
+            exposure_weight,
+            noevent_weight,
+            event_weight,
+            design_groups,
+        ) = aggregate_design_rows_with_groups(
+            keys,
+            exposure_weight,
+            noevent_weight,
+            event_weight,
+            copy_input=False,
+        )
+
+        group_codes = np.rint(grouped_keys[:, 0]).astype(np.int64)
+        x = np.zeros((len(grouped_keys), dimension), dtype=np.float64)
+        inherited = group_codes < source_group_count
+        inherited_rows = np.flatnonzero(inherited)
+        if len(inherited_rows):
+            old = source.x[group_codes[inherited]]
+            x[inherited_rows, :baseline_dim] = old[:, :baseline_dim]
+            for old_index, term in enumerate(source.closure):
+                old_left = baseline_dim + old_index * self.knot_count
+                new_left = baseline_dim + closure_index[term] * self.knot_count
+                x[
+                    inherited_rows, new_left : new_left + self.knot_count
+                ] = old[:, old_left : old_left + self.knot_count]
+            for rule, old_slice in zip(
+                source.support.rules, source.rule_slices, strict=True
+            ):
+                new_left = new_free + rule_index[rule] * self.knot_count
+                x[
+                    inherited_rows, new_left : new_left + self.knot_count
+                ] = old[:, old_slice]
+        baseline_rows = np.flatnonzero(~inherited)
+        if len(baseline_rows):
+            baseline_bins = group_codes[~inherited] - source_group_count
+            x[baseline_rows, 0] = 1.0
+            nonzero = baseline_bins > 0
+            x[baseline_rows[nonzero], baseline_bins[nonzero]] = 1.0
+        for index, (_, _, _, kind, identity) in enumerate(specifications):
+            source_slice = slice(
+                1 + index * self.knot_count,
+                1 + (index + 1) * self.knot_count,
+            )
             if kind == "closure":
                 left = baseline_dim + closure_index[identity] * self.knot_count
             else:
                 left = new_free + rule_index[identity] * self.knot_count
-            x_active[positions, left : left + self.knot_count] = sign * block.values
-        local, times = context.rows_to_entity_time(union)
-        ages = context.baseline_origins[local] + times - context.starts[local]
-        age_bins = np.minimum(ages // self.lag, baseline_dim - 1).astype(np.int64)
-        return self._finalize_model_matrix(
-            context,
-            support,
-            closure,
-            union,
-            age_bins,
-            x_active,
+            x[:, left : left + self.knot_count] = grouped_keys[:, source_slice]
+
+        rule_slices = tuple(
+            slice(
+                new_free + index * self.knot_count,
+                new_free + (index + 1) * self.knot_count,
+            )
+            for index in range(len(support.rules))
+        )
+        return ModelMatrix(
+            x=x,
+            exposure_weight=exposure_weight,
+            noevent_weight=noevent_weight,
+            event_weight=event_weight,
+            free_dimension=new_free,
+            closure_dimension=len(closure) * self.knot_count,
+            rule_slices=rule_slices,
+            support=support,
+            closure=closure,
+            active_rows=union,
+            active_design_groups=np.ascontiguousarray(
+                design_groups[:active_count], dtype=np.int32
+            ),
+            active_age_bins=age_bins,
+            aggregate_bins=aggregate_bins,
         )
 
     def _finalize_model_matrix(

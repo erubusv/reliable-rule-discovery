@@ -52,15 +52,16 @@ PREDICATES = (
     "pred_eltv_returns_below_80",
     "pred_eltv_enters_negative_equity",
     "pred_eltv_exits_negative_equity",
-    "pred_eltv_increase_starts_below_80",
-    "pred_eltv_decrease_starts_below_80",
-    "pred_eltv_increase_starts_within_80_100",
-    "pred_eltv_decrease_starts_within_80_100",
-    "pred_eltv_increase_starts_above_100",
-    "pred_eltv_decrease_starts_above_100",
     "pred_upb_increase_starts",
     "pred_upb_flat_starts",
-    "pred_upb_decrease_starts",
+    "pred_upb_paydown_resumes",
+    "pred_upb_paydown_acceleration_starts",
+    "pred_upb_paydown_deceleration_starts",
+    "pred_interest_rate_increases",
+    "pred_interest_rate_decreases",
+    "pred_modification_settles",
+    "pred_deferred_upb_appears",
+    "pred_deferred_upb_clears",
 )
 
 
@@ -71,7 +72,10 @@ def _read(path: Path) -> pd.DataFrame:
         "current_actual_upb",
         "current_loan_delinquency_status",
         "loan_age",
+        "modification_flag",
         "zero_balance_code",
+        "current_interest_rate",
+        "current_deferred_upb",
         "eltv",
     ]
     frame = pd.read_csv(
@@ -94,6 +98,16 @@ def _read(path: Path) -> pd.DataFrame:
     frame["upb"] = pd.to_numeric(frame["current_actual_upb"], errors="coerce")
     frame["loan_age_num"] = pd.to_numeric(frame["loan_age"], errors="coerce")
     frame["eltv_num"] = pd.to_numeric(frame["eltv"], errors="coerce")
+    frame["interest_rate"] = pd.to_numeric(
+        frame["current_interest_rate"], errors="coerce"
+    )
+    frame["deferred_upb"] = pd.to_numeric(
+        frame["current_deferred_upb"], errors="coerce"
+    ).fillna(0.0)
+    # Freddie's documented settlement-period code is Y; P denotes a prior
+    # modification in subsequent records and is a persistent state, not an
+    # event.
+    frame["modification_settles"] = frame["modification_flag"].str.upper().eq("Y")
     status = frame["current_loan_delinquency_status"].str.upper()
     numeric = pd.to_numeric(status.where(status.ne("RA")), errors="coerce")
     frame["target"] = (numeric.ge(3) | status.eq("RA")).fillna(False)
@@ -108,6 +122,9 @@ def _read(path: Path) -> pd.DataFrame:
             "upb",
             "loan_age_num",
             "eltv_num",
+            "interest_rate",
+            "deferred_upb",
+            "modification_settles",
             "target",
             "termination",
         ]
@@ -152,12 +169,11 @@ def _prefix(frame: pd.DataFrame, *, max_observation_months: int = 36) -> pd.Data
 
 
 def _predicate_matrix(frame: pd.DataFrame) -> pd.DataFrame:
-    prev1, prev2 = (_contiguous(frame, lag) for lag in (1, 2))
+    prev1, prev2, prev3 = (_contiguous(frame, lag) for lag in (1, 2, 3))
     eltv = frame["eltv_num"]
-    e1, e2 = eltv.shift(), eltv.shift(2)
+    e1 = eltv.shift()
     valid = eltv.notna() & eltv.ne(999)
     valid1 = e1.notna() & e1.ne(999)
-    valid2 = e2.notna() & e2.ne(999)
 
     def band(values: pd.Series) -> pd.Series:
         return pd.Series(
@@ -169,73 +185,64 @@ def _predicate_matrix(frame: pd.DataFrame) -> pd.DataFrame:
             index=frame.index,
         )
 
-    b0, b1, b2 = band(eltv), band(e1), band(e2)
+    b0, b1 = band(eltv), band(e1)
     epair = prev1 & valid & valid1
-    etriple = prev2 & valid & valid1 & valid2
-    eltv_delta, previous_eltv_delta = eltv - e1, e1 - e2
-    upb, u1, u2 = (
+    upb, u1, u2, u3 = (
         frame["upb"],
         frame["upb"].shift(),
         frame["upb"].shift(2),
+        frame["upb"].shift(3),
     )
     upb_valid = prev2 & upb.gt(0) & u1.gt(0) & u2.gt(0)
     delta, previous_delta = upb - u1, u1 - u2
+    upb_quad = upb_valid & prev3 & u3.gt(0)
+    current_paydown = (u1 - upb) / u1
+    previous_paydown = (u2 - u1) / u2
+    prior_paydown = (u3 - u2) / u3
+    accelerating = (
+        upb_quad
+        & current_paydown.gt(0)
+        & previous_paydown.gt(0)
+        & current_paydown.gt(previous_paydown)
+    )
+    prior_accelerating = (
+        upb_quad
+        & previous_paydown.gt(0)
+        & prior_paydown.gt(0)
+        & previous_paydown.gt(prior_paydown)
+    )
+    decelerating = (
+        upb_quad
+        & current_paydown.gt(0)
+        & previous_paydown.gt(0)
+        & current_paydown.lt(previous_paydown)
+    )
+    prior_decelerating = (
+        upb_quad
+        & previous_paydown.gt(0)
+        & prior_paydown.gt(0)
+        & previous_paydown.lt(prior_paydown)
+    )
+    rate, previous_rate = frame["interest_rate"], frame["interest_rate"].shift()
+    rate_valid = prev1 & rate.notna() & previous_rate.notna()
+    deferred = frame["deferred_upb"]
+    previous_deferred = deferred.shift()
+    deferred_valid = prev1 & deferred.ge(0) & previous_deferred.ge(0)
     out = pd.DataFrame(index=frame.index)
     out[PREDICATES[0]] = epair & b1.eq(0) & b0.eq(1)
     out[PREDICATES[1]] = epair & b1.eq(1) & b0.eq(0)
     out[PREDICATES[2]] = epair & b1.lt(2) & b0.eq(2)
     out[PREDICATES[3]] = epair & b1.eq(2) & b0.lt(2)
-    out[PREDICATES[4]] = (
-        etriple
-        & b0.eq(0)
-        & b1.eq(0)
-        & b2.eq(0)
-        & eltv_delta.gt(0)
-        & previous_eltv_delta.le(0)
-    )
-    out[PREDICATES[5]] = (
-        etriple
-        & b0.eq(0)
-        & b1.eq(0)
-        & b2.eq(0)
-        & eltv_delta.lt(0)
-        & previous_eltv_delta.ge(0)
-    )
-    out[PREDICATES[6]] = (
-        etriple
-        & b0.eq(1)
-        & b1.eq(1)
-        & b2.eq(1)
-        & eltv_delta.gt(0)
-        & previous_eltv_delta.le(0)
-    )
-    out[PREDICATES[7]] = (
-        etriple
-        & b0.eq(1)
-        & b1.eq(1)
-        & b2.eq(1)
-        & eltv_delta.lt(0)
-        & previous_eltv_delta.ge(0)
-    )
-    out[PREDICATES[8]] = (
-        etriple
-        & b0.eq(2)
-        & b1.eq(2)
-        & b2.eq(2)
-        & eltv_delta.gt(0)
-        & previous_eltv_delta.le(0)
-    )
-    out[PREDICATES[9]] = (
-        etriple
-        & b0.eq(2)
-        & b1.eq(2)
-        & b2.eq(2)
-        & eltv_delta.lt(0)
-        & previous_eltv_delta.ge(0)
-    )
-    out[PREDICATES[10]] = upb_valid & delta.gt(0) & previous_delta.le(0)
-    out[PREDICATES[11]] = upb_valid & delta.eq(0) & previous_delta.ne(0)
-    out[PREDICATES[12]] = upb_valid & delta.lt(0) & previous_delta.ge(0)
+    out[PREDICATES[4]] = upb_valid & delta.gt(0) & previous_delta.le(0)
+    out[PREDICATES[5]] = upb_valid & delta.eq(0) & previous_delta.ne(0)
+    out[PREDICATES[6]] = upb_valid & delta.lt(0) & previous_delta.ge(0)
+    out[PREDICATES[7]] = accelerating & ~prior_accelerating
+    out[PREDICATES[8]] = decelerating & ~prior_decelerating
+    out[PREDICATES[9]] = rate_valid & rate.gt(previous_rate)
+    out[PREDICATES[10]] = rate_valid & rate.lt(previous_rate)
+    out[PREDICATES[11]] = prev1 & frame["modification_settles"]
+    out[PREDICATES[12]] = deferred_valid & deferred.gt(0) & previous_deferred.eq(0)
+    out[PREDICATES[13]] = deferred_valid & deferred.eq(0) & previous_deferred.gt(0)
     return out.fillna(False).astype(np.uint8)
 
 
@@ -270,6 +277,26 @@ def _read_first_payment(path: Path) -> tuple[pd.Series, str]:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return first_payment, digest.hexdigest()
+
+
+def _assert_distinct_predicate_streams(events: pd.DataFrame) -> None:
+    """Reject observationally identical event types before rule generation."""
+    signatures: dict[tuple[int, bytes], list[int]] = {}
+    for code, group in events.groupby("predicate_code", sort=True):
+        coordinates = np.ascontiguousarray(
+            group[["entity_code", "time"]].to_numpy(dtype=np.int64)
+        )
+        signature = (len(coordinates), hashlib.sha256(coordinates).digest())
+        for previous in signatures.get(signature, []):
+            prior = events.loc[
+                events["predicate_code"].eq(previous), ["entity_code", "time"]
+            ].to_numpy(dtype=np.int64)
+            if np.array_equal(prior, coordinates):
+                raise ValueError(
+                    "observationally identical Freddie predicates: "
+                    f"{PREDICATES[previous]} and {PREDICATES[int(code)]}"
+                )
+        signatures.setdefault(signature, []).append(int(code))
 
 
 def _load_vintage(
@@ -475,6 +502,7 @@ def preprocess_freddie(
         .sort_values(["entity_code", "time"], kind="stable")
         .reset_index(drop=True)
     )
+    _assert_distinct_predicate_streams(events)
     return write_dataset(
         output_root,
         entities=entities,
@@ -494,14 +522,15 @@ def preprocess_freddie(
             "independent_certification_units": True,
         },
         provenance={
-            "preprocessor": "crbstpp.preprocess.freddie.v6",
+            "preprocessor": "crbstpp.preprocess.freddie.v8",
             "vintages": [name for name, _, _ in paths],
             "source_sha256": source_digests,
             "predicate_definition": (
-                "13 primitive events: four ELTV band transitions, six mutually "
-                "exclusive within-band ELTV direction onsets and three UPB "
-                "direction onsets; no magnitude thresholds or target-status "
-                "predicates"
+                "14 primitive events across four financial mechanisms: four "
+                "ELTV boundary transitions, five mutually exclusive UPB/payment "
+                "transitions, two contractual rate changes and three "
+                "modification/deferred-balance events; no empirical magnitude "
+                "thresholds or target-status predicates"
             ),
             "environment_definition": "Freddie acquisition quarter",
             "partition_definition": (

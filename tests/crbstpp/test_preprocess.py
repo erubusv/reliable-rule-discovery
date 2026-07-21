@@ -11,6 +11,7 @@ from crbstpp.data import Dataset
 from crbstpp.preprocess.freddie import (
     PERFORMANCE_COLUMNS,
     PREDICATES,
+    _assert_distinct_predicate_streams,
     _predicate_matrix,
     _prefix,
     preprocess_freddie,
@@ -19,31 +20,73 @@ from crbstpp.preprocess.ibm import preprocess_ibm
 
 
 class PreprocessingTests(unittest.TestCase):
+    def test_freddie_rejects_identical_predicate_streams(self) -> None:
+        events = pd.DataFrame(
+            {
+                "entity_code": [0, 0],
+                "time": [1, 1],
+                "predicate_code": [0, 1],
+            }
+        )
+        with self.assertRaisesRegex(ValueError, "observationally identical"):
+            _assert_distinct_predicate_streams(events)
+
     def test_freddie_predicates_are_explicit_transition_events(self) -> None:
         rows = []
 
-        def add(loan: str, eltv: list[int], upb: list[int]) -> None:
-            for index, (ratio, balance) in enumerate(
-                zip(eltv, upb, strict=True), start=1
+        def add(
+            loan: str,
+            eltv: list[float],
+            upb: list[float],
+            *,
+            rate: list[float] | None = None,
+            modification: list[bool] | None = None,
+            deferred: list[float] | None = None,
+        ) -> None:
+            count = len(eltv)
+            rate = [5.0] * count if rate is None else rate
+            modification = [False] * count if modification is None else modification
+            deferred = [0.0] * count if deferred is None else deferred
+            for index, values in enumerate(
+                zip(
+                    eltv,
+                    upb,
+                    rate,
+                    modification,
+                    deferred,
+                    strict=True,
+                ),
+                start=1,
             ):
+                ratio, balance, note_rate, modified, deferred_upb = values
                 rows.append(
                     {
                         "loan_id": loan,
                         "time": index,
                         "eltv_num": ratio,
                         "upb": balance,
+                        "interest_rate": note_rate,
+                        "modification_settles": modified,
+                        "deferred_upb": deferred_upb,
                     }
                 )
 
         add("cross", [70, 85, 105, 95, 75], [100] * 5)
-        add("low", [70, 70, 75, 72], [100] * 4)
-        add("high", [85, 85, 90, 87], [100] * 4)
-        add("negative", [105, 105, 110, 108], [100] * 4)
         add("upb", [70] * 5, [100, 100, 101, 101, 100])
+        add("accelerate", [70] * 4, [10_000, 9_900, 9_801, 9_605])
+        add("decelerate", [70] * 4, [10_000, 9_800, 9_604, 9_508])
+        add("rate", [70] * 4, [100] * 4, rate=[5, 5, 6, 5])
+        add(
+            "modification",
+            [70] * 3,
+            [100] * 3,
+            modification=[False, True, False],
+        )
+        add("deferred", [70] * 3, [100] * 3, deferred=[0, 10, 0])
         frame = pd.DataFrame(rows)
         matrix = _predicate_matrix(frame)
         self.assertEqual(tuple(matrix.columns), PREDICATES)
-        np.testing.assert_array_equal(matrix.sum(axis=0).to_numpy(), np.ones(13))
+        np.testing.assert_array_equal(matrix.sum(axis=0).to_numpy(), np.ones(14))
 
     def test_freddie_prefix_obeys_absorbing_gap_and_horizon_stops(self) -> None:
         rows: list[dict[str, object]] = []

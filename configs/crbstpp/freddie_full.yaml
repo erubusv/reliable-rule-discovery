@@ -1,4 +1,4 @@
-dataset: data/crbstpp/freddie_2023q1_2024q3_events_v6
+dataset: data/crbstpp/freddie_2023q1_2024q3_events_v8
 run_root: runs/crbstpp
 q_max: 3
 impact_lag: 12

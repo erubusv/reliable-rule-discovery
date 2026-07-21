@@ -79,30 +79,72 @@ def projected_kkt(beta: np.ndarray, gradient: np.ndarray, free_dimension: int) -
 
 
 def _axis_recession(matrix: ModelMatrix, likelihood: str) -> bool:
-    """Detect every coordinate recession ray before Newton is attempted."""
-    for index in range(matrix.dimension):
-        signs = (-1.0, 1.0) if index < matrix.free_dimension else (1.0,)
-        for sign in signs:
-            direction = sign * matrix.x[:, index]
-            if not np.any(direction):
-                continue
-            event = matrix.event_weight > 0
-            if likelihood == "poisson":
-                valid = np.all(direction <= 1.0e-14) and np.all(
-                    np.abs(direction[event]) <= 1.0e-14
+    """Detect every coordinate recession ray in one tiled matrix pass."""
+    x = matrix.x
+    dimension = matrix.dimension
+    tolerance = 1.0e-14
+    minimum = np.full(dimension, np.inf, dtype=np.float64)
+    maximum = np.full(dimension, -np.inf, dtype=np.float64)
+    event_minimum = np.full(dimension, np.inf, dtype=np.float64)
+    event_maximum = np.full(dimension, -np.inf, dtype=np.float64)
+    noevent_minimum = np.full(dimension, np.inf, dtype=np.float64)
+    noevent_maximum = np.full(dimension, -np.inf, dtype=np.float64)
+    # Bound boolean-index temporaries while reducing every column together.
+    tile_rows = max(1, min(len(x), 64 * 1024**2 // max(8, 8 * dimension)))
+    for start in range(0, len(x), tile_rows):
+        end = min(len(x), start + tile_rows)
+        tile = x[start:end]
+        minimum = np.minimum(minimum, np.min(tile, axis=0))
+        maximum = np.maximum(maximum, np.max(tile, axis=0))
+        event = matrix.event_weight[start:end] > 0
+        if np.any(event):
+            selected = tile[event]
+            event_minimum = np.minimum(event_minimum, np.min(selected, axis=0))
+            event_maximum = np.maximum(event_maximum, np.max(selected, axis=0))
+        if likelihood != "poisson":
+            noevent = matrix.noevent_weight[start:end] > 0
+            if np.any(noevent):
+                selected = tile[noevent]
+                noevent_minimum = np.minimum(
+                    noevent_minimum, np.min(selected, axis=0)
                 )
-                strict = np.any(direction < -1.0e-14)
-            else:
-                noevent = matrix.noevent_weight > 0
-                valid = np.all(direction[noevent] <= 1.0e-14) and np.all(
-                    direction[event] >= -1.0e-14
+                noevent_maximum = np.maximum(
+                    noevent_maximum, np.max(selected, axis=0)
                 )
-                strict = np.any(direction[noevent] < -1.0e-14) or np.any(
-                    direction[event] > 1.0e-14
-                )
-            if valid and strict:
-                return True
-    return False
+    if likelihood == "poisson":
+        event_absolute = np.maximum(
+            np.abs(event_minimum), np.abs(event_maximum)
+        )
+        event_absolute[~np.isfinite(event_absolute)] = 0.0
+        positive = (
+            (maximum <= tolerance)
+            & (event_absolute <= tolerance)
+            & (minimum < -tolerance)
+        )
+        negative = (
+            (minimum >= -tolerance)
+            & (event_absolute <= tolerance)
+            & (maximum > tolerance)
+        )
+    else:
+        positive = (
+            (noevent_maximum <= tolerance)
+            & (event_minimum >= -tolerance)
+            & (
+                (noevent_minimum < -tolerance)
+                | (event_maximum > tolerance)
+            )
+        )
+        negative = (
+            (noevent_minimum >= -tolerance)
+            & (event_maximum <= tolerance)
+            & (
+                (noevent_maximum > tolerance)
+                | (event_minimum < -tolerance)
+            )
+        )
+    negative[matrix.free_dimension :] = False
+    return bool(np.any(positive | negative))
 
 
 def _general_recession_design(

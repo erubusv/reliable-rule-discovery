@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 import numpy as np
@@ -39,6 +41,7 @@ from crbstpp.search import (
     _nonnegative_quadratic_solution,
 )
 from crbstpp.solver import (
+    _axis_recession,
     _objective,
     fit_model_matrix,
     fit_offset_design,
@@ -49,6 +52,55 @@ from tests.crbstpp.test_core import synthetic_dataset
 
 
 class NumericalParityTests(unittest.TestCase):
+    def test_vectorized_axis_recession_matches_coordinate_reference(self) -> None:
+        rng = np.random.default_rng(781)
+
+        def reference(matrix: object, likelihood: str) -> bool:
+            for index in range(matrix.dimension):
+                signs = (
+                    (-1.0, 1.0)
+                    if index < matrix.free_dimension
+                    else (1.0,)
+                )
+                for sign in signs:
+                    direction = sign * matrix.x[:, index]
+                    if not np.any(direction):
+                        continue
+                    event = matrix.event_weight > 0
+                    if likelihood == "poisson":
+                        valid = np.all(direction <= 1.0e-14) and np.all(
+                            np.abs(direction[event]) <= 1.0e-14
+                        )
+                        strict = np.any(direction < -1.0e-14)
+                    else:
+                        noevent = matrix.noevent_weight > 0
+                        valid = np.all(direction[noevent] <= 1.0e-14) and np.all(
+                            direction[event] >= -1.0e-14
+                        )
+                        strict = np.any(direction[noevent] < -1.0e-14) or np.any(
+                            direction[event] > 1.0e-14
+                        )
+                    if valid and strict:
+                        return True
+            return False
+
+        for likelihood in ("poisson", "first_event_cloglog"):
+            for _ in range(40):
+                x = rng.choice((-1.0, 0.0, 1.0), size=(113, 9), p=(0.1, 0.8, 0.1))
+                event = rng.integers(0, 2, size=113).astype(np.float64)
+                noevent = rng.integers(0, 2, size=113).astype(np.float64)
+                matrix = SimpleNamespace(
+                    x=x,
+                    dimension=x.shape[1],
+                    free_dimension=int(rng.integers(0, x.shape[1] + 1)),
+                    event_weight=event,
+                    noevent_weight=noevent,
+                )
+                self.assertEqual(
+                    _axis_recession(matrix, likelihood),
+                    reference(matrix, likelihood),
+                )
+
     def test_native_bounded_span_order_is_stable_and_exact(self) -> None:
         spans = np.array([3, 1, 5, 1, 0, 3, 2], dtype=np.int64)
         actual = bounded_span_order(spans, 3)
@@ -561,22 +613,46 @@ class NumericalParityTests(unittest.TestCase):
     def test_incremental_support_matrix_matches_fresh_construction(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             data = synthetic_dataset(Path(directory) / "data", 120)
-            context = Context.make(data, np.arange(data.n_entities, dtype=np.int32))
-            engine = ResponseEngine(data, lag=3, knot_count=2, cache_bytes=32 * 1024**2)
-            source_support = Support.of((RuleIdentity((0,), 0, 1),))
-            target_support = source_support.add(RuleIdentity((0, 1), 2, -1))
-            source = engine.model_matrix(context, source_support)
-            incremental = engine.extend_model_matrix(context, target_support, source)
-            fresh = engine.model_matrix(context, target_support)
-            for left, right in (
-                (incremental.x, fresh.x),
-                (incremental.exposure_weight, fresh.exposure_weight),
-                (incremental.noevent_weight, fresh.noevent_weight),
-                (incremental.event_weight, fresh.event_weight),
-                (incremental.active_rows, fresh.active_rows),
-                (incremental.active_design_groups, fresh.active_design_groups),
-            ):
-                np.testing.assert_array_equal(left, right)
+            for likelihood in ("first_event_cloglog", "poisson"):
+                variant = replace(data, likelihood=likelihood)
+                context = Context.make(
+                    variant, np.arange(variant.n_entities, dtype=np.int32)
+                )
+                engine = ResponseEngine(
+                    variant, lag=3, knot_count=2, cache_bytes=32 * 1024**2
+                )
+                source_support = Support.of((RuleIdentity((0,), 0, 1),))
+                target_support = source_support.add(RuleIdentity((0, 1), 2, -1))
+                source = engine.model_matrix(context, source_support)
+                incremental = engine.extend_model_matrix(
+                    context, target_support, source
+                )
+                fresh = engine.model_matrix(context, target_support)
+                np.testing.assert_array_equal(
+                    incremental.active_rows, fresh.active_rows
+                )
+                np.testing.assert_allclose(
+                    incremental.x[incremental.active_design_groups],
+                    fresh.x[fresh.active_design_groups],
+                    rtol=0.0,
+                    atol=0.0,
+                )
+                incremental_canonical = aggregate_design_rows(
+                    incremental.x,
+                    incremental.exposure_weight,
+                    incremental.noevent_weight,
+                    incremental.event_weight,
+                )
+                fresh_canonical = aggregate_design_rows(
+                    fresh.x,
+                    fresh.exposure_weight,
+                    fresh.noevent_weight,
+                    fresh.event_weight,
+                )
+                for left, right in zip(
+                    incremental_canonical, fresh_canonical, strict=True
+                ):
+                    np.testing.assert_allclose(left, right, rtol=0.0, atol=0.0)
 
     def test_compiled_nonnegative_quadratic_batch_matches_reference(self) -> None:
         rng = np.random.default_rng(314)
