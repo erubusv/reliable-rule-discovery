@@ -168,7 +168,12 @@ class ResponseEngine:
             tuple[int, Antecedent], tuple[np.ndarray, np.ndarray, np.ndarray]
         ] = OrderedDict()
         self._completion_cache_size = 0
-        self._completion_cache_limit = min(self.cache_bytes // 4, 2 * 1024**3)
+        # Lower-order completions are reused by every pair/triplet hierarchy
+        # closure.  The former hard 2-GiB cap forced exact recomputation even
+        # when the configured bounded cache had ample room (Freddie allocates
+        # 16 GiB to this engine).  The four numeric LRUs still sum to at most
+        # ``cache_bytes``; only the artificial cap is removed.
+        self._completion_cache_limit = self.cache_bytes // 4
         self._source_cache: dict[tuple[int, int], tuple[np.ndarray, np.ndarray]] = {}
         self._baseline_cache: dict[int, np.ndarray] = {}
         self._entity_age_cache: dict[int, np.ndarray] = {}
@@ -360,6 +365,53 @@ class ResponseEngine:
         if not windows:
             return ()
         ordered_windows = tuple(sorted(set(map(int, windows))))
+        # Structural screening and later hierarchy construction need the same
+        # singleton/pair completion streams.  Materialize those reusable exact
+        # streams once.  Triplet streams can be much larger and are not shared
+        # by other closures, so retain their allocation-free counting pass.
+        if len(antecedent) <= 2:
+            entities, times, spans = self.completions(context, antecedent)
+            if not len(entities):
+                return ()
+            productive = times < context.ends[entities]
+            maximum_ticks = (
+                max(ordered_windows) * self.dataset.ticks_per_unit
+            )
+            productive_spans = spans[
+                productive & (spans <= maximum_ticks)
+            ]
+            if not len(productive_spans):
+                return ()
+            previous = 0
+            effective: list[int] = []
+            cumulative = None
+            if maximum_ticks <= 1_000_000:
+                cumulative = np.cumsum(
+                    np.bincount(
+                        productive_spans.astype(np.int64, copy=False),
+                        minlength=maximum_ticks + 1,
+                    )
+                )
+            else:
+                productive_spans = np.sort(productive_spans)
+            for window in ordered_windows:
+                window_ticks = int(window) * self.dataset.ticks_per_unit
+                admitted = (
+                    int(cumulative[window_ticks])
+                    if cumulative is not None
+                    else int(
+                        np.searchsorted(
+                            productive_spans,
+                            window_ticks,
+                            side="right",
+                        )
+                    )
+                )
+                if admitted > previous:
+                    effective.append(int(window))
+                    previous = admitted
+            return tuple(effective)
+
         sources = [self._source(predicate, context) for predicate in antecedent]
         compiled_counts = completion_window_counts(
             sources,
@@ -414,11 +466,21 @@ class ResponseEngine:
                 return existing
             self._completion_cache[key] = result
             self._completion_cache_size += size
-            while (
-                self._completion_cache_size > self._completion_cache_limit
-                and len(self._completion_cache) > 1
-            ):
-                _, removed = self._completion_cache.popitem(last=False)
+            while self._completion_cache_size > self._completion_cache_limit:
+                # Higher-order completions are private to one skeleton, while
+                # a lower-order stream is shared by many hierarchy closures.
+                # Evict a triplet first, otherwise use ordinary deterministic
+                # LRU order.  This is cache scheduling only; the returned
+                # arrays and every fitted objective remain identical.
+                victim = next(
+                    (
+                        candidate
+                        for candidate in self._completion_cache
+                        if len(candidate[1]) >= 3
+                    ),
+                    next(iter(self._completion_cache)),
+                )
+                removed = self._completion_cache.pop(victim)
                 self._completion_cache_size -= sum(array.nbytes for array in removed)
         return result
 
@@ -656,9 +718,13 @@ class ResponseEngine:
                     np.zeros((0, self.knot_count), dtype=np.float64),
                 )
                 for window in requested:
-                    result = (
-                        self._retain_block(keys[window], empty) if retain else empty
-                    )
+                    result = cached.get(window)
+                    if result is None:
+                        result = (
+                            self._retain_block(keys[window], empty)
+                            if retain
+                            else empty
+                        )
                     yield window, result
                 return
             # A dense global-row lookup is the fastest exact representation on
@@ -760,6 +826,13 @@ class ResponseEngine:
                                     )
                             np.add.at(accumulator, positions, raw_values)
                 left = right
+                cached_result = cached.get(window)
+                if cached_result is not None:
+                    # Accumulation must still advance for later W values, but
+                    # an exact retained snapshot avoids another potentially
+                    # multi-GiB boolean gather and copy at this W.
+                    yield window, cached_result
+                    continue
                 footprint = minimum_spans <= window_ticks
                 rows = threshold_rows[footprint]
                 values = accumulator[footprint].copy()

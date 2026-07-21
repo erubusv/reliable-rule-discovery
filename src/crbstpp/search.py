@@ -28,7 +28,7 @@ from .native import (
     moments,
     moments_batch,
     nonnegative_quadratic_gains,
-    sparse_moments_batch,
+    sparse_moments_indexed_batch,
     sorted_unique_union,
     sparse_joint_moments,
 )
@@ -2135,7 +2135,12 @@ class SupportOptimizer:
                         self.context,
                         block_antecedent,
                         ordered,
-                        retain=False,
+                        # Singleton/pair W blocks are shared hierarchy closure
+                        # inputs for many higher-order skeletons.  Keep them in
+                        # the bounded LRU; triplet-owned streams remain one-live-
+                        # snapshot iterators.  Cache eviction merely triggers an
+                        # exact recomputation and cannot change any score.
+                        retain=len(block_antecedent) <= 2,
                     )
                 )
 
@@ -2239,7 +2244,11 @@ class SupportOptimizer:
                         self.context,
                         block_antecedent,
                         ordered,
-                        retain=False,
+                        # Reuse lower-order hierarchy blocks across baseline
+                        # pair/triplet skeletons.  The bounded LRU preserves
+                        # the streaming memory guarantee for triplet-owned
+                        # blocks and fails only to exact recomputation.
+                        retain=len(block_antecedent) <= 2,
                     )
                 )
 
@@ -2302,11 +2311,7 @@ class SupportOptimizer:
                 window, closure, blocks = next(generators[index])
             except StopIteration:
                 return None
-            prepared = []
-            for block in blocks:
-                first = np.ascontiguousarray(baseline_first[block.rows])
-                second = np.ascontiguousarray(baseline_second[block.rows])
-                prepared.append((block.rows, block.values, first, second))
+            prepared = tuple((block.rows, block.values) for block in blocks)
             return index, window, closure, blocks, tuple(prepared)
 
         active = list(range(len(groups)))
@@ -2324,8 +2329,11 @@ class SupportOptimizer:
                 active = [item[0] for item in ready]
                 if not ready:
                     break
-                sparse = sparse_moments_batch(
-                    [item[4] for item in ready], device=device
+                sparse = sparse_moments_indexed_batch(
+                    [item[4] for item in ready],
+                    baseline_first,
+                    baseline_second,
+                    device=device,
                 )
                 if sparse is None:
                     with self._state_lock:
@@ -2444,13 +2452,19 @@ class SupportOptimizer:
         # Build the shared O(n_grid) derivative vectors once before the two
         # device workers start, avoiding duplicate concurrent allocations.
         self._baseline_grid_derivatives(current)
+        parallelism = (
+            min(2, len(devices))
+            if devices and all(device.startswith("cuda") for device in devices[:2])
+            else 1
+        )
         chunks: list[tuple[tuple[Antecedent, tuple[int, ...]], ...]] = []
         for order in (1, 2, 3):
             ordered = [group for group in groups if len(group[0]) == order]
             # Equal-order candidates have 1, 3 and 7 joint M-knot blocks.
-            # These tile sizes keep the host/device bytes comparable without
-            # changing which candidate is evaluated.
-            batch_size = {1: 12, 2: 8, 3: 4}[order]
+            # Preserve the former total number of simultaneously live
+            # skeletons when two devices overlap: each device owns half a
+            # tile, so GPU overlap does not increase the host-memory peak.
+            batch_size = max(1, {1: 12, 2: 8, 3: 4}[order] // parallelism)
             chunks.extend(
                 tuple(ordered[start : start + batch_size])
                 for start in range(0, len(ordered), batch_size)
@@ -2468,14 +2482,27 @@ class SupportOptimizer:
                 dict[int, tuple[float, float, float, float, int, bool]],
             ]
         ] = []
-        # Kernel construction is host-memory-bandwidth bound.  Running two
-        # four-skeleton builders concurrently more than doubles wall time on
-        # the target 128-GiB workstation, even though the GPU reductions are
-        # independent.  One deterministic producer batch therefore feeds the
-        # first GPU; the second remains available to nonempty-support pricing
-        # and exact fits.  This changes only scheduling, never the candidates.
-        for chunk in chunks:
-            output.extend(price((chunk, devices[0])))
+        assignments = [
+            (chunk, devices[index % parallelism])
+            for index, chunk in enumerate(chunks)
+        ]
+        if parallelism == 1:
+            results = map(price, assignments)
+        else:
+            # Each worker releases ``_ragged_prepare_lock`` before its GPU
+            # reduction.  Thus one exact host producer overlaps one GPU with
+            # the other device, while host completion construction remains
+            # serialized and bounded.  ``executor.map`` preserves chunk order.
+            executor = ThreadPoolExecutor(
+                max_workers=parallelism,
+                thread_name_prefix="crbstpp-ragged-device",
+            )
+            try:
+                results = list(executor.map(price, assignments))
+            finally:
+                executor.shutdown(wait=True)
+        for result in results:
+            output.extend(result)
         return output
 
     def _rank_block_identities(
@@ -3300,23 +3327,20 @@ class SupportOptimizer:
                     best_rule = rule
                     best_exact = record
                 continue
-            # The cloglog conjugate requires scalar root solves on mixed
-            # aggregate rows.  On this model its certified dual solve is more
-            # expensive than the exact M-dimensional primal block solve.  Skip
-            # that redundant certificate deterministically; the preceding
-            # analytic bound remains safe and the exact solve preserves the
-            # identical accepted move.  Poisson retains the cheap vectorized
-            # dual certificate.
-            if self.context.dataset.likelihood != "first_event_cloglog":
-                bound = self._restricted_add_bound(current, rule)
-                if bound.upper_score <= best_score + self.config.search_tolerance:
-                    with self._state_lock:
-                        if bound.dual is None:
-                            self.diagnostics.restricted_relaxation_screens += 1
-                        else:
-                            self.diagnostics.restricted_dual_screens += 1
-                        self.diagnostics.lazy_exact_refits_avoided += 1
-                    continue
+            # Event and no-event rows are kept in separate exact aggregation
+            # groups by ``_restricted_add_problem``.  Hence both supported
+            # likelihoods have a valid scalar-row conjugate and can use the
+            # same certified dual screen.  A failed certificate still fails
+            # open to the exact restricted solve below.
+            bound = self._restricted_add_bound(current, rule)
+            if bound.upper_score <= best_score + self.config.search_tolerance:
+                with self._state_lock:
+                    if bound.dual is None:
+                        self.diagnostics.restricted_relaxation_screens += 1
+                    else:
+                        self.diagnostics.restricted_dual_screens += 1
+                    self.diagnostics.lazy_exact_refits_avoided += 1
+                continue
             score = self._restricted_add_score(
                 current, rule, device=devices[audited % len(devices)]
             )
@@ -3488,16 +3512,26 @@ class SupportOptimizer:
             if geometry is not None:
                 raw_offset = self._pricing_rows(current, geometry.rows)[0]
                 # ``row_patterns`` exactly identifies the unsigned sparse design
-                # row.  Aggregating the two-column (offset, pattern-id) key is
-                # therefore identical to aggregating (offset, full design), but
-                # avoids materializing N x d for every support state.
-                keys = np.empty((len(geometry.rows), 2), dtype=np.float64)
+                # row.  The third key separates event from no-event rows for
+                # cloglog.  This is an exact sufficient-statistic aggregation
+                # and makes every aggregated cloglog row a scalar conjugate
+                # case; without it mixed rows disabled certified dual screening.
+                key_columns = (
+                    3
+                    if self.context.dataset.likelihood == "first_event_cloglog"
+                    else 2
+                )
+                keys = np.empty(
+                    (len(geometry.rows), key_columns), dtype=np.float64
+                )
                 keys[:, 0] = raw_offset
                 keys[:, 1] = geometry.row_patterns
                 exposure = np.full(
                     len(geometry.rows), self.engine.tick_exposure, dtype=np.float64
                 )
                 event = geometry.event.copy()
+                if key_columns == 3:
+                    keys[:, 2] = event > 0.0
                 noevent = (
                     exposure - event
                     if self.context.dataset.likelihood == "first_event_cloglog"

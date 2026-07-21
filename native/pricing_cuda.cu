@@ -86,10 +86,10 @@ __global__ void gradient_batch_kernel(
 }
 
 __global__ void sparse_gradient_batch_kernel(
-    const std::int64_t* block_offsets, const double* values,
+    const std::int64_t* rows, const std::int64_t* block_offsets, const double* values,
     const double* first, const double* second, std::int64_t candidates,
     std::int64_t blocks_per_candidate, std::int64_t knots,
-    double* gradient, double* cross) {
+    int indexed_derivatives, double* gradient, double* cross) {
     const std::int64_t flat = blockIdx.x;
     const std::int64_t dimensions = blocks_per_candidate * knots;
     if (flat >= candidates * dimensions) return;
@@ -104,8 +104,9 @@ __global__ void sparse_gradient_batch_kernel(
     double gradient_value = 0.0, cross_value = 0.0;
     for (std::int64_t row = left + threadIdx.x; row < right; row += blockDim.x) {
         const double value = values[row * knots + knot];
-        gradient_value += value * first[row];
-        cross_value += value * second[row];
+        const std::int64_t derivative_row = indexed_derivatives ? rows[row] : row;
+        gradient_value += value * first[derivative_row];
+        cross_value += value * second[derivative_row];
     }
     partial[threadIdx.x] = gradient_value;
     partial[blockDim.x + threadIdx.x] = cross_value;
@@ -139,7 +140,7 @@ __global__ void sparse_hessian_batch_kernel(
     const std::int64_t* rows, const std::int64_t* block_offsets,
     const double* values, const double* second, std::int64_t candidates,
     std::int64_t blocks_per_candidate, std::int64_t knots,
-    double* hessian) {
+    int indexed_derivatives, double* hessian) {
     const std::int64_t block_pairs =
         blocks_per_candidate * (blocks_per_candidate + 1) / 2;
     const std::int64_t knot_pairs = knots * knots;
@@ -173,7 +174,7 @@ __global__ void sparse_hessian_batch_kernel(
         const std::int64_t matched =
             lower_bound_row(rows, right_begin, right_end, row);
         if (matched < right_end && rows[matched] == row) {
-            const double weight = second[index];
+            const double weight = second[indexed_derivatives ? row : index];
             for (std::int64_t left_knot = 0; left_knot < knots; ++left_knot) {
                 const double weighted =
                     values[index * knots + left_knot] * weight;
@@ -413,16 +414,17 @@ extern "C" int crbstpp_cuda_moments_batch(
     return 0;
 }
 
-extern "C" int crbstpp_cuda_sparse_moments_batch(
+int sparse_moments_batch_impl(
     int device, const std::int64_t* host_rows, const double* host_values,
     const double* host_first, const double* host_second,
     const std::int64_t* host_block_offsets, std::int64_t total_rows,
+    std::int64_t derivative_rows, int indexed_derivatives,
     std::int64_t candidates, std::int64_t blocks_per_candidate,
     std::int64_t knots, double* host_gradient, double* host_hessian,
     double* host_cross) {
     if (device < 0 || device >= static_cast<int>(sparse_workspaces.size()) ||
-        total_rows < 0 || candidates < 1 || blocks_per_candidate < 1 || knots < 1 ||
-        knots > 8)
+        total_rows < 0 || derivative_rows < 0 || candidates < 1 ||
+        blocks_per_candidate < 1 || knots < 1 || knots > 8)
         return 1;
     SparseWorkspace& workspace = sparse_workspaces[device];
     std::lock_guard<std::mutex> lock(workspace.mutex);
@@ -433,7 +435,7 @@ extern "C" int crbstpp_cuda_sparse_moments_batch(
     const std::size_t rows_bytes = sizeof(std::int64_t) * total_rows;
     const std::size_t values_bytes = sizeof(double) * total_rows * knots;
     const std::size_t offsets_bytes = sizeof(std::int64_t) * (total_blocks + 1);
-    const std::size_t derivative_bytes = sizeof(double) * total_rows;
+    const std::size_t derivative_bytes = sizeof(double) * derivative_rows;
     const std::size_t gradient_bytes = sizeof(double) * candidates * dimensions;
     const std::size_t hessian_bytes =
         sizeof(double) * candidates * dimensions * dimensions;
@@ -462,9 +464,9 @@ extern "C" int crbstpp_cuda_sparse_moments_batch(
         return 2;
     sparse_gradient_batch_kernel<<<
         candidates * dimensions, threads, 2 * threads * sizeof(double)>>>(
-        workspace.block_offsets, workspace.values, workspace.first,
+        workspace.rows, workspace.block_offsets, workspace.values, workspace.first,
         workspace.second, candidates, blocks_per_candidate, knots,
-        workspace.gradient, workspace.cross);
+        indexed_derivatives, workspace.gradient, workspace.cross);
     const std::int64_t block_pairs =
         blocks_per_candidate * (blocks_per_candidate + 1) / 2;
     int hessian_threads = 256;
@@ -476,7 +478,7 @@ extern "C" int crbstpp_cuda_sparse_moments_batch(
         hessian_threads * knots * knots * sizeof(double)>>>(
         workspace.rows, workspace.block_offsets, workspace.values,
         workspace.second, candidates, blocks_per_candidate, knots,
-        workspace.hessian);
+        indexed_derivatives, workspace.hessian);
     if (cudaGetLastError() != cudaSuccess || cudaDeviceSynchronize() != cudaSuccess)
         return 2;
     if (cudaMemcpy(host_gradient, workspace.gradient, gradient_bytes,
@@ -487,4 +489,30 @@ extern "C" int crbstpp_cuda_sparse_moments_batch(
                    cudaMemcpyDeviceToHost) != cudaSuccess)
         return 2;
     return 0;
+}
+
+extern "C" int crbstpp_cuda_sparse_moments_batch(
+    int device, const std::int64_t* host_rows, const double* host_values,
+    const double* host_first, const double* host_second,
+    const std::int64_t* host_block_offsets, std::int64_t total_rows,
+    std::int64_t candidates, std::int64_t blocks_per_candidate,
+    std::int64_t knots, double* host_gradient, double* host_hessian,
+    double* host_cross) {
+    return sparse_moments_batch_impl(
+        device, host_rows, host_values, host_first, host_second,
+        host_block_offsets, total_rows, total_rows, 0, candidates,
+        blocks_per_candidate, knots, host_gradient, host_hessian, host_cross);
+}
+
+extern "C" int crbstpp_cuda_sparse_moments_indexed_batch(
+    int device, const std::int64_t* host_rows, const double* host_values,
+    const double* host_first, const double* host_second,
+    const std::int64_t* host_block_offsets, std::int64_t total_rows,
+    std::int64_t derivative_rows, std::int64_t candidates,
+    std::int64_t blocks_per_candidate, std::int64_t knots,
+    double* host_gradient, double* host_hessian, double* host_cross) {
+    return sparse_moments_batch_impl(
+        device, host_rows, host_values, host_first, host_second,
+        host_block_offsets, total_rows, derivative_rows, 1, candidates,
+        blocks_per_candidate, knots, host_gradient, host_hessian, host_cross);
 }

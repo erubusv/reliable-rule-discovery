@@ -24,6 +24,7 @@ from crbstpp.native import (
     moments_batch,
     nonnegative_quadratic_gains,
     sparse_moments_batch,
+    sparse_moments_indexed_batch,
     sorted_unique_union,
 )
 from crbstpp.response import Context, ResponseEngine
@@ -99,6 +100,41 @@ class NumericalParityTests(unittest.TestCase):
                 )
             )
         actual = sparse_moments_batch(candidates, device="cuda:0")
+        self.assertIsNotNone(actual)
+        for index, reference in enumerate(references):
+            np.testing.assert_allclose(actual[0][index], reference[0], atol=1e-12)
+            np.testing.assert_allclose(actual[1][index], reference[1], atol=1e-12)
+            np.testing.assert_allclose(actual[2][index], reference[2], atol=1e-12)
+
+    def test_cuda_indexed_sparse_moments_match_dense_reference(self) -> None:
+        if not cuda_available():
+            self.skipTest("CUDA pricing operators unavailable")
+        rng = np.random.default_rng(191)
+        first = rng.normal(size=80)
+        second = rng.uniform(0.1, 2.0, size=80)
+        candidates = []
+        references = []
+        for _ in range(3):
+            blocks = []
+            dense = np.zeros((80, 12), dtype=np.float64)
+            for block_index in range(3):
+                rows = np.sort(
+                    rng.choice(80, size=18 + block_index * 3, replace=False)
+                ).astype(np.int64)
+                values = rng.normal(size=(len(rows), 4))
+                dense[rows, block_index * 4 : (block_index + 1) * 4] = values
+                blocks.append((rows, values))
+            candidates.append(tuple(blocks))
+            references.append(
+                (
+                    dense.T @ first,
+                    dense.T @ (second[:, None] * dense),
+                    dense.T @ second,
+                )
+            )
+        actual = sparse_moments_indexed_batch(
+            candidates, first, second, device="cuda:0"
+        )
         self.assertIsNotNone(actual)
         for index, reference in enumerate(references):
             np.testing.assert_allclose(actual[0][index], reference[0], atol=1e-12)
@@ -330,6 +366,11 @@ class NumericalParityTests(unittest.TestCase):
             checked = 0
             for rule in optimizer.dictionary:
                 bound = optimizer._restricted_add_bound(empty, rule)
+                problem = optimizer._restricted_add_problem(empty, rule)
+                if problem is not None:
+                    self.assertFalse(
+                        np.any((problem.noevent > 0.0) & (problem.event > 0.0))
+                    )
                 exact = optimizer._restricted_add_score(empty, rule)
                 if not np.isfinite(exact):
                     continue
@@ -395,14 +436,16 @@ class NumericalParityTests(unittest.TestCase):
             exposure = np.full(len(rows), optimizer.engine.tick_exposure)
             noevent = exposure - event
             joint, exposure, noevent, event = aggregate_design_rows(
-                np.concatenate((offset[:, None], design), axis=1),
+                np.concatenate(
+                    (offset[:, None], design, (event > 0.0)[:, None]), axis=1
+                ),
                 exposure,
                 noevent,
                 event,
                 copy_input=False,
             )
             np.testing.assert_array_equal(compact.offset, joint[:, 0])
-            np.testing.assert_array_equal(compact.unsigned_design, joint[:, 1:])
+            np.testing.assert_array_equal(compact.unsigned_design, joint[:, 1:-1])
             np.testing.assert_array_equal(compact.exposure, exposure)
             np.testing.assert_array_equal(compact.noevent, noevent)
             np.testing.assert_array_equal(compact.event, event)
@@ -1268,7 +1311,7 @@ class NumericalParityTests(unittest.TestCase):
             triplet_devices = {
                 device for antecedent, device in calls if len(antecedent) == 3
             }
-            self.assertEqual(triplet_devices, {"cuda:0"})
+            self.assertEqual(triplet_devices, {"cuda:0", "cuda:1"})
             self.assertFalse(
                 any(
                     device == "cpu"
