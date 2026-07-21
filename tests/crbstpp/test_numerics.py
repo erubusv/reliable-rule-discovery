@@ -23,6 +23,7 @@ from crbstpp.native import (
     moments,
     moments_batch,
     nonnegative_quadratic_gains,
+    sparse_moments_batch,
     sorted_unique_union,
 )
 from crbstpp.response import Context, ResponseEngine
@@ -63,6 +64,46 @@ class NumericalParityTests(unittest.TestCase):
             self.skipTest("compiled CPU operators unavailable")
         expected = np.unique(np.concatenate(parts))
         np.testing.assert_array_equal(actual, expected)
+
+    def test_cuda_ragged_sparse_moments_match_dense_reference(self) -> None:
+        if not cuda_available():
+            self.skipTest("CUDA pricing operators unavailable")
+        rng = np.random.default_rng(19)
+        candidates = []
+        references = []
+        for _ in range(3):
+            first_grid = rng.normal(size=80)
+            second_grid = rng.uniform(0.1, 2.0, size=80)
+            blocks = []
+            dense = np.zeros((80, 12), dtype=np.float64)
+            for block_index in range(3):
+                rows = np.sort(
+                    rng.choice(80, size=18 + block_index * 3, replace=False)
+                ).astype(np.int64)
+                values = rng.normal(size=(len(rows), 4))
+                dense[rows, block_index * 4 : (block_index + 1) * 4] = values
+                blocks.append(
+                    (
+                        rows,
+                        values,
+                        first_grid[rows],
+                        second_grid[rows],
+                    )
+                )
+            candidates.append(tuple(blocks))
+            references.append(
+                (
+                    dense.T @ first_grid,
+                    dense.T @ (second_grid[:, None] * dense),
+                    dense.T @ second_grid,
+                )
+            )
+        actual = sparse_moments_batch(candidates, device="cuda:0")
+        self.assertIsNotNone(actual)
+        for index, reference in enumerate(references):
+            np.testing.assert_allclose(actual[0][index], reference[0], atol=1e-12)
+            np.testing.assert_allclose(actual[1][index], reference[1], atol=1e-12)
+            np.testing.assert_allclose(actual[2][index], reference[2], atol=1e-12)
 
     def test_sparse_grid_derivatives_match_dense_weights(self) -> None:
         eta = np.linspace(-4.0, 2.0, 31)
@@ -1023,6 +1064,49 @@ class NumericalParityTests(unittest.TestCase):
                     atol=1e-11,
                 )
 
+    def test_ragged_baseline_hierarchy_prices_match_cpu_reference(self) -> None:
+        if not cuda_available():
+            self.skipTest("CUDA pricing operators unavailable")
+        with tempfile.TemporaryDirectory() as directory:
+            data = synthetic_dataset(Path(directory) / "data", 90)
+            fit_codes, _, _ = data.split((0.6, 0.2, 0.2), 111)
+            config = RunConfig(
+                dataset=str(data.root),
+                q_max=2,
+                impact_lag=3,
+                knot_count=2,
+                formation_windows=(0, 1, 2),
+                solver_tolerance=1e-8,
+                solver_max_iter=150,
+                cache_bytes=32 * 1024**2,
+                early_warning_horizon=3,
+                pricing_devices=("cuda:0", "cuda:1"),
+            )
+            optimizer = SupportOptimizer(Context.make(data, fit_codes), config)
+            empty = optimizer.records[Support(())]
+            windows = tuple(
+                sorted(
+                    {
+                        rule.window
+                        for rule in optimizer.dictionary
+                        if rule.antecedent == (0, 1)
+                    }
+                )
+            )
+            expected = optimizer._price_hierarchy_skeleton(
+                empty, (0, 1), windows, device="cpu"
+            )
+            actual = dict(
+                optimizer._price_baseline_hierarchy_batch(
+                    empty, (((0, 1), windows),), device="cuda:0"
+                )
+            )[(0, 1)]
+            for window in windows:
+                np.testing.assert_allclose(
+                    actual[window][:4], expected[window][:4], rtol=1e-10, atol=1e-10
+                )
+                self.assertEqual(actual[window][4:], expected[window][4:])
+
     def test_embedded_closure_null_matches_direct_matrix(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             data = synthetic_dataset(Path(directory) / "data", 120)
@@ -1126,7 +1210,7 @@ class NumericalParityTests(unittest.TestCase):
                 ranked = optimizer._rank_block_identities(empty, (rule,))
             self.assertLess(ranked[0][0], 0.0)
 
-    def test_triplet_pricing_waves_use_both_gpus_not_static_cpu_slots(self) -> None:
+    def test_triplet_pricing_uses_ragged_gpu_batches_not_static_cpu_slots(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             data = synthetic_dataset(Path(directory) / "data", 45)
             fit_codes, _, _ = data.split((0.6, 0.2, 0.2), 111)
@@ -1151,26 +1235,40 @@ class NumericalParityTests(unittest.TestCase):
                     (0, 1, 2),
                     (0, 1, 3),
                     (0, 2, 3),
+                    (1, 2, 3),
+                    (0, 1, 4),
+                    (0, 2, 4),
+                    (1, 2, 4),
+                    (0, 3, 4),
+                    (1, 3, 4),
                 )
             )
             calls: list[tuple[tuple[int, ...], str]] = []
 
-            def fake_price(current, antecedent, windows, *, device):
+            def fake_price(current, groups, *, device):
                 del current
-                calls.append((antecedent, device))
-                return {
-                    window: (0.0, 0.0, 0.0, 0.0, 0, True)
-                    for window in windows
-                }
+                output = []
+                for antecedent, windows in groups:
+                    calls.append((antecedent, device))
+                    output.append(
+                        (
+                            antecedent,
+                            {
+                                window: (0.0, 0.0, 0.0, 0.0, 0, True)
+                                for window in windows
+                            },
+                        )
+                    )
+                return output
 
             with mock.patch.object(
-                optimizer, "_price_hierarchy_skeleton", side_effect=fake_price
+                optimizer, "_price_baseline_hierarchy_batch", side_effect=fake_price
             ):
                 optimizer._rank_block_identities(empty, identities)
             triplet_devices = {
                 device for antecedent, device in calls if len(antecedent) == 3
             }
-            self.assertEqual(triplet_devices, {"cuda:0", "cuda:1"})
+            self.assertEqual(triplet_devices, {"cuda:0"})
             self.assertFalse(
                 any(
                     device == "cpu"

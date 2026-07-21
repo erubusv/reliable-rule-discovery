@@ -28,6 +28,7 @@ from .native import (
     moments,
     moments_batch,
     nonnegative_quadratic_gains,
+    sparse_moments_batch,
     sorted_unique_union,
     sparse_joint_moments,
 )
@@ -199,6 +200,9 @@ class SearchDiagnostics:
     lazy_skeleton_profiles: int = 0
     lazy_skeleton_profiles_avoided: int = 0
     lazy_skeleton_activations: int = 0
+    ragged_gpu_batches: int = 0
+    ragged_gpu_candidates: int = 0
+    ragged_gpu_fail_open: int = 0
 
 
 @dataclass(frozen=True)
@@ -339,6 +343,7 @@ class SupportOptimizer:
         self._stored_records: dict[Support, _StoredRecord] = {}
         self._forced_fits: dict[tuple[Support, tuple[ClosureTerm, ...]], FitResult] = {}
         self._state_lock = threading.RLock()
+        self._ragged_prepare_lock = threading.Lock()
         self._record_cache_bytes = 0
         self._record_cache_limit = max(1, config.cache_bytes // 8)
         self._relaxed_upper_cache: OrderedDict[tuple, float] = OrderedDict()
@@ -352,6 +357,7 @@ class SupportOptimizer:
         self._row_eta_state: OrderedDict[Support, np.ndarray] = OrderedDict()
         self._row_eta_cache_bytes = 0
         self._row_eta_cache_limit = max(1, config.cache_bytes // 64)
+        self._baseline_derivative_state: tuple[np.ndarray, np.ndarray] | None = None
         self._block_price_cache: OrderedDict[
             tuple[Support, Antecedent, int], tuple[np.ndarray, np.ndarray]
         ] = OrderedDict()
@@ -1316,6 +1322,57 @@ class SupportOptimizer:
         )
         return eta, first, second
 
+    def _baseline_grid_derivatives(
+        self, current: SupportRecord
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Return exact empty-model derivatives once for all sparse blocks."""
+        if current.support != EMPTY_SUPPORT or current.matrix.dimension != 1:
+            raise ValueError("baseline derivative cache requires the empty model")
+        with self._state_lock:
+            cached = self._baseline_derivative_state
+        if cached is not None:
+            return cached
+        eta0 = float(current.fit.coefficients[0])
+        exposure0 = float(self.engine.tick_exposure)
+        _, noevent_first, noevent_second = loss_rows(
+            np.asarray([eta0], dtype=np.float64),
+            likelihood=self.context.dataset.likelihood,
+            exposure_weight=np.asarray([exposure0], dtype=np.float64),
+            noevent_weight=np.asarray([exposure0], dtype=np.float64),
+            event_weight=np.zeros(1, dtype=np.float64),
+        )
+        first = np.full(
+            self.context.n_grid, noevent_first[0], dtype=np.float64
+        )
+        second = np.full(
+            self.context.n_grid, noevent_second[0], dtype=np.float64
+        )
+        if len(self.context.target_rows):
+            event = self.context.target_counts.astype(np.float64, copy=False)
+            exposure = np.full(len(event), exposure0, dtype=np.float64)
+            noevent = (
+                exposure - event
+                if self.context.dataset.likelihood == "first_event_cloglog"
+                else exposure
+            )
+            _, target_first, target_second = loss_rows(
+                np.full(len(event), eta0, dtype=np.float64),
+                likelihood=self.context.dataset.likelihood,
+                exposure_weight=exposure,
+                noevent_weight=noevent,
+                event_weight=event,
+            )
+            first[self.context.target_rows] = target_first
+            second[self.context.target_rows] = target_second
+        result = (
+            np.ascontiguousarray(first),
+            np.ascontiguousarray(second),
+        )
+        with self._state_lock:
+            if self._baseline_derivative_state is None:
+                self._baseline_derivative_state = result
+            return self._baseline_derivative_state
+
     def _price_skeleton(
         self,
         current: SupportRecord,
@@ -2151,6 +2208,204 @@ class SupportOptimizer:
             self.diagnostics.fused_skeleton_pricing_passes += 1
         return output
 
+    def _iter_baseline_hierarchy_blocks(
+        self,
+        antecedent: Antecedent,
+        windows: tuple[int, ...],
+    ):
+        """Yield one live full-M-knot hierarchy snapshot per baseline W."""
+        requested = tuple(sorted(set(map(int, windows))))
+        closures = {
+            window: hierarchy_closure(
+                Support.of((RuleIdentity(antecedent, window, 1),))
+            )
+            for window in requested
+        }
+        block_requests: dict[Antecedent, set[int]] = {antecedent: set(requested)}
+        for closure in closures.values():
+            for term in closure:
+                block_requests.setdefault(term.antecedent, set()).add(term.window)
+        fixed_blocks: dict[tuple[Antecedent, int], SparseBlock] = {}
+        streams = {}
+        for block_antecedent, block_windows in sorted(block_requests.items()):
+            ordered = tuple(sorted(block_windows))
+            if len(ordered) == 1:
+                fixed_blocks[(block_antecedent, ordered[0])] = self.engine.block(
+                    self.context, block_antecedent, ordered[0]
+                )
+            else:
+                streams[block_antecedent] = iter(
+                    self.engine.iter_blocks_many(
+                        self.context,
+                        block_antecedent,
+                        ordered,
+                        retain=False,
+                    )
+                )
+
+        def block_for(block_antecedent: Antecedent, window: int) -> SparseBlock:
+            fixed = fixed_blocks.get((block_antecedent, window))
+            if fixed is not None:
+                return fixed
+            produced_window, block = next(streams[block_antecedent])
+            if produced_window != window:
+                raise AssertionError("baseline W stream advanced out of order")
+            return block
+
+        for window in requested:
+            closure = closures[window]
+            blocks = tuple(
+                block_for(term.antecedent, term.window) for term in closure
+            ) + (block_for(antecedent, window),)
+            yield window, closure, blocks
+
+    def _price_baseline_hierarchy_batch(
+        self,
+        current: SupportRecord,
+        groups: tuple[tuple[Antecedent, tuple[int, ...]], ...],
+        *,
+        device: str,
+    ) -> list[
+        tuple[
+            Antecedent,
+            dict[int, tuple[float, float, float, float, int, bool]],
+        ]
+    ]:
+        """Price several equal-order baseline skeletons in ragged GPU batches."""
+        if current.support != EMPTY_SUPPORT:
+            raise ValueError("ragged baseline profiler requires the empty support")
+        if not groups:
+            return []
+        order = len(groups[0][0])
+        if any(len(antecedent) != order for antecedent, _ in groups):
+            raise ValueError("ragged baseline batch mixes skeleton orders")
+        generators = [
+            iter(self._iter_baseline_hierarchy_blocks(antecedent, windows))
+            for antecedent, windows in groups
+        ]
+        outputs = {antecedent: {} for antecedent, _ in groups}
+        indices, inverse = self._pricing_components(current)
+        baseline_only = (
+            current.matrix.dimension == 1
+            and len(indices) == 1
+            and int(indices[0]) == 0
+        )
+        if not baseline_only:
+            raise AssertionError("empty-support pricing is not intercept-only")
+        baseline_first, baseline_second = self._baseline_grid_derivatives(current)
+
+        def advance(index: int):
+            configure_cpu_threads(
+                max(1, self.config.pricing_workers // len(groups))
+            )
+            try:
+                window, closure, blocks = next(generators[index])
+            except StopIteration:
+                return None
+            prepared = []
+            for block in blocks:
+                first = np.ascontiguousarray(baseline_first[block.rows])
+                second = np.ascontiguousarray(baseline_second[block.rows])
+                prepared.append((block.rows, block.values, first, second))
+            return index, window, closure, blocks, tuple(prepared)
+
+        active = list(range(len(groups)))
+        with ThreadPoolExecutor(
+            max_workers=len(groups),
+            thread_name_prefix="crbstpp-ragged-prepare",
+        ) as executor:
+            while active:
+                # Two device batches may overlap GPU reduction with the next
+                # host preparation, but two simultaneous completion builders
+                # exceed memory bandwidth and thrash the bounded response LRU.
+                with self._ragged_prepare_lock:
+                    advanced = list(executor.map(advance, active))
+                ready = [item for item in advanced if item is not None]
+                active = [item[0] for item in ready]
+                if not ready:
+                    break
+                sparse = sparse_moments_batch(
+                    [item[4] for item in ready], device=device
+                )
+                if sparse is None:
+                    with self._state_lock:
+                        self.diagnostics.ragged_gpu_fail_open += len(ready)
+                    moments_values = [
+                        self._joint_hierarchy_moments(
+                            current, item[3], device="cpu"
+                        )
+                        for item in ready
+                    ]
+                else:
+                    gradients, hessians, crosses = sparse
+                    moments_values = [
+                        (
+                            gradients[position],
+                            hessians[position]
+                            - crosses[position, :, None]
+                            @ inverse
+                            @ crosses[position, None, :],
+                        )
+                        for position in range(len(ready))
+                    ]
+                    with self._state_lock:
+                        self.diagnostics.ragged_gpu_batches += 1
+                        self.diagnostics.ragged_gpu_candidates += len(ready)
+
+                for item, (gradient, hessian) in zip(
+                    ready, moments_values, strict=True
+                ):
+                    index, window, closure, blocks, _ = item
+                    antecedent = groups[index][0]
+                    closure_dimension = len(closure) * self.config.knot_count
+                    closure_gain, rule_gradient, rule_hessian, valid = (
+                        self._profile_hierarchy_geometry(
+                            gradient, hessian, closure_dimension
+                        )
+                    )
+                    if not valid:
+                        outputs[antecedent][window] = (
+                            math.inf,
+                            math.inf,
+                            math.inf,
+                            math.inf,
+                            closure_dimension,
+                            True,
+                        )
+                        continue
+                    with self._state_lock:
+                        geometry_key = (current.support, antecedent, window)
+                        self._hierarchy_rule_geometries[geometry_key] = (
+                            _HierarchyRuleGeometry(
+                                np.ascontiguousarray(rule_gradient),
+                                np.ascontiguousarray(rule_hessian),
+                                True,
+                            )
+                        )
+                        self._hierarchy_rule_geometries.move_to_end(geometry_key)
+                        while (
+                            len(self._hierarchy_rule_geometries)
+                            > self._hierarchy_rule_geometry_limit
+                        ):
+                            self._hierarchy_rule_geometries.popitem(last=False)
+                    negative_rule = _nonnegative_quadratic_gain(
+                        -rule_gradient, rule_hessian
+                    )
+                    positive_rule = _nonnegative_quadratic_gain(
+                        rule_gradient, rule_hessian
+                    )
+                    outputs[antecedent][window] = (
+                        closure_gain + negative_rule,
+                        closure_gain + positive_rule,
+                        negative_rule,
+                        positive_rule,
+                        closure_dimension,
+                        True,
+                    )
+        with self._state_lock:
+            self.diagnostics.fused_skeleton_pricing_passes += len(groups)
+        return [(antecedent, outputs[antecedent]) for antecedent, _ in groups]
+
     def _pricing_task_memory_upper_bound(self, antecedent: Antecedent) -> int:
         """Conservative live-byte bound for one streamed hierarchy price.
 
@@ -2174,6 +2429,55 @@ class SupportOptimizer:
         tiled_moments = 256 * 1024**2
         return int(1.25 * streamed) + tiled_moments
 
+    def _baseline_batched_component_items(
+        self,
+        current: SupportRecord,
+        groups: list[tuple[Antecedent, tuple[int, ...]]],
+        devices: tuple[str, ...],
+    ) -> list[
+        tuple[
+            Antecedent,
+            dict[int, tuple[float, float, float, float, int, bool]],
+        ]
+    ]:
+        """Run all baseline skeletons in deterministic dual-GPU ragged tiles."""
+        # Build the shared O(n_grid) derivative vectors once before the two
+        # device workers start, avoiding duplicate concurrent allocations.
+        self._baseline_grid_derivatives(current)
+        chunks: list[tuple[tuple[Antecedent, tuple[int, ...]], ...]] = []
+        for order in (1, 2, 3):
+            ordered = [group for group in groups if len(group[0]) == order]
+            # Equal-order candidates have 1, 3 and 7 joint M-knot blocks.
+            # These tile sizes keep the host/device bytes comparable without
+            # changing which candidate is evaluated.
+            batch_size = {1: 12, 2: 8, 3: 4}[order]
+            chunks.extend(
+                tuple(ordered[start : start + batch_size])
+                for start in range(0, len(ordered), batch_size)
+            )
+
+        def price(assigned):
+            chunk, device = assigned
+            return self._price_baseline_hierarchy_batch(
+                current, chunk, device=device
+            )
+
+        output: list[
+            tuple[
+                Antecedent,
+                dict[int, tuple[float, float, float, float, int, bool]],
+            ]
+        ] = []
+        # Kernel construction is host-memory-bandwidth bound.  Running two
+        # four-skeleton builders concurrently more than doubles wall time on
+        # the target 128-GiB workstation, even though the GPU reductions are
+        # independent.  One deterministic producer batch therefore feeds the
+        # first GPU; the second remains available to nonempty-support pricing
+        # and exact fits.  This changes only scheduling, never the candidates.
+        for chunk in chunks:
+            output.extend(price((chunk, devices[0])))
+        return output
+
     def _rank_block_identities(
         self, current: SupportRecord, identities: tuple[RuleIdentity, ...]
     ) -> list[tuple[float, float, RuleIdentity, bool]]:
@@ -2193,6 +2497,16 @@ class SupportOptimizer:
             for antecedent, windows in sorted(grouped.items())
         ]
         devices = self.config.pricing_devices
+        pricing_groups = groups
+        batched_component_items = None
+        if current.support == EMPTY_SUPPORT and devices:
+            batched_component_items = self._baseline_batched_component_items(
+                current, groups, devices
+            )
+            # The exact components are already complete.  Leave the legacy
+            # scheduler empty; it remains the fail-safe path for nonempty
+            # support-conditioned audits and CPU-only installations.
+            groups = []
         if devices:
             # Extra CPU producers feed the two GPUs.  The independent byte
             # gate below, rather than this thread count, limits live scratch.
@@ -2253,7 +2567,7 @@ class SupportOptimizer:
                 Antecedent,
                 dict[int, tuple[float, float, float, float, int, bool]],
             ]
-        ] = []
+        ] = list(batched_component_items or [])
         indexed_groups = list(enumerate(groups))
         if devices:
             # Triplets dominate both time and memory.  Assign every admitted
@@ -2326,7 +2640,7 @@ class SupportOptimizer:
             ranked.append((net, gain, rule, nested))
         with self._state_lock:
             self.diagnostics.fused_sign_prices += len(identities) - sum(
-                len(windows) for _, windows in groups
+                len(windows) for _, windows in pricing_groups
             )
             self.diagnostics.block_score_screens += sum(
                 nested and net <= self.config.search_tolerance
@@ -3580,10 +3894,13 @@ class SupportOptimizer:
                 if self.saturated_upper_score(Support.of((rule,)))
                 > self.config.search_tolerance
             )
-            survivors = self._safe_standalone_survivors(
-                empty, antecedent, globally_possible
-            )
-            if survivors:
+            # The localized standalone relaxation was exact-safe but passed
+            # every sampled Freddie triplet after paying for its completion
+            # footprints.  The global saturated bound is cheaper, equally
+            # safe, and the ragged profiler now makes the surviving full score
+            # inexpensive enough to evaluate directly.  No candidate is
+            # removed unless this universal upper bound proves it impossible.
+            if globally_possible:
                 possible.add(antecedent)
             else:
                 self._baseline_safe_screened.add(antecedent)

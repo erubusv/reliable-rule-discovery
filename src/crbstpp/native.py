@@ -185,6 +185,24 @@ def _cuda_library():
                     pointer,
                 ]
                 batch_function.restype = ctypes.c_int
+                sparse_batch = library.crbstpp_cuda_sparse_moments_batch
+                int64_pointer = ctypes.POINTER(ctypes.c_int64)
+                sparse_batch.argtypes = [
+                    ctypes.c_int,
+                    int64_pointer,
+                    pointer,
+                    pointer,
+                    pointer,
+                    int64_pointer,
+                    ctypes.c_int64,
+                    ctypes.c_int64,
+                    ctypes.c_int64,
+                    ctypes.c_int64,
+                    pointer,
+                    pointer,
+                    pointer,
+                ]
+                sparse_batch.restype = ctypes.c_int
                 _CUDA = library
     return _CUDA
 
@@ -303,6 +321,92 @@ def moments_batch(
         if return_second_gradient
         else (gradient, hessian)
     )
+
+
+def sparse_moments_batch(
+    candidates: list[
+        tuple[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray], ...]
+    ],
+    *,
+    device: str,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
+    """Exact ragged sparse moments for equally shaped candidate block sets.
+
+    Each block tuple contains sorted rows, M-knot values, and the first/second
+    likelihood derivatives evaluated at those rows.  The CUDA kernel performs
+    deterministic per-output reductions and never constructs a dense row union.
+    """
+    library = _cuda_library()
+    if (
+        not candidates
+        or not device.startswith("cuda")
+        or library is None
+        or not hasattr(library, "crbstpp_cuda_sparse_moments_batch")
+    ):
+        return None
+    block_count = len(candidates[0])
+    if block_count < 1 or any(len(candidate) != block_count for candidate in candidates):
+        raise ValueError("ragged candidates must have one common block count")
+    knot_count = candidates[0][0][1].shape[1]
+    rows_parts: list[np.ndarray] = []
+    value_parts: list[np.ndarray] = []
+    first_parts: list[np.ndarray] = []
+    second_parts: list[np.ndarray] = []
+    offsets = [0]
+    for candidate in candidates:
+        for rows, values, first, second in candidate:
+            rows = np.ascontiguousarray(rows, dtype=np.int64)
+            values = np.ascontiguousarray(values, dtype=np.float64)
+            first = np.ascontiguousarray(first, dtype=np.float64)
+            second = np.ascontiguousarray(second, dtype=np.float64)
+            if (
+                values.shape != (len(rows), knot_count)
+                or first.shape != (len(rows),)
+                or second.shape != (len(rows),)
+            ):
+                raise ValueError("ragged sparse block shape mismatch")
+            rows_parts.append(rows)
+            value_parts.append(values)
+            first_parts.append(first)
+            second_parts.append(second)
+            offsets.append(offsets[-1] + len(rows))
+    total_rows = offsets[-1]
+    if total_rows:
+        rows = np.ascontiguousarray(np.concatenate(rows_parts), dtype=np.int64)
+        values = np.ascontiguousarray(np.concatenate(value_parts), dtype=np.float64)
+        first = np.ascontiguousarray(np.concatenate(first_parts), dtype=np.float64)
+        second = np.ascontiguousarray(np.concatenate(second_parts), dtype=np.float64)
+    else:
+        rows = np.zeros(0, dtype=np.int64)
+        values = np.zeros((0, knot_count), dtype=np.float64)
+        first = np.zeros(0, dtype=np.float64)
+        second = np.zeros(0, dtype=np.float64)
+    block_offsets = np.ascontiguousarray(offsets, dtype=np.int64)
+    dimensions = block_count * knot_count
+    gradient = np.empty((len(candidates), dimensions), dtype=np.float64)
+    hessian = np.empty(
+        (len(candidates), dimensions, dimensions), dtype=np.float64
+    )
+    cross = np.empty_like(gradient)
+    pointer = ctypes.POINTER(ctypes.c_double)
+    int64_pointer = ctypes.POINTER(ctypes.c_int64)
+    index = int(device.split(":", 1)[1]) if ":" in device else 0
+    status = library.crbstpp_cuda_sparse_moments_batch(
+        index,
+        rows.ctypes.data_as(int64_pointer),
+        values.ctypes.data_as(pointer),
+        first.ctypes.data_as(pointer),
+        second.ctypes.data_as(pointer),
+        block_offsets.ctypes.data_as(int64_pointer),
+        total_rows,
+        len(candidates),
+        block_count,
+        knot_count,
+        gradient.ctypes.data_as(pointer),
+        hessian.ctypes.data_as(pointer),
+        cross.ctypes.data_as(pointer),
+    )
+    return (gradient, hessian, cross) if status == 0 else None
 
 
 def nonnegative_quadratic_gains(

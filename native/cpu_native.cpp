@@ -506,32 +506,70 @@ PyObject* accumulate_kernel(PyObject*, PyObject* args) {
                               : nullptr;
     auto* out = static_cast<double*>(accumulator.buf);
     bool invalid = false;
+    bool allocation_failed = false;
     Py_BEGIN_ALLOW_THREADS
-    for (std::int64_t i = 0; i < count && !invalid; ++i) {
-        const auto entity = ep[i];
-        if (entity < 0 || entity >= entity_count) {
-            invalid = true;
-            break;
-        }
-        const auto maximum = std::min<std::int64_t>(lag, endp[entity] - tp[i]);
-        const auto base = offsetp[entity] + tp[i] - startp[entity];
-        for (std::int64_t l = 1; l <= maximum; ++l) {
-            const auto row = base + l;
-            if (row < 0 || row >= lookup.shape[0]) {
+    try {
+        std::vector<std::int64_t> boundaries(
+            static_cast<std::size_t>(entity_count) + 1, 0);
+        for (std::int64_t i = 0; i < count; ++i) {
+            const auto entity = ep[i];
+            if (entity < 0 || entity >= entity_count ||
+                tp[i] < startp[entity] || tp[i] > endp[entity]) {
                 invalid = true;
                 break;
             }
-            const auto position = lookp64 ? lookp64[row] : lookp32[row];
-            if (position < 0 || position >= accumulator.shape[0]) {
-                invalid = true;
-                break;
-            }
-            for (std::int64_t k = 0; k < knots; ++k) {
-                out[position * knots + k] += bp[k * lag + l - 1];
-            }
+            ++boundaries[static_cast<std::size_t>(entity) + 1];
         }
+        if (!invalid) {
+            for (std::int64_t entity = 0; entity < entity_count; ++entity) {
+                boundaries[static_cast<std::size_t>(entity) + 1] +=
+                    boundaries[static_cast<std::size_t>(entity)];
+            }
+            auto positions = boundaries;
+            std::vector<std::int64_t> ordered(static_cast<std::size_t>(count));
+            for (std::int64_t i = 0; i < count; ++i) {
+                const auto entity = ep[i];
+                ordered[static_cast<std::size_t>(
+                    positions[static_cast<std::size_t>(entity)]++)] = i;
+            }
+            int invalid_parallel = 0;
+            #pragma omp parallel for schedule(static) reduction(|:invalid_parallel)
+            for (std::int64_t entity = 0; entity < entity_count; ++entity) {
+                for (std::int64_t cursor = boundaries[static_cast<std::size_t>(entity)];
+                     cursor < boundaries[static_cast<std::size_t>(entity) + 1];
+                     ++cursor) {
+                    const auto i = ordered[static_cast<std::size_t>(cursor)];
+                    const auto maximum =
+                        std::min<std::int64_t>(lag, endp[entity] - tp[i]);
+                    const auto base = offsetp[entity] + tp[i] - startp[entity];
+                    for (std::int64_t l = 1; l <= maximum; ++l) {
+                        const auto row = base + l;
+                        if (row < 0 || row >= lookup.shape[0]) {
+                            invalid_parallel = 1;
+                            continue;
+                        }
+                        const auto position =
+                            lookp64 ? lookp64[row] : lookp32[row];
+                        if (position < 0 || position >= accumulator.shape[0]) {
+                            invalid_parallel = 1;
+                            continue;
+                        }
+                        for (std::int64_t k = 0; k < knots; ++k) {
+                            out[position * knots + k] += bp[k * lag + l - 1];
+                        }
+                    }
+                }
+            }
+            invalid = invalid_parallel != 0;
+        }
+    } catch (const std::bad_alloc&) {
+        allocation_failed = true;
     }
     Py_END_ALLOW_THREADS
+    if (allocation_failed) {
+        release();
+        return PyErr_NoMemory();
+    }
     if (invalid) {
         PyErr_SetString(PyExc_ValueError, "kernel row missing from accumulator lookup");
         release();
