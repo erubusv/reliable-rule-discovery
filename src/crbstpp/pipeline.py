@@ -1497,6 +1497,11 @@ def run(
     search_payload["formation_window_quantiles"] = list(
         config.formation_window_quantiles
     )
+    search_payload["formation_window_semantics"] = (
+        "disjoint_previous_exclusive_current_inclusive"
+        if config.formation_window_mode == "fit_quantile_band"
+        else "cumulative_zero_to_window_inclusive"
+    )
     search_payload["frozen_window_dictionary"] = {
         (
             ",".join(map(str, pattern[1]))
@@ -1519,6 +1524,21 @@ def run(
             for window, quantiles in sorted(labels.items())
         }
         for pattern, labels in sorted(optimizer.window_quantile_dictionary.items())
+    }
+    search_payload["frozen_window_bands"] = {
+        (
+            ",".join(map(str, pattern[1]))
+            if config.temporal_relations == ("unordered",)
+            else _pattern_label(pattern)
+        ): {
+            str(window): [
+                optimizer.engine.window_band_lower(pattern[1], window, pattern[0]),
+                window,
+            ]
+            for window in windows
+        }
+        for pattern, windows in sorted(optimizer.window_dictionary.items())
+        if config.formation_window_mode == "fit_quantile_band" and len(pattern[1]) > 1
     }
     search_payload["family_discovery_weights"] = {
         support_key(support): weight

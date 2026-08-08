@@ -150,9 +150,7 @@ def _parser() -> argparse.ArgumentParser:
     )
     wselob.add_argument("--raw-root", type=Path, default=Path("data/wselob_2017/raw"))
     wselob.add_argument("--output-root", type=Path)
-    wselob.add_argument(
-        "--stock", choices=tuple(WSELOB_FILES), default="PEKAO"
-    )
+    wselob.add_argument("--stock", choices=tuple(WSELOB_FILES), default="PEKAO")
     wselob.add_argument("--download", action="store_true")
     wselob.add_argument("--build-dataset", action="store_true")
     wselob.add_argument("--bin-seconds", type=int, default=5)
@@ -179,7 +177,7 @@ def _parser() -> argparse.ArgumentParser:
     )
     wselob.add_argument(
         "--target-mode",
-        choices=("down_tick", "adverse_excursion"),
+        choices=("down_tick", "adverse_excursion", "volatility_burst"),
         default="down_tick",
     )
     wselob.add_argument("--target-horizon-seconds", type=int, default=30)

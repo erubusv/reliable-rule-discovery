@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import tempfile
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 
+from crbstpp.data import Dataset, write_dataset
 from crbstpp.preprocess.wselob import (
     ASK_DOMINANCE_STARTS,
     BEST_BID_ADD,
@@ -20,10 +24,14 @@ from crbstpp.preprocess.wselob import (
     MECH_BID_REPLENISH,
     MECH_TRADE_BID_CLEAR,
     _adverse_excursion_targets,
+    _duration_weighted_quantile,
     _ordered_partition,
     _process_day,
     _process_day_mechanisms,
+    _realized_volatility,
+    _volatility_burst_targets,
 )
+from crbstpp.response import Context, ResponseEngine
 
 
 def _orders() -> pd.DataFrame:
@@ -136,3 +144,102 @@ def test_wselob_adverse_excursion_target_is_declustered_and_rearmed() -> None:
         threshold=0.02,
         rearm_fraction=0.5,
     ) == [20, 50]
+
+
+def test_wselob_realized_volatility_is_past_only_and_declustered() -> None:
+    ticks = np.asarray([0, 10, 20, 30, 40], dtype=np.int64)
+    mid = 200.0 * np.exp(np.asarray([0.0, 0.01, 0.01, -0.01, -0.01]))
+    observed_ticks, volatility = _realized_volatility(
+        ticks,
+        mid,
+        session_start_ns=0,
+        session_end_ns=40,
+        horizon_ns=20,
+    )
+    np.testing.assert_array_equal(observed_ticks, [0, 10, 20, 30, 40])
+    np.testing.assert_allclose(volatility, [0.0, 0.01, 0.01, 0.02, 0.02], atol=1e-14)
+    assert _volatility_burst_targets(
+        observed_ticks,
+        volatility,
+        threshold=0.015,
+        rearm_fraction=0.5,
+    ) == [30]
+
+
+def test_duration_weighted_quantile_uses_time_not_change_count() -> None:
+    values = np.asarray([1.0, 2.0, 3.0])
+    weights = np.asarray([8.0, 1.0, 1.0])
+    assert _duration_weighted_quantile(values, weights, 0.5) == 1.0
+    assert _duration_weighted_quantile(values, weights, 0.9) == 2.0
+
+
+def test_quantile_lag_bands_partition_cumulative_rule_response() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory) / "data"
+        write_dataset(
+            root,
+            entities=pd.DataFrame(
+                {
+                    "entity_id": ["day"],
+                    "start_time": [0],
+                    "end_time": [8],
+                    "baseline_origin": [0],
+                    "split_group": [0],
+                }
+            ),
+            events=pd.DataFrame(
+                [
+                    (0, 0, 0, 1),
+                    (0, 0, 1, 2),
+                    (0, 2, 1, 3),
+                    (0, 3, 0, 4),
+                    (0, 4, 1, 5),
+                ],
+                columns=[
+                    "entity_code",
+                    "time",
+                    "predicate_code",
+                    "primitive_event_id",
+                ],
+            ),
+            targets=pd.DataFrame(
+                [(0, 7, 1)],
+                columns=["entity_code", "time", "multiplicity"],
+            ),
+            predicate_names=("A", "B"),
+            likelihood="poisson",
+            time_unit="second",
+            adverse_event_name="movement",
+            f0_contract={
+                "dynamic_predicates": True,
+                "outcome_blind_predicate_construction": True,
+                "direct_target_proxy_excluded_from_reported_dictionary": True,
+                "strict_future_effect_required": True,
+                "atomic_predicates": True,
+                "primitive_event_provenance": True,
+                "independent_certification_units": True,
+            },
+            provenance={"test": True},
+        )
+        data = Dataset.load(root)
+        context = Context.make(data, np.asarray([0], dtype=np.int32))
+        cumulative_engine = ResponseEngine(
+            data, lag=2, knot_count=2, cache_bytes=1024**2
+        )
+        cumulative = cumulative_engine.blocks_many(context, (0, 1), (0, 1, 2))
+        band_engine = ResponseEngine(data, lag=2, knot_count=2, cache_bytes=1024**2)
+        band_engine.configure_window_bands({("unordered", (0, 1)): (0, 1, 2)})
+        bands = band_engine.blocks_many(context, (0, 1), (0, 1, 2))
+
+        def dense(block) -> np.ndarray:
+            result = np.zeros((context.n_grid, 2), dtype=np.float64)
+            result[block.rows] = block.values
+            return result
+
+        np.testing.assert_allclose(dense(bands[0]), dense(cumulative[0]))
+        np.testing.assert_allclose(
+            dense(bands[1]), dense(cumulative[1]) - dense(cumulative[0])
+        )
+        np.testing.assert_allclose(
+            dense(bands[2]), dense(cumulative[2]) - dense(cumulative[1])
+        )

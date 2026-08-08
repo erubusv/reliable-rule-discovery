@@ -27,9 +27,11 @@ from .native import (
 from .rules import (
     Antecedent,
     ClosureTerm,
+    PatternKey,
     RuleIdentity,
     Support,
     hierarchy_closure,
+    normalize_pattern,
     normalize_relation,
 )
 from .state import StateIntervals, active_at, history_state_intervals
@@ -97,9 +99,7 @@ def _temporal_baseline_layout(dataset: Dataset, time_bins: int) -> np.ndarray:
                 rows = np.arange(left, right, dtype=np.int64)
                 entity = np.searchsorted(offsets, rows, side="right") - 1
                 times = dataset.start_times[entity] + rows - offsets[entity]
-            calendar_bin = np.searchsorted(
-                calendar_edges[1:-1], times, side="right"
-            )
+            calendar_bin = np.searchsorted(calendar_edges[1:-1], times, side="right")
             age = np.maximum(0, times - dataset.baseline_origins[entity])
             age_bin = np.searchsorted(age_edges[1:-1], age, side="right")
             raw = dataset.baseline_cell_strata[left:right].astype(np.int64) + (
@@ -247,9 +247,7 @@ class Context:
             for left in range(0, len(row_strata), chunk):
                 right = min(len(row_strata), left + chunk)
                 rows_chunk = np.arange(left, right, dtype=np.int64)
-                local_chunk = (
-                    np.searchsorted(offsets, rows_chunk, side="right") - 1
-                )
+                local_chunk = np.searchsorted(offsets, rows_chunk, side="right") - 1
                 global_rows = (
                     global_offsets[entity_codes[local_chunk]]
                     + rows_chunk
@@ -257,7 +255,9 @@ class Context:
                 )
                 row_strata[left:right] = dataset.baseline_cell_strata[global_rows]
                 if row_exposure is not None:
-                    row_exposure[left:right] = dataset.baseline_cell_exposure[global_rows]
+                    row_exposure[left:right] = dataset.baseline_cell_exposure[
+                        global_rows
+                    ]
                 if row_times is not None:
                     assert dataset.baseline_cell_times is not None
                     row_times[left:right] = dataset.baseline_cell_times[global_rows]
@@ -448,9 +448,7 @@ class Context:
                 right = min(self.n_grid, left + chunk)
                 rows = np.arange(left, right, dtype=np.int64)
                 local = np.searchsorted(self.offsets, rows, side="right") - 1
-                groups = self.temporal_baseline_groups_at_rows(
-                    rows, time_bins=bins
-                )
+                groups = self.temporal_baseline_groups_at_rows(rows, time_bins=bins)
                 exposure = (
                     np.ones(len(rows), dtype=np.float64)
                     if self.baseline_row_exposure is None
@@ -517,9 +515,7 @@ class Context:
         if self.baseline_row_strata is not None:
             rows = np.arange(self.n_grid, dtype=np.int64)
             local, times = self.rows_to_entity_time(rows)
-            row_groups = self.temporal_baseline_groups_at_rows(
-                rows, time_bins=bins
-            )
+            row_groups = self.temporal_baseline_groups_at_rows(rows, time_bins=bins)
             if self.baseline_row_exposure is not None:
                 observed = self.baseline_row_exposure > 0.0
                 local = local[observed]
@@ -535,9 +531,11 @@ class Context:
             right_times = times + np.rint(
                 exposures * self.dataset.ticks_per_unit
             ).astype(np.int64)
-            boundary = np.r_[True, local[1:] != local[:-1]] | np.r_[
-                True, row_groups[1:] != row_groups[:-1]
-            ] | np.r_[True, times[1:] != right_times[:-1]]
+            boundary = (
+                np.r_[True, local[1:] != local[:-1]]
+                | np.r_[True, row_groups[1:] != row_groups[:-1]]
+                | np.r_[True, times[1:] != right_times[:-1]]
+            )
             first = np.flatnonzero(boundary)
             last = np.r_[first[1:] - 1, len(times) - 1]
             return (
@@ -606,10 +604,10 @@ class Context:
             weights=(right - left).astype(np.float64),
             minlength=len(self.entity_codes),
         )
-        if not np.array_equal(
-            covered.astype(np.int64), self.ends - self.starts + 1
-        ):
-            raise AssertionError("temporal baseline segments do not cover risk intervals")
+        if not np.array_equal(covered.astype(np.int64), self.ends - self.starts + 1):
+            raise AssertionError(
+                "temporal baseline segments do not cover risk intervals"
+            )
         return entity, left, right, group
 
     def weighted_baseline_totals(
@@ -624,9 +622,9 @@ class Context:
         """Return declared observation opportunity per selected entity."""
         if self.baseline_row_exposure is None:
             return (self.ends - self.starts + 1).astype(np.float64)
-        return np.add.reduceat(
-            self.baseline_row_exposure, self.offsets[:-1]
-        ).astype(np.float64)
+        return np.add.reduceat(self.baseline_row_exposure, self.offsets[:-1]).astype(
+            np.float64
+        )
 
     def all_row_weights(self) -> np.ndarray:
         if self.uniform_entity_weight is not None:
@@ -793,9 +791,7 @@ class ResponseEngine:
                 np.arange(self.knot_count + 1, dtype=np.int64) * self.lag_units
             ) // self.knot_count
             unit_edges[-1] = self.lag_units
-            self.basis = np.zeros(
-                (self.knot_count, self.lag_units), dtype=np.float64
-            )
+            self.basis = np.zeros((self.knot_count, self.lag_units), dtype=np.float64)
             for index in range(self.knot_count):
                 left, right = int(unit_edges[index]), int(unit_edges[index + 1])
                 width = max(1, right - left)
@@ -833,6 +829,14 @@ class ResponseEngine:
             + len(self.control_predicates) * self.knot_count
         )
         self.cache_bytes = max(0, int(cache_bytes))
+        # A quantile-band dictionary is frozen on D_fit by SupportOptimizer.
+        # Missing entries retain the historical cumulative ``span <= W``
+        # response.  For a registered higher-order pattern, W=0 is the exact
+        # same-tick identity and every positive W is the disjoint interval
+        # ``previous_W < span <= W``.  The map lives in the response engine so
+        # route pricing, exact fitting and held-out footprints cannot silently
+        # disagree about the meaning of W.
+        self._window_band_lower: dict[tuple[str, Antecedent, int], int] = {}
         # Numeric LRUs together stay within ``cache_bytes``.  Threshold rows
         # and their dense int32 lookup are reused by many triplet closures;
         # reserving explicit space for them avoids rebuilding an O(n_grid)
@@ -890,6 +894,46 @@ class ResponseEngine:
         # Keep these locks for the engine lifetime: the number of structural
         # keys is finite and tiny compared with the cached numeric arrays.
         self._compute_locks: dict[tuple, threading.Lock] = {}
+
+    @property
+    def has_window_bands(self) -> bool:
+        return bool(self._window_band_lower)
+
+    def configure_window_bands(
+        self,
+        window_dictionary: dict[PatternKey, tuple[int, ...]],
+    ) -> None:
+        """Freeze disjoint formation-lag intervals for this engine.
+
+        The dictionary must already have been learned without target values on
+        D_fit.  Calling this method after a response block has been built would
+        make an existing cache key ambiguous, so that misuse is rejected.
+        """
+
+        if self._cache or self._footprint_cache:
+            raise RuntimeError("window bands must be configured before response use")
+        bands: dict[tuple[str, Antecedent, int], int] = {}
+        for raw_pattern, raw_windows in window_dictionary.items():
+            relation, antecedent = normalize_pattern(raw_pattern)
+            if len(antecedent) == 1:
+                continue
+            previous = 0
+            for window in sorted(set(map(int, raw_windows))):
+                if window < 0:
+                    raise ValueError("window-band boundaries must be nonnegative")
+                lower = -1 if window == 0 else previous
+                bands[(relation, antecedent, window)] = int(lower)
+                previous = window
+        self._window_band_lower = bands
+
+    def window_band_lower(
+        self,
+        antecedent: Antecedent,
+        window: int,
+        relation: str = "unordered",
+    ) -> int | None:
+        relation = "atomic" if len(antecedent) == 1 else str(relation)
+        return self._window_band_lower.get((relation, antecedent, int(window)))
 
     def _keep_unaggregated_design(self, x: np.ndarray) -> bool:
         """Return whether exact hash aggregation is predictably unproductive.
@@ -1085,7 +1129,9 @@ class ResponseEngine:
                     block_keys.add(
                         (id(context), closure_relation, term.antecedent, term.window)
                     )
-                    completion_keys.add((id(context), closure_relation, term.antecedent))
+                    completion_keys.add(
+                        (id(context), closure_relation, term.antecedent)
+                    )
             for rule in support.rules:
                 if rule.history_marks:
                     block_keys.add(
@@ -1110,9 +1156,7 @@ class ResponseEngine:
                     block_keys.add(
                         (id(context), rule.relation, rule.antecedent, rule.window)
                     )
-                    completion_keys.add(
-                        (id(context), rule.relation, rule.antecedent)
-                    )
+                    completion_keys.add((id(context), rule.relation, rule.antecedent))
         context_id = id(context)
         with self._lock:
             for key in tuple(self._cache):
@@ -1233,9 +1277,9 @@ class ResponseEngine:
                     self._marked_source_cache.move_to_end(key)
                     return cached
             entities, times, primitive_ids = self._source(predicate, context)
-            keep = self._history_prior_counts(
-                predicate, lookback, context
-            ) >= int(threshold)
+            keep = self._history_prior_counts(predicate, lookback, context) >= int(
+                threshold
+            )
             result = (
                 np.ascontiguousarray(entities[keep], dtype=np.int32),
                 np.ascontiguousarray(times[keep], dtype=np.int64),
@@ -1250,8 +1294,7 @@ class ResponseEngine:
                     self._marked_source_cache[key] = result
                     self._marked_source_cache_size += size
                     while (
-                        self._marked_source_cache_size
-                        > self._marked_source_cache_limit
+                        self._marked_source_cache_size > self._marked_source_cache_limit
                         and len(self._marked_source_cache) > 1
                     ):
                         _, removed = self._marked_source_cache.popitem(last=False)
@@ -1375,9 +1418,7 @@ class ResponseEngine:
             source_ids,
             context.ends,
             transform=str(definition["transform"]),
-            horizon_ticks=(
-                int(definition["horizon"]) * self.dataset.ticks_per_unit
-            ),
+            horizon_ticks=(int(definition["horizon"]) * self.dataset.ticks_per_unit),
         )
         with self._lock:
             incumbent = self._state_interval_cache.setdefault(key, result)
@@ -1437,7 +1478,9 @@ class ResponseEngine:
         )
         if state_predicates:
             event_predicates = tuple(
-                predicate for predicate in antecedent if predicate not in state_predicates
+                predicate
+                for predicate in antecedent
+                if predicate not in state_predicates
             )
             if relation == "ordered":
                 raise ValueError("ordered relations cannot contain history-state atoms")
@@ -1854,9 +1897,7 @@ class ResponseEngine:
             np.concatenate(
                 [
                     np.arange(start, stop, dtype=np.int64)
-                    for start, stop in zip(
-                        merged_left, merged_right, strict=True
-                    )
+                    for start, stop in zip(merged_left, merged_right, strict=True)
                 ]
             ),
             dtype=np.int64,
@@ -1984,7 +2025,9 @@ class ResponseEngine:
                 dtype=np.int64,
             ),
             np.ascontiguousarray(
-                np.concatenate(span_parts) if span_parts else np.zeros(0, dtype=np.int64),
+                np.concatenate(span_parts)
+                if span_parts
+                else np.zeros(0, dtype=np.int64),
                 dtype=np.int64,
             ),
         )
@@ -2025,12 +2068,80 @@ class ResponseEngine:
                 )
             )[1]
 
+    def _block_from_completion_band(
+        self,
+        context: Context,
+        entities: np.ndarray,
+        times: np.ndarray,
+        spans: np.ndarray,
+        *,
+        lower_ticks: int,
+        upper_ticks: int,
+    ) -> SparseBlock:
+        """Build one exact ``lower < span <= upper`` response block."""
+
+        admitted = (spans > int(lower_ticks)) & (spans <= int(upper_ticks))
+        entities = entities[admitted]
+        times = times[admitted]
+        spans = spans[admitted]
+        if self.continuous:
+            return self._continuous_block_from_completions(
+                context,
+                entities,
+                times,
+                spans,
+                window_ticks=int(upper_ticks),
+            )
+        contributions = kernel_contributions(
+            entities,
+            times,
+            spans,
+            context.starts,
+            context.ends,
+            context.offsets,
+            self.basis,
+            int(upper_ticks),
+        )
+        if contributions is None:
+            rows_list: list[int] = []
+            values_list: list[np.ndarray] = []
+            for entity, completion in zip(
+                entities.tolist(), times.tolist(), strict=True
+            ):
+                base = int(
+                    context.offsets[entity] + completion - context.starts[entity]
+                )
+                remaining = min(self.lag, int(context.ends[entity] - completion))
+                for lag in range(1, remaining + 1):
+                    rows_list.append(base + lag)
+                    values_list.append(self.basis[:, lag - 1])
+            raw_rows = np.asarray(rows_list, dtype=np.int64)
+            raw_values = (
+                np.asarray(values_list, dtype=np.float64)
+                if values_list
+                else np.zeros((0, self.knot_count), dtype=np.float64)
+            )
+        else:
+            raw_rows, raw_values = contributions
+        if not len(raw_rows):
+            return SparseBlock(
+                np.zeros(0, dtype=np.int64),
+                np.zeros((0, self.knot_count), dtype=np.float64),
+            )
+        order = np.argsort(raw_rows, kind="stable")
+        sorted_rows = np.asarray(raw_rows[order], dtype=np.int64)
+        sorted_values = np.asarray(raw_values[order], dtype=np.float64)
+        rows, first = np.unique(sorted_rows, return_index=True)
+        values = np.add.reduceat(sorted_values, first, axis=0)
+        return SparseBlock(
+            np.ascontiguousarray(rows, dtype=np.int64),
+            np.ascontiguousarray(values, dtype=np.float64),
+        )
+
     def rule_block(self, context: Context, rule: RuleIdentity) -> SparseBlock:
         """Return the exact response block for one finite rule identity."""
         if not rule.history_marks:
-            return self.block(
-                context, rule.antecedent, rule.window, rule.relation
-            )
+            return self.block(context, rule.antecedent, rule.window, rule.relation)
         key = (
             id(context),
             "history-rule",
@@ -2052,6 +2163,17 @@ class ResponseEngine:
                     return cached
             entities, times, spans = self.rule_completions(context, rule)
             window_ticks = int(rule.window) * self.dataset.ticks_per_unit
+            lower = self.window_band_lower(rule.antecedent, rule.window, rule.relation)
+            if lower is not None:
+                result = self._block_from_completion_band(
+                    context,
+                    entities,
+                    times,
+                    spans,
+                    lower_ticks=int(lower) * self.dataset.ticks_per_unit,
+                    upper_ticks=window_ticks,
+                )
+                return self._retain_block(key, result)
             if self.continuous:
                 result = self._continuous_block_from_completions(
                     context,
@@ -2082,13 +2204,9 @@ class ResponseEngine:
                     entities.tolist(), times.tolist(), strict=True
                 ):
                     base = int(
-                        context.offsets[entity]
-                        + completion
-                        - context.starts[entity]
+                        context.offsets[entity] + completion - context.starts[entity]
                     )
-                    remaining = min(
-                        self.lag, int(context.ends[entity] - completion)
-                    )
+                    remaining = min(self.lag, int(context.ends[entity] - completion))
                     for lag in range(1, remaining + 1):
                         rows_list.append(base + lag)
                         values_list.append(self.basis[:, lag - 1])
@@ -2249,16 +2367,11 @@ class ResponseEngine:
         # sparse state-splice builder.
         for key in set(target_geometry).difference(source_geometry):
             rule = target_geometry[key]
-            if any(
-                self._more_specific(rule, other)
-                for other in target.rules
-            ):
+            if any(self._more_specific(rule, other) for other in target.rules):
                 return True
         return False
 
-    def rule_design_values(
-        self, block: SparseBlock, rule: RuleIdentity
-    ) -> np.ndarray:
+    def rule_design_values(self, block: SparseBlock, rule: RuleIdentity) -> np.ndarray:
         """Return the exact design for a rule's declared kernel family.
 
         ``kernel_rank=1`` is the normalized constant mixture of the configured
@@ -2296,17 +2409,18 @@ class ResponseEngine:
         """
 
         raw = tuple(self.rule_block(context, rule) for rule in support.rules)
-        if self.effect_model in {"additive_hierarchy", "support_additive"} or any(
-            rule.hierarchical for rule in support.rules
-        ) or any(rule.support_additive for rule in support.rules):
+        if (
+            self.effect_model in {"additive_hierarchy", "support_additive"}
+            or any(rule.hierarchical for rule in support.rules)
+            or any(rule.support_additive for rule in support.rules)
+        ):
             return raw
         output: list[SparseBlock] = []
         for index, (rule, block) in enumerate(zip(support.rules, raw, strict=True)):
             dominator_rows = [
                 raw[other_index].rows
                 for other_index, other in enumerate(support.rules)
-                if self._more_specific(rule, other)
-                and len(raw[other_index].rows)
+                if self._more_specific(rule, other) and len(raw[other_index].rows)
             ]
             if not dominator_rows or not len(block.rows):
                 output.append(block)
@@ -2476,8 +2590,7 @@ class ResponseEngine:
             return
         relation = "atomic" if len(antecedent) == 1 else str(relation)
         keys = {
-            window: (id(context), relation, antecedent, window)
-            for window in requested
+            window: (id(context), relation, antecedent, window) for window in requested
         }
         with self._lock:
             cached = {
@@ -2490,6 +2603,31 @@ class ResponseEngine:
         if len(cached) == len(requested):
             for window in requested:
                 yield window, cached[window]
+            return
+        band_lowers = {
+            window: self.window_band_lower(antecedent, window, relation)
+            for window in requested
+        }
+        if any(lower is not None for lower in band_lowers.values()):
+            if any(lower is None for lower in band_lowers.values()):
+                raise ValueError("one pattern cannot mix cumulative and band windows")
+            entities, times, spans = self.completions(context, antecedent, relation)
+            for window in requested:
+                result = cached.get(window)
+                if result is None:
+                    result = self._block_from_completion_band(
+                        context,
+                        entities,
+                        times,
+                        spans,
+                        lower_ticks=(
+                            int(band_lowers[window]) * self.dataset.ticks_per_unit
+                        ),
+                        upper_ticks=window * self.dataset.ticks_per_unit,
+                    )
+                    if retain:
+                        result = self._retain_block(keys[window], result)
+                yield window, result
             return
         if self.continuous:
             entities, times, spans = self.completions(context, antecedent, relation)
@@ -2744,9 +2882,9 @@ class ResponseEngine:
             if not len(block.rows):
                 continue
             positions = np.searchsorted(union, block.rows)
-            x_active[positions, destination] = (
-                float(rule.sign) * self.rule_design_values(block, rule)
-            )
+            x_active[positions, destination] = float(
+                rule.sign
+            ) * self.rule_design_values(block, rule)
         matrix = self._finalize_model_matrix(
             context,
             support,
@@ -3083,17 +3221,16 @@ class ResponseEngine:
         # doing so loses target-only rows from the active union.  Rebuilding
         # this uncommon transition is exact and preserves the compact fast
         # path for its intended one-step use.
-        if (
-            len(source.active_rows) == 0
-            and (source.support.rules or source.closure)
-        ):
+        if len(source.active_rows) == 0 and (source.support.rules or source.closure):
             return self.model_matrix(context, support, forced_closure=forced_closure)
         closure = (
             hierarchy_closure(support)
             if forced_closure is None
             else tuple(sorted(forced_closure))
         )
-        if any(rule.kernel_rank != 0 for rule in (*source.support.rules, *support.rules)):
+        if any(
+            rule.kernel_rank != 0 for rule in (*source.support.rules, *support.rules)
+        ):
             # Variable-width representation changes are rare terminal audits.
             # Rebuilding is exact and avoids routing the fixed-M incremental
             # builder through an invalid column layout.
@@ -3535,9 +3672,7 @@ class ResponseEngine:
         terms = tuple(
             ClosureTerm((fake_base + index,), 0) for index in range(len(blocks))
         )
-        specifications = [
-            (term.antecedent, 0, 1.0, "closure", term) for term in terms
-        ]
+        specifications = [(term.antecedent, 0, 1.0, "closure", term) for term in terms]
         active_parts = [source.active_rows]
         active_parts.extend(block.rows for block in blocks if len(block.rows))
         union = sorted_unique_union(active_parts)
@@ -3557,9 +3692,7 @@ class ResponseEngine:
             specifications=specifications,
             blocks=blocks,
             closure_index={term: index for index, term in enumerate(terms)},
-            rule_index={
-                rule: index for index, rule in enumerate(source.support.rules)
-            },
+            rule_index={rule: index for index, rule in enumerate(source.support.rules)},
             dimension=(
                 baseline_dim
                 + temporary_dimension
@@ -3691,9 +3824,7 @@ class ResponseEngine:
             count = len(source_design) if rows is None else len(rows)
             output = np.empty((count, dimension), dtype=np.float64)
             if rows is None:
-                output[:, :baseline_dimension] = source_design[
-                    :, :baseline_dimension
-                ]
+                output[:, :baseline_dimension] = source_design[:, :baseline_dimension]
             else:
                 output[:, :baseline_dimension] = source_design[
                     rows, :baseline_dimension
@@ -3702,9 +3833,7 @@ class ResponseEngine:
                 if rows is None:
                     output[:, target_slices[rule]] = source_design[:, source_slice]
                 else:
-                    output[:, target_slices[rule]] = source_design[
-                        rows, source_slice
-                    ]
+                    output[:, target_slices[rule]] = source_design[rows, source_slice]
             output[:, target_slices[added_rule]] = 0.0
             return output
 
@@ -4214,20 +4343,12 @@ class ResponseEngine:
         # keeping them avoids an unnecessary complete-union rebuild.
         source_is_touched = np.zeros(len(source.active_rows), dtype=bool)
         if len(source.active_rows) and len(touched):
-            touched_positions_in_source = np.searchsorted(
-                touched, source.active_rows
-            )
+            touched_positions_in_source = np.searchsorted(touched, source.active_rows)
             source_is_touched = touched_positions_in_source < len(touched)
-            touched_safe = np.minimum(
-                touched_positions_in_source, len(touched) - 1
-            )
-            source_is_touched &= (
-                touched[touched_safe] == source.active_rows
-            )
+            touched_safe = np.minimum(touched_positions_in_source, len(touched) - 1)
+            source_is_touched &= touched[touched_safe] == source.active_rows
         if len(source.active_rows):
-            untouched_parent_groups = source.active_design_groups[
-                ~source_is_touched
-            ]
+            untouched_parent_groups = source.active_design_groups[~source_is_touched]
             if np.any(
                 (untouched_parent_groups < 0)
                 | (untouched_parent_groups >= source_group_count)
@@ -4584,7 +4705,11 @@ class ResponseEngine:
         if rule.history_marks:
             entities, times, spans = self.rule_completions(context, rule)
             maximum_span = int(rule.window) * self.dataset.ticks_per_unit
-            admitted = spans <= maximum_span
+            lower = self.window_band_lower(rule.antecedent, rule.window, rule.relation)
+            minimum_span = (
+                int(lower) * self.dataset.ticks_per_unit if lower is not None else -1
+            )
+            admitted = (spans > minimum_span) & (spans <= maximum_span)
             if self.continuous:
                 return self._continuous_footprint_rows(
                     context,
@@ -4639,6 +4764,48 @@ class ResponseEngine:
         if not unique_windows:
             return {}
         horizon_units = self.lag_units if horizon is None else int(horizon)
+        band_lowers = {
+            window: self.window_band_lower(antecedent, window, relation)
+            for window in unique_windows
+        }
+        if any(lower is not None for lower in band_lowers.values()):
+            if any(lower is None for lower in band_lowers.values()):
+                raise ValueError("one pattern cannot mix cumulative and band windows")
+            if horizon_units == self.lag_units:
+                return {
+                    window: self.block(context, antecedent, window, relation).rows
+                    for window in unique_windows
+                }
+            entities, times, spans = self.completions(context, antecedent, relation)
+            output: dict[int, np.ndarray] = {}
+            horizon_ticks = horizon_units * self.dataset.ticks_per_unit
+            for window in unique_windows:
+                lower_ticks = int(band_lowers[window]) * self.dataset.ticks_per_unit
+                upper_ticks = int(window) * self.dataset.ticks_per_unit
+                admitted = (spans > lower_ticks) & (spans <= upper_ticks)
+                selected_entities = entities[admitted]
+                selected_times = times[admitted]
+                if self.continuous:
+                    output[window] = self._continuous_footprint_rows(
+                        context,
+                        selected_entities,
+                        selected_times,
+                        horizon_ticks=horizon_ticks,
+                    )
+                    continue
+                rows: list[int] = []
+                for entity, completion in zip(
+                    selected_entities.tolist(), selected_times.tolist(), strict=True
+                ):
+                    remaining = min(
+                        horizon_ticks, int(context.ends[entity] - completion)
+                    )
+                    base = int(
+                        context.offsets[entity] + completion - context.starts[entity]
+                    )
+                    rows.extend(base + lag for lag in range(1, remaining + 1))
+                output[window] = np.unique(np.asarray(rows, dtype=np.int64))
+            return output
         rows, minimum_spans = self.response_row_thresholds(
             context,
             antecedent,

@@ -2421,9 +2421,7 @@ class SupportOptimizer:
             (current.support,)
         )
         current_profile = (
-            None
-            if current_profiles is None
-            else current_profiles.get(current.support)
+            None if current_profiles is None else current_profiles.get(current.support)
         )
         if current_profile is None:
             current_profile = self._fisher_effect_profile(current)
@@ -2478,9 +2476,7 @@ class SupportOptimizer:
         # interval profile; infinite/unsupported bounds retain the old
         # fail-open evaluation.  The final ordinary Pareto loop below remains
         # unchanged and therefore returns the same representatives.
-        novelty_uppers = self._continuous_candidate_novelty_uppers(
-            current, items
-        )
+        novelty_uppers = self._continuous_candidate_novelty_uppers(current, items)
         tolerance = self.config.search_tolerance
         safely_dominated = 0
         ordered_items = sorted(items, key=lambda value: (-value[0], value[2]))
@@ -2496,9 +2492,7 @@ class SupportOptimizer:
             for candidate in batch:
                 novelty = None if batched is None else batched.get(candidate[2])
                 if batched is None or novelty is None:
-                    profile = self._candidate_fisher_profile(
-                        current, candidate[2]
-                    )
+                    profile = self._candidate_fisher_profile(current, candidate[2])
                     novelty = (
                         None
                         if profile is None
@@ -3236,6 +3230,8 @@ class SupportOptimizer:
                 self.window_quantile_dictionary,
             ) = self._structurally_admissible_dictionary(all_skeletons)
         self.window_dictionary = _PatternWindowDictionary(self.window_dictionary)
+        if config.formation_window_mode == "fit_quantile_band":
+            self.engine.configure_window_bands(dict(self.window_dictionary))
         self.window_quantile_dictionary = _PatternWindowDictionary(  # type: ignore[arg-type,assignment]
             self.window_quantile_dictionary  # type: ignore[arg-type]
         )
@@ -3405,9 +3401,7 @@ class SupportOptimizer:
         self._record_cache_limit = max(1, config.cache_bytes // 8)
         self._relaxed_upper_cache: OrderedDict[tuple, float] = OrderedDict()
         self._relaxed_upper_limit = max(1, min(200_000, config.cache_bytes // 256))
-        self._state_splice_upper_cache: OrderedDict[
-            tuple, float
-        ] = OrderedDict()
+        self._state_splice_upper_cache: OrderedDict[tuple, float] = OrderedDict()
         self._state_splice_group_states: OrderedDict[
             tuple[Support, tuple[ClosureTerm, ...], int],
             _StateSpliceRelaxationState,
@@ -3731,9 +3725,7 @@ class SupportOptimizer:
         # vector, not merely for the immutable support key.  Keeping the tiny
         # signatures beside the bounded caches makes a warm uninterrupted
         # run and a checkpoint resume use the same exact profiles.
-        self._fisher_effect_profile_signatures: dict[
-            Support, tuple[float, bytes]
-        ] = {}
+        self._fisher_effect_profile_signatures: dict[Support, tuple[float, bytes]] = {}
         self._online_pareto_reference_predicates: frozenset[int] = frozenset()
         self._predicate_coverage_root_alternatives: dict[
             int, tuple[PatternKey, ...]
@@ -3755,18 +3747,14 @@ class SupportOptimizer:
         self._route_sparse_profiles: OrderedDict[Support, _SparseProfile] = (
             OrderedDict()
         )
-        self._route_sparse_profile_signatures: dict[
-            Support, tuple[float, bytes]
-        ] = {}
+        self._route_sparse_profile_signatures: dict[Support, tuple[float, bytes]] = {}
         self._route_sparse_profile_bytes = 0
         self._route_sparse_profile_limit = profile_limit
         self._rashomon_basin_by_support: dict[Support, Support] = {}
         self._rashomon_basin_profiles: OrderedDict[
             Support, tuple[np.ndarray, np.ndarray]
         ] = OrderedDict()
-        self._rashomon_basin_profile_signatures: dict[
-            Support, tuple[float, bytes]
-        ] = {}
+        self._rashomon_basin_profile_signatures: dict[Support, tuple[float, bytes]] = {}
         self._fisher_effect_profile_bytes = 0
         self._rashomon_basin_profile_bytes = 0
         # Continuous route diversity reuses the exact standalone-root effects
@@ -4064,12 +4052,9 @@ class SupportOptimizer:
         """
         recession_checked = False
         if (
-            (
-                is_poisson_likelihood(self.context.dataset.likelihood)
-                or self.context.dataset.likelihood == "first_event_cloglog"
-            )
-            and matrix.x.nbytes > 256 * 1024**2
-        ):
+            is_poisson_likelihood(self.context.dataset.likelihood)
+            or self.context.dataset.likelihood == "first_event_cloglog"
+        ) and matrix.x.nbytes > 256 * 1024**2:
             # The dense coordinate-recession audit used to scan every element
             # of this multi-GiB matrix before each exact fit.  In the signed
             # nonnegative block model the same condition is determined exactly
@@ -4731,8 +4716,7 @@ class SupportOptimizer:
                     set(self._rashomon_basin_by_support.values()),
                     key=lambda value: value.rules,
                 )
-                if (record := self._stored_metadata_record(representative))
-                is not None
+                if (record := self._stored_metadata_record(representative)) is not None
                 and record.fit.converged
             ],
             "closure_signs": [
@@ -4806,14 +4790,10 @@ class SupportOptimizer:
                     "penalty": float(stored.penalty),
                     "score": float(stored.score),
                     "rule_score": (
-                        None
-                        if stored.rule_score is None
-                        else float(stored.rule_score)
+                        None if stored.rule_score is None else float(stored.rule_score)
                     ),
                     "rule_score_upper": (
-                        None
-                        if stored.rule_score is None
-                        else float(stored.rule_score)
+                        None if stored.rule_score is None else float(stored.rule_score)
                     ),
                     "closure_null_nll": (
                         None
@@ -6053,7 +6033,10 @@ class SupportOptimizer:
                     self.context, antecedent, windows, relation=relation
                 )
                 provenance = {window: () for window in effective}
-            elif self.config.formation_window_mode == "fit_quantile":
+            elif self.config.formation_window_mode in {
+                "fit_quantile",
+                "fit_quantile_band",
+            }:
                 effective, provenance = self.engine.quantile_windows_with_provenance(
                     self.context,
                     antecedent,
@@ -10807,6 +10790,7 @@ class SupportOptimizer:
             len(pending_supports),
             time.perf_counter() - solve_started,
         )
+
         # The sparse representation is the exact full-grid likelihood, not an
         # approximation. A numerical nonconvergence therefore continues the
         # same sparse cone problem to the same KKT tolerance. Independent
@@ -15658,9 +15642,7 @@ class SupportOptimizer:
                 one_positions = np.argmax(pure_baseline, axis=1)
                 row_index = np.arange(len(pure_rows), dtype=np.int64)
                 one_values = pure_baseline[row_index, one_positions]
-                one_hot = (
-                    np.abs(one_values - 1.0) <= tolerance
-                ) & (
+                one_hot = (np.abs(one_values - 1.0) <= tolerance) & (
                     np.count_nonzero(
                         np.abs(pure_baseline) > tolerance,
                         axis=1,
@@ -15668,9 +15650,7 @@ class SupportOptimizer:
                     == 1
                 )
                 for baseline_group in range(baseline_count):
-                    matches = pure_rows[
-                        one_hot & (one_positions == baseline_group)
-                    ]
+                    matches = pure_rows[one_hot & (one_positions == baseline_group)]
                     if len(matches) > 1:
                         raise AssertionError("duplicate pure baseline design group")
                     if len(matches) == 1:
@@ -15678,9 +15658,7 @@ class SupportOptimizer:
             missing: list[np.ndarray] = []
             for baseline_group in range(baseline_count):
                 if baseline_to_design[baseline_group] < 0:
-                    expected = np.zeros(
-                        current.matrix.dimension, dtype=np.float64
-                    )
+                    expected = np.zeros(current.matrix.dimension, dtype=np.float64)
                     expected[baseline_group] = 1.0
                     baseline_to_design[baseline_group] = len(current.matrix.x) + len(
                         missing
@@ -15943,6 +15921,13 @@ class SupportOptimizer:
         """Price a same-shape candidate batch from compact event streams."""
         if not specifications:
             return None
+        # The native compact operator receives cumulative upper windows.  A
+        # lag-band rule is an exact completion subset, not the difference of
+        # two Fisher matrices, so reusing that operator would give an
+        # incorrect Hessian.  Fail open to the exact sparse batched backend;
+        # this affects execution only and keeps every candidate.
+        if self.engine.has_window_bands:
+            return None
         # The observation-mask compact path is exact for likelihood moments,
         # but footprint relaxations also require explicit opportunity counts.
         # Until those optional audit statistics have a mask-aware native
@@ -15963,9 +15948,8 @@ class SupportOptimizer:
             )
             for antecedent, window, closure, keys in specifications
         )
-        if (
-            self.context.dataset.likelihood == "continuous_poisson"
-            and (first is None or second is None)
+        if self.context.dataset.likelihood == "continuous_poisson" and (
+            first is None or second is None
         ):
             if current.support == EMPTY_SUPPORT:
                 first, second = self._baseline_grid_derivatives(current)
@@ -16007,8 +15991,7 @@ class SupportOptimizer:
             )
             candidate_windows = np.ascontiguousarray(
                 [
-                    int(specification[3][0][1])
-                    * self.context.dataset.ticks_per_unit
+                    int(specification[3][0][1]) * self.context.dataset.ticks_per_unit
                     for specification in specifications
                 ],
                 dtype=np.int64,
@@ -16016,7 +15999,12 @@ class SupportOptimizer:
             current_groups, current_x = self._implicit_current_groups(current)
             with self._continuous_moment_state_lock:
                 state = self._continuous_moment_state
-                if state is None or state[0] is not current or state[1] is not first or state[2] is not second:
+                if (
+                    state is None
+                    or state[0] is not current
+                    or state[1] is not first
+                    or state[2] is not second
+                ):
                     prefix_first = np.empty(len(first) + 1, dtype=np.float64)
                     prefix_second = np.empty(len(second) + 1, dtype=np.float64)
                     prefix_first[0] = 0.0
@@ -17311,7 +17299,8 @@ class SupportOptimizer:
         relation, antecedent = pattern
         requested = tuple(sorted(set(map(int, windows))))
         if (
-            len(requested) < 2
+            self.engine.has_window_bands
+            or len(requested) < 2
             or len(antecedent) < 2
             or not incremental_kernel_available()
         ):
@@ -20714,6 +20703,14 @@ class SupportOptimizer:
                     self._skeleton_witnesses.update(best_by_pattern)
             return tuple(survivors)
 
+        # The signed-shell relaxation below summarizes a cumulative response
+        # by the minimum span reaching each row.  Disjoint lag bands can have
+        # several completions from different bands on the same row, so that
+        # summary is not an upper-bound certificate for a band identity.
+        # Retain every identity and let the exact band block/Fisher path decide.
+        if self.engine.has_window_bands:
+            return identities
+
         survivors: list[RuleIdentity] = []
         scored: list[tuple[float, RuleIdentity]] = []
         # A node can enter the safe bound twice: once while opening delayed
@@ -20760,15 +20757,12 @@ class SupportOptimizer:
             return tuple(survivors)
 
         def response_rows(pattern: PatternKey, window: int) -> np.ndarray:
-            rows, minimum_spans = self.engine.response_row_thresholds(
+            return self.engine.response_rows_many(
                 self.context,
                 pattern[1],
-                int(window),
+                (int(window),),
                 relation=pattern[0],
-            )
-            return rows[
-                minimum_spans <= int(window) * self.context.dataset.ticks_per_unit
-            ]
+            )[int(window)]
 
         matrix_signed_state: np.ndarray | None = None
         if (
@@ -25791,14 +25785,11 @@ class SupportOptimizer:
             metadata = self.engine.model_metadata(trial)
             if (
                 metadata.closure != base.matrix.closure
-                or metadata.dimension
-                != base.matrix.dimension + self.config.knot_count
+                or metadata.dimension != base.matrix.dimension + self.config.knot_count
                 or self.engine.total_state_geometry_changed(base.support, trial)
             ):
                 continue
-            grouped.setdefault((rule.pattern_key, int(rule.window)), []).append(
-                rule
-            )
+            grouped.setdefault((rule.pattern_key, int(rule.window)), []).append(rule)
         if not grouped:
             return frozenset()
         specifications = tuple(
@@ -25830,18 +25821,12 @@ class SupportOptimizer:
             return None
         gradients = moments[0]
         certified: set[RuleIdentity] = set()
-        for ((_, _), rules), unsigned in zip(
-            grouped.items(), gradients, strict=True
-        ):
+        for ((_, _), rules), unsigned in zip(grouped.items(), gradients, strict=True):
             for rule in rules:
-                gradient = float(rule.sign) * np.asarray(
-                    unsigned, dtype=np.float64
-                )
+                gradient = float(rule.sign) * np.asarray(unsigned, dtype=np.float64)
                 if np.any(~np.isfinite(gradient)):
                     continue
-                scale = max(
-                    1.0, float(np.max(np.abs(gradient), initial=0.0))
-                )
+                scale = max(1.0, float(np.max(np.abs(gradient), initial=0.0)))
                 margin = max(
                     64.0 * np.finfo(np.float64).eps * scale,
                     4.0 * self.config.solver_tolerance,
@@ -25908,15 +25893,9 @@ class SupportOptimizer:
             changes = np.empty(len(group_by_row), dtype=np.bool_)
             changes[0] = True
             changes[1:] = group_by_row[1:] != group_by_row[:-1]
-            run_starts = np.ascontiguousarray(
-                np.flatnonzero(changes), dtype=np.int64
-            )
-            run_ids = np.ascontiguousarray(
-                group_by_row[run_starts], dtype=np.int32
-            )
-            edges = np.ascontiguousarray(
-                self.engine.continuous_edges, dtype=np.int64
-            )
+            run_starts = np.ascontiguousarray(np.flatnonzero(changes), dtype=np.int64)
+            run_ids = np.ascontiguousarray(group_by_row[run_starts], dtype=np.int32)
+            edges = np.ascontiguousarray(self.engine.continuous_edges, dtype=np.int64)
             scales = np.ascontiguousarray(
                 self.context.dataset.ticks_per_unit / np.diff(edges),
                 dtype=np.float64,
@@ -25945,8 +25924,7 @@ class SupportOptimizer:
                     np.full(candidate_count, len(entities), dtype=np.int64),
                     np.asarray(
                         [
-                            int(rule.window)
-                            * self.context.dataset.ticks_per_unit
+                            int(rule.window) * self.context.dataset.ticks_per_unit
                             for rule in rules
                         ],
                         dtype=np.int64,
@@ -25974,9 +25952,7 @@ class SupportOptimizer:
                     continue
                 gradients = moments[0]
                 for rule, unsigned in zip(rules, gradients, strict=True):
-                    gradient = float(rule.sign) * np.asarray(
-                        unsigned, dtype=np.float64
-                    )
+                    gradient = float(rule.sign) * np.asarray(unsigned, dtype=np.float64)
                     if np.any(~np.isfinite(gradient)):
                         continue
                     scale = max(
@@ -26000,8 +25976,7 @@ class SupportOptimizer:
             metadata = self.engine.model_metadata(trial)
             if (
                 metadata.closure != base.matrix.closure
-                or metadata.dimension
-                != base.matrix.dimension + self.config.knot_count
+                or metadata.dimension != base.matrix.dimension + self.config.knot_count
                 or self.engine.total_state_geometry_changed(base.support, trial)
             ):
                 continue
@@ -26148,9 +26123,7 @@ class SupportOptimizer:
         devices = tuple(dict.fromkeys(self.config.pricing_devices)) or ("cpu",)
         cuda_requested = any(device.startswith("cuda") for device in devices)
         output: dict[Support, SupportRecord | None] = {}
-        pending_by_old: dict[
-            RuleIdentity, list[tuple[Support, RuleIdentity]]
-        ] = {}
+        pending_by_old: dict[RuleIdentity, list[tuple[Support, RuleIdentity]]] = {}
         for trial in ordered:
             cached = self._stored_metadata_record(trial)
             if cached is not None:
@@ -26279,8 +26252,8 @@ class SupportOptimizer:
                                 previous_index = previous_indices[previous_rule]
                                 replacement_warm = previous_fit.coefficients[
                                     baseline_dimension
-                                    + previous_index * self.config.knot_count
-                                    : baseline_dimension
+                                    + previous_index
+                                    * self.config.knot_count : baseline_dimension
                                     + (previous_index + 1) * self.config.knot_count
                                 ]
                             elif new_rule.sign == old_rule.sign:
@@ -26292,9 +26265,7 @@ class SupportOptimizer:
                                     self.config.knot_count, dtype=np.float64
                                 )
                             warm_parts.append(
-                                np.ascontiguousarray(
-                                    replacement_warm, dtype=np.float64
-                                )
+                                np.ascontiguousarray(replacement_warm, dtype=np.float64)
                             )
                             continue
                         source_index = current_rule_index.get(rule)
@@ -26317,8 +26288,8 @@ class SupportOptimizer:
                             previous_index = previous_indices[rule]
                             retained_warm = previous_fit.coefficients[
                                 baseline_dimension
-                                + previous_index * self.config.knot_count
-                                : baseline_dimension
+                                + previous_index
+                                * self.config.knot_count : baseline_dimension
                                 + (previous_index + 1) * self.config.knot_count
                             ]
                         else:
@@ -26442,13 +26413,10 @@ class SupportOptimizer:
             time.perf_counter() - shared_started,
         )
         unresolved = tuple(
-            trial
-            for trial in ordered
-            if output.get(trial) is None or trial in fallback
+            trial for trial in ordered if output.get(trial) is None or trial in fallback
         )
         LOGGER.info(
-            "terminal identity shared fallback support=%s unresolved=%d "
-            "messages=%s",
+            "terminal identity shared fallback support=%s unresolved=%d messages=%s",
             support_key(current.support),
             len(unresolved),
             sorted(failure_messages.items()),
@@ -26532,9 +26500,7 @@ class SupportOptimizer:
                 self.diagnostics.safe_column_exact_improvements += 1
             return self._attach_rule_score(self.fit(best.support, current))
 
-        specifications: dict[
-            Support, tuple[RuleIdentity, RuleIdentity]
-        ] = {}
+        specifications: dict[Support, tuple[RuleIdentity, RuleIdentity]] = {}
         for old_rule in current.support.rules:
             for rule in self._identity_coordinate_rules(old_rule):
                 if rule == old_rule:
@@ -28366,9 +28332,7 @@ class SupportOptimizer:
             # likelihood and KKT system without constructing that union.
             # Only a genuine sparse numerical failure falls through to the
             # existing shared projection and dense-reference fail-open path.
-            sparse = self._fit_sparse_supports_exact_many(
-                pending_supports, source
-            )
+            sparse = self._fit_sparse_supports_exact_many(pending_supports, source)
             unresolved_indices: list[int] = []
             unresolved_supports: list[Support] = []
             for output_index, support, record in zip(
@@ -29525,9 +29489,7 @@ class SupportOptimizer:
             pattern_indices.append(
                 self._compact_completion_pattern_index[rule.pattern_key]
             )
-            windows.append(
-                int(rule.window) * self.context.dataset.ticks_per_unit
-            )
+            windows.append(int(rule.window) * self.context.dataset.ticks_per_unit)
             values = np.asarray(
                 record.fit.coefficients[record.matrix.rule_slices[0]],
                 dtype=np.float64,
@@ -29580,9 +29542,7 @@ class SupportOptimizer:
             scaled[np.abs(scaled) <= tolerance] = 0.0
             distance_gram += scaled @ scaled.T
         fisher = np.ascontiguousarray(0.5 * (fisher + fisher.T))
-        distance_gram = np.ascontiguousarray(
-            0.5 * (distance_gram + distance_gram.T)
-        )
+        distance_gram = np.ascontiguousarray(0.5 * (distance_gram + distance_gram.T))
         supports = tuple(record.support for record in live)
         self._continuous_root_fisher_state = (supports, distance_gram)
         # The same dense slab is the exact empty-model-Fisher profile later
@@ -29655,7 +29615,10 @@ class SupportOptimizer:
                 )
                 live.append(freeze_support_record(frozen))
                 sparse_blocks.append(
-                    (rows, np.ascontiguousarray(contribution[:, None], dtype=np.float64))
+                    (
+                        rows,
+                        np.ascontiguousarray(contribution[:, None], dtype=np.float64),
+                    )
                 )
         else:
             live, gradient, fisher = continuous_moments
@@ -30125,6 +30088,7 @@ class SupportOptimizer:
                     - 2.0 * gram[left_index, right_index]
                 ),
             )
+
         predictive = self._predictive_root_supports
         route_roots: list[SupportRecord] = []
         representatives: list[Support] = []
@@ -30856,14 +30820,10 @@ class SupportOptimizer:
             recovered = self._fit_sparse_supports_exact_many(
                 missing_supports, self.records[EMPTY_SUPPORT]
             )
-            if any(
-                record is None or not record.fit.converged for record in recovered
-            ):
+            if any(record is None or not record.fit.converged for record in recovered):
                 return None
         result: dict[Support, tuple[np.ndarray, np.ndarray]] = {}
-        pending: list[
-            tuple[Support, RuleIdentity, int, int, np.ndarray]
-        ] = []
+        pending: list[tuple[Support, RuleIdentity, int, int, np.ndarray]] = []
         pending_supports: list[Support] = []
         support_component_offsets: list[int] = [0]
         offsets, entities, times, spans = self._compact_completion_store
@@ -31001,9 +30961,7 @@ class SupportOptimizer:
         if derivative_state is None or derivative_state[0] is not current:
             return output
         current_second = np.asarray(derivative_state[2], dtype=np.float64)
-        _, empty_second = self._baseline_grid_derivatives(
-            self.records[EMPTY_SUPPORT]
-        )
+        _, empty_second = self._baseline_grid_derivatives(self.records[EMPTY_SUPPORT])
         if (
             current_second.shape != empty_second.shape
             or np.any(current_second <= 0.0)
@@ -31084,9 +31042,7 @@ class SupportOptimizer:
         ):
             return None
         offsets, entities, times, spans = self._compact_completion_store
-        specifications: list[
-            tuple[RuleIdentity, int, int, np.ndarray]
-        ] = []
+        specifications: list[tuple[RuleIdentity, int, int, np.ndarray]] = []
         output: dict[RuleIdentity, float | None] = {}
         for _, _, rule in items:
             trial_metadata = self.engine.model_metadata(current.support.add(rule))
@@ -31126,9 +31082,7 @@ class SupportOptimizer:
                     for reference in references
                 )
                 continue
-            pattern_index = self._compact_completion_pattern_index.get(
-                rule.pattern_key
-            )
+            pattern_index = self._compact_completion_pattern_index.get(rule.pattern_key)
             if pattern_index is None:
                 output[rule] = None
                 continue
@@ -31165,8 +31119,7 @@ class SupportOptimizer:
             np.asarray([item[2] for item in specifications], dtype=np.int64),
             np.asarray(
                 [
-                    int(item[0].window)
-                    * self.context.dataset.ticks_per_unit
+                    int(item[0].window) * self.context.dataset.ticks_per_unit
                     for item in specifications
                 ],
                 dtype=np.int64,
@@ -31216,9 +31169,7 @@ class SupportOptimizer:
             256 * 1024**2,
             min(2 * 1024**3, self.config.cache_bytes // 2),
         )
-        wave_size = max(
-            1, min(len(specifications), slab_bytes // (8 * row_count))
-        )
+        wave_size = max(1, min(len(specifications), slab_bytes // (8 * row_count)))
         tolerance = max(1.0e-12, self.config.solver_tolerance)
         for left in range(0, len(specifications), wave_size):
             wave = specifications[left : left + wave_size]
@@ -31230,8 +31181,7 @@ class SupportOptimizer:
                 np.asarray([item[2] for item in wave], dtype=np.int64),
                 np.asarray(
                     [
-                        int(item[0].window)
-                        * self.context.dataset.ticks_per_unit
+                        int(item[0].window) * self.context.dataset.ticks_per_unit
                         for item in wave
                     ],
                     dtype=np.int64,
@@ -31264,16 +31214,12 @@ class SupportOptimizer:
                 ] = []
                 for index, (rule, _, _, _) in enumerate(wave):
                     scaled = profiles[index]
-                    active = np.isfinite(scaled) & (
-                        np.abs(scaled) > tolerance
-                    )
+                    active = np.isfinite(scaled) & (np.abs(scaled) > tolerance)
                     if not np.any(active):
                         output[rule] = None
                         continue
                     increment = (
-                        np.ascontiguousarray(
-                            np.flatnonzero(active), dtype=np.int64
-                        ),
+                        np.ascontiguousarray(np.flatnonzero(active), dtype=np.int64),
                         np.ascontiguousarray(scaled[active], dtype=np.float64),
                     )
                     candidate_profile = self._sum_sparse_fisher_profiles(
@@ -31296,9 +31242,7 @@ class SupportOptimizer:
                             )
                     else:
                         for index, (rule, _) in enumerate(pending_profiles):
-                            output[rule] = float(
-                                np.min(fallback_distances[index])
-                            )
+                            output[rule] = float(np.min(fallback_distances[index]))
             else:
                 for index, (rule, _, _, _) in enumerate(wave):
                     row = distances[index]
@@ -31340,8 +31284,7 @@ class SupportOptimizer:
         signature = self._fit_profile_signature(record)
         if (
             cached is not None
-            and self._fisher_effect_profile_signatures.get(record.support)
-            == signature
+            and self._fisher_effect_profile_signatures.get(record.support) == signature
         ):
             self._fisher_effect_profiles.move_to_end(record.support)
             return cached
@@ -31434,9 +31377,7 @@ class SupportOptimizer:
         ordered_left = tuple(lefts)
         ordered_right = tuple(rights)
         if not ordered_left or not ordered_right:
-            return np.zeros(
-                (len(ordered_left), len(ordered_right)), dtype=np.float64
-            )
+            return np.zeros((len(ordered_left), len(ordered_right)), dtype=np.float64)
         distances = sparse_squared_distances(
             ordered_left,
             ordered_right,
@@ -31445,7 +31386,10 @@ class SupportOptimizer:
         if distances is None:
             return np.asarray(
                 [
-                    [self._sparse_fisher_distance(left, right) for right in ordered_right]
+                    [
+                        self._sparse_fisher_distance(left, right)
+                        for right in ordered_right
+                    ]
                     for left in ordered_left
                 ],
                 dtype=np.float64,

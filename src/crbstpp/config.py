@@ -190,8 +190,15 @@ class RunConfig:
         windows = tuple(int(value) for value in self.formation_windows)
         if not windows or windows != tuple(sorted(set(windows))) or windows[0] < 0:
             raise ValueError("formation_windows must be sorted, unique and nonnegative")
-        if self.formation_window_mode not in {"fixed", "fit_quantile"}:
-            raise ValueError("formation_window_mode must be 'fixed' or 'fit_quantile'")
+        if self.formation_window_mode not in {
+            "fixed",
+            "fit_quantile",
+            "fit_quantile_band",
+        }:
+            raise ValueError(
+                "formation_window_mode must be 'fixed', 'fit_quantile' or "
+                "'fit_quantile_band'"
+            )
         quantiles = tuple(float(value) for value in self.formation_window_quantiles)
         if (
             not quantiles

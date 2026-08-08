@@ -352,7 +352,9 @@ def _process_day(
         "order_type",
         "action_type",
     ]
-    for row_number, row in enumerate(orders[columns].itertuples(index=False, name=None)):
+    for row_number, row in enumerate(
+        orders[columns].itertuples(index=False, name=None)
+    ):
         time_ns, price, aggregate, side, order_type, action = row
         time_ns = int(time_ns)
         price = int(price)
@@ -376,7 +378,9 @@ def _process_day(
         is_ask = side in (2, 5)
         if in_session:
             if action == "A" and order_type == "1":
-                action_predicate = BUY_MARKET if is_bid else SELL_MARKET if is_ask else None
+                action_predicate = (
+                    BUY_MARKET if is_bid else SELL_MARKET if is_ask else None
+                )
             elif action == "A" and order_type == "2":
                 if is_bid and before_bid is not None:
                     if price > before_bid:
@@ -497,7 +501,9 @@ def _process_day_mechanisms(
         "order_type",
         "action_type",
     ]
-    for row_number, row in enumerate(orders[columns].itertuples(index=False, name=None)):
+    for row_number, row in enumerate(
+        orders[columns].itertuples(index=False, name=None)
+    ):
         time_ns, price, aggregate, side, order_type, action = row
         time_ns = int(time_ns)
         price = int(price)
@@ -528,11 +534,7 @@ def _process_day_mechanisms(
         predicate: int | None = None
         if action == "A" and order_type == "1":
             predicate = (
-                MECH_BUY_MARKET
-                if is_bid
-                else MECH_SELL_MARKET
-                if is_ask
-                else None
+                MECH_BUY_MARKET if is_bid else MECH_SELL_MARKET if is_ask else None
             )
         elif action == "A" and order_type == "2":
             if is_bid:
@@ -565,9 +567,7 @@ def _process_day_mechanisms(
                 cleared = after_bid is None or after_bid < before_bid
                 if cleared:
                     predicate = (
-                        MECH_TRADE_BID_CLEAR
-                        if execution
-                        else MECH_CANCEL_BID_CLEAR
+                        MECH_TRADE_BID_CLEAR if execution else MECH_CANCEL_BID_CLEAR
                     )
                     last_bid_clear = (time_ns, before_bid)
                 else:
@@ -580,9 +580,7 @@ def _process_day_mechanisms(
                 cleared = after_ask is None or after_ask > before_ask
                 if cleared:
                     predicate = (
-                        MECH_TRADE_ASK_CLEAR
-                        if execution
-                        else MECH_CANCEL_ASK_CLEAR
+                        MECH_TRADE_ASK_CLEAR if execution else MECH_CANCEL_ASK_CLEAR
                     )
                     last_ask_clear = (time_ns, before_ask)
                 else:
@@ -665,6 +663,113 @@ def _adverse_excursion_targets(
     return targets
 
 
+def _realized_volatility(
+    ticks: np.ndarray,
+    mid_twice: np.ndarray,
+    *,
+    session_start_ns: int,
+    session_end_ns: int,
+    horizon_ns: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return the exact piecewise-constant past-only realized volatility.
+
+    A price jump at time ``s`` contributes to the value at ``t`` exactly when
+    ``t-horizon < s <= t``.  Consequently the process changes both at a new
+    jump and when an old jump leaves the window at ``s+horizon``.  Including
+    both boundaries is required for a genuine continuous-time weighted
+    quantile; otherwise a quiet period after a burst is incorrectly assigned
+    the stale high value.  The first reconstructed quote has no preceding
+    within-session price and therefore contributes a zero jump.
+    """
+
+    ticks = np.asarray(ticks, dtype=np.int64)
+    mid_twice = np.asarray(mid_twice, dtype=np.float64)
+    if len(ticks) != len(mid_twice):
+        raise ValueError("mid-price ticks and values have different lengths")
+    if len(ticks) == 0:
+        return np.zeros(0, dtype=np.int64), np.zeros(0, dtype=np.float64)
+    if np.any(mid_twice <= 0.0):
+        raise ValueError("mid-price must be positive")
+    jumps = np.zeros(len(ticks), dtype=np.float64)
+    if len(ticks) > 1:
+        jumps[1:] = np.diff(np.log(mid_twice))
+    squared_prefix = np.empty(len(ticks) + 1, dtype=np.float64)
+    squared_prefix[0] = 0.0
+    np.cumsum(jumps * jumps, out=squared_prefix[1:])
+    first = int(session_start_ns)
+    last = int(session_end_ns)
+    if first > last:
+        return np.zeros(0, dtype=np.int64), np.zeros(0, dtype=np.float64)
+    boundaries = np.unique(
+        np.concatenate(
+            (
+                np.asarray([first], dtype=np.int64),
+                ticks[(ticks >= first) & (ticks <= last)],
+                (ticks + int(horizon_ns))[
+                    (ticks + int(horizon_ns) >= first)
+                    & (ticks + int(horizon_ns) <= last)
+                ],
+            )
+        )
+    )
+    left = np.searchsorted(ticks, boundaries - int(horizon_ns), side="right")
+    right = np.searchsorted(ticks, boundaries, side="right")
+    variance = squared_prefix[right] - squared_prefix[left]
+    return (
+        np.ascontiguousarray(boundaries, dtype=np.int64),
+        np.sqrt(np.maximum(variance, 0.0), dtype=np.float64),
+    )
+
+
+def _duration_weighted_quantile(
+    values: np.ndarray,
+    weights: np.ndarray,
+    quantile: float,
+) -> float:
+    """Return the left-continuous weighted empirical quantile."""
+
+    values = np.asarray(values, dtype=np.float64)
+    weights = np.asarray(weights, dtype=np.float64)
+    if values.shape != weights.shape or values.ndim != 1:
+        raise ValueError("weighted quantile values and weights must align")
+    keep = np.isfinite(values) & np.isfinite(weights) & (weights > 0.0)
+    if not np.any(keep):
+        raise ValueError("weighted quantile has no positive finite weight")
+    values = values[keep]
+    weights = weights[keep]
+    order = np.argsort(values, kind="stable")
+    values = values[order]
+    cumulative = np.cumsum(weights[order])
+    cutoff = float(quantile) * float(cumulative[-1])
+    index = min(len(values) - 1, int(np.searchsorted(cumulative, cutoff, side="left")))
+    return float(values[index])
+
+
+def _volatility_burst_targets(
+    ticks: np.ndarray,
+    volatility: np.ndarray,
+    *,
+    threshold: float,
+    rearm_fraction: float,
+) -> list[int]:
+    """Decluster realized-volatility threshold crossings by hysteresis."""
+
+    if not math.isfinite(threshold) or threshold <= 0.0:
+        raise ValueError("realized-volatility threshold must be positive")
+    if not 0.0 < rearm_fraction < 1.0:
+        raise ValueError("target rearm fraction must lie strictly between zero and one")
+    rearm_level = float(rearm_fraction) * float(threshold)
+    targets: list[int] = []
+    armed = True
+    for tick, value in zip(ticks.tolist(), volatility.tolist(), strict=True):
+        if not armed and value < rearm_level:
+            armed = True
+        if armed and value > threshold:
+            targets.append(int(tick))
+            armed = False
+    return targets
+
+
 def _continuous_risk_frame(
     *,
     entity_code: int,
@@ -714,9 +819,7 @@ def _continuous_risk_frame(
             )
         )
     )
-    boundaries = boundaries[
-        (boundaries >= session_start) & (boundaries <= terminal)
-    ]
+    boundaries = boundaries[(boundaries >= session_start) & (boundaries <= terminal)]
     if boundaries[0] != session_start or boundaries[-1] != terminal:
         raise AssertionError("continuous risk boundaries lost session bounds")
     left = boundaries[:-1]
@@ -729,17 +832,15 @@ def _continuous_risk_frame(
         {
             "entity_code": np.full(len(left), entity_code, dtype=np.int32),
             "time": left,
-            "baseline_stratum": (
-                int(weekday) * baseline_bins + intraday
-            ).astype(np.int16),
+            "baseline_stratum": (int(weekday) * baseline_bins + intraday).astype(
+                np.int16
+            ),
             "exposure": exposure,
         }
     )
 
 
-def _ordered_partition(
-    count: int, fractions: tuple[float, float, float]
-) -> np.ndarray:
+def _ordered_partition(count: int, fractions: tuple[float, float, float]) -> np.ndarray:
     if len(fractions) != 3 or not np.isclose(sum(fractions), 1.0):
         raise ValueError("partition fractions must sum to one")
     if count < 5:
@@ -787,13 +888,15 @@ def preprocess_wselob(
         raise ValueError("continuous baseline bin count must be positive")
     if predicate_schema not in {"legacy", "mechanism_v2"}:
         raise ValueError("predicate_schema must be 'legacy' or 'mechanism_v2'")
-    if target_mode not in {"down_tick", "adverse_excursion"}:
-        raise ValueError("target_mode must be 'down_tick' or 'adverse_excursion'")
-    if target_mode == "adverse_excursion" and (
+    if target_mode not in {"down_tick", "adverse_excursion", "volatility_burst"}:
+        raise ValueError(
+            "target_mode must be 'down_tick', 'adverse_excursion' or 'volatility_burst'"
+        )
+    if target_mode in {"adverse_excursion", "volatility_burst"} and (
         not continuous or predicate_schema != "mechanism_v2"
     ):
         raise ValueError(
-            "adverse_excursion requires continuous mode and mechanism_v2 predicates"
+            "window target modes require continuous mode and mechanism_v2 predicates"
         )
     if target_horizon_seconds < 1:
         raise ValueError("target_horizon_seconds must be positive")
@@ -812,9 +915,10 @@ def preprocess_wselob(
         if _sha256(path) != WSELOB_FILES[stock][kind].sha256:
             raise ValueError(f"raw WSELOB digest mismatch: {path}")
 
-    with pd.HDFStore(order_path, mode="r") as order_store, pd.HDFStore(
-        trade_path, mode="r"
-    ) as trade_store:
+    with (
+        pd.HDFStore(order_path, mode="r") as order_store,
+        pd.HDFStore(trade_path, mode="r") as trade_store,
+    ):
         keys = sorted(set(order_store.keys()) & set(trade_store.keys()))
         if diagnostic_max_days is not None:
             if diagnostic_max_days < 5:
@@ -850,21 +954,19 @@ def preprocess_wselob(
             orders = order_store.select(key)
             entity_code = len(entities_rows)
             if predicate_schema == "mechanism_v2":
-                events, mid_ticks, mid_twice, action_counts = (
-                    _process_day_mechanisms(
-                        orders,
-                        entity_code=entity_code,
-                        session_start_ns=session_start,
-                        session_end_ns=session_end,
-                        bin_nanoseconds=bin_ns,
-                        continuous=continuous,
-                        replenishment_lookback_ns=(
-                            int(target_horizon_seconds) * 1_000_000_000
-                        ),
-                        trade_times=frozenset(
-                            core_trades.to_numpy(dtype=np.int64).tolist()
-                        ),
-                    )
+                events, mid_ticks, mid_twice, action_counts = _process_day_mechanisms(
+                    orders,
+                    entity_code=entity_code,
+                    session_start_ns=session_start,
+                    session_end_ns=session_end,
+                    bin_nanoseconds=bin_ns,
+                    continuous=continuous,
+                    replenishment_lookback_ns=(
+                        int(target_horizon_seconds) * 1_000_000_000
+                    ),
+                    trade_times=frozenset(
+                        core_trades.to_numpy(dtype=np.int64).tolist()
+                    ),
                 )
                 target_ticks: list[int] = []
             else:
@@ -898,7 +1000,7 @@ def preprocess_wselob(
                 }
             )
             all_events.extend(events)
-            if target_mode == "adverse_excursion":
+            if target_mode in {"adverse_excursion", "volatility_burst"}:
                 excursion_days.append(
                     {
                         "entity_code": entity_code,
@@ -945,14 +1047,11 @@ def preprocess_wselob(
                 )
                 duration = int(terminal - session_start)
                 baseline_boundaries = session_start + (
-                    np.arange(continuous_baseline_bins + 1, dtype=np.int64)
-                    * duration
+                    np.arange(continuous_baseline_bins + 1, dtype=np.int64) * duration
                 ) // int(continuous_baseline_bins)
                 shifted = (
                     (
-                        event_times[:, None]
-                        + np.int64(1)
-                        + continuous_edges[None, :]
+                        event_times[:, None] + np.int64(1) + continuous_edges[None, :]
                     ).reshape(-1)
                     if len(event_times)
                     else np.zeros(0, dtype=np.int64)
@@ -971,14 +1070,15 @@ def preprocess_wselob(
                     (boundaries >= session_start) & (boundaries <= terminal)
                 ]
                 if boundaries[0] != session_start or boundaries[-1] != terminal:
-                    raise AssertionError("continuous risk boundaries lost session bounds")
+                    raise AssertionError(
+                        "continuous risk boundaries lost session bounds"
+                    )
                 left = boundaries[:-1]
                 exposure = np.diff(boundaries).astype(np.float64) / 1_000_000_000.0
                 intraday = np.minimum(
                     continuous_baseline_bins - 1,
-                    (
-                        (left - session_start) * continuous_baseline_bins
-                    ) // max(1, duration),
+                    ((left - session_start) * continuous_baseline_bins)
+                    // max(1, duration),
                 ).astype(np.int16)
                 risk_parts.append(
                     pd.DataFrame(
@@ -1019,35 +1119,76 @@ def preprocess_wselob(
     partition = _ordered_partition(len(entities), partition_fractions)
     entities["partition"] = partition
     excursion_threshold: float | None = None
-    if target_mode == "adverse_excursion":
+    if target_mode in {"adverse_excursion", "volatility_burst"}:
         horizon_ns = int(target_horizon_seconds) * 1_000_000_000
-        fit_magnitudes: list[np.ndarray] = []
+        fit_values: list[np.ndarray] = []
+        fit_weights: list[np.ndarray] = []
         for payload in excursion_days:
-            return_ticks, return_values = _adverse_excursion_returns(
-                payload["mid_ticks"],
-                payload["mid_twice"],
-                session_start_ns=int(payload["session_start"]),
-                horizon_ns=horizon_ns,
-            )
-            payload["return_ticks"] = return_ticks
-            payload["return_values"] = return_values
+            if target_mode == "adverse_excursion":
+                process_ticks, process_values = _adverse_excursion_returns(
+                    payload["mid_ticks"],
+                    payload["mid_twice"],
+                    session_start_ns=int(payload["session_start"]),
+                    horizon_ns=horizon_ns,
+                )
+            else:
+                process_ticks, process_values = _realized_volatility(
+                    payload["mid_ticks"],
+                    payload["mid_twice"],
+                    session_start_ns=int(payload["session_start"]),
+                    session_end_ns=int(payload["session_end"]),
+                    horizon_ns=horizon_ns,
+                )
+            payload["process_ticks"] = process_ticks
+            payload["process_values"] = process_values
             if partition[int(payload["entity_code"])] == 0:
-                negative = -return_values[return_values < 0.0]
-                if len(negative):
-                    fit_magnitudes.append(negative)
-        if not fit_magnitudes:
-            raise ValueError("D_fit contains no negative horizon mid-price returns")
-        excursion_threshold = float(
-            np.quantile(np.concatenate(fit_magnitudes), target_quantile)
+                complete = process_ticks >= (
+                    int(payload["session_start"]) + int(horizon_ns)
+                )
+                values = (
+                    -process_values[complete & (process_values < 0.0)]
+                    if target_mode == "adverse_excursion"
+                    else process_values[complete]
+                )
+                if len(values):
+                    fit_values.append(values)
+                    if target_mode == "volatility_burst":
+                        next_ticks = np.minimum(
+                            np.r_[process_ticks[1:], int(payload["session_end"]) + 1],
+                            int(payload["session_end"]) + 1,
+                        )
+                        durations = np.maximum(0, next_ticks - process_ticks).astype(
+                            np.float64
+                        )
+                        fit_weights.append(durations[complete])
+        if not fit_values:
+            raise ValueError("D_fit contains no eligible target-process values")
+        excursion_threshold = (
+            _duration_weighted_quantile(
+                np.concatenate(fit_values),
+                np.concatenate(fit_weights),
+                target_quantile,
+            )
+            if target_mode == "volatility_burst"
+            else float(np.quantile(np.concatenate(fit_values), target_quantile))
         )
         if not math.isfinite(excursion_threshold) or excursion_threshold <= 0.0:
-            raise ValueError("D_fit adverse-excursion threshold is not positive")
+            raise ValueError("D_fit target-process threshold is not positive")
         for payload in excursion_days:
-            target_ticks = _adverse_excursion_targets(
-                payload["return_ticks"],
-                payload["return_values"],
-                threshold=excursion_threshold,
-                rearm_fraction=target_rearm_fraction,
+            target_ticks = (
+                _volatility_burst_targets(
+                    payload["process_ticks"],
+                    payload["process_values"],
+                    threshold=excursion_threshold,
+                    rearm_fraction=target_rearm_fraction,
+                )
+                if target_mode == "volatility_burst"
+                else _adverse_excursion_targets(
+                    payload["process_ticks"],
+                    payload["process_values"],
+                    threshold=excursion_threshold,
+                    rearm_fraction=target_rearm_fraction,
+                )
             )
             entity_code = int(payload["entity_code"])
             if target_ticks:
@@ -1117,8 +1258,10 @@ def preprocess_wselob(
         if predicate_schema == "mechanism_v2"
         else PREDICATE_MEANINGS
     )
-    predicate_counts = events.groupby("predicate_code").size().reindex(
-        range(len(predicate_names)), fill_value=0
+    predicate_counts = (
+        events.groupby("predicate_code")
+        .size()
+        .reindex(range(len(predicate_names)), fill_value=0)
     )
     target_events_by_split = np.bincount(
         partition[targets["entity_code"].to_numpy(dtype=np.int32)],
@@ -1144,7 +1287,9 @@ def preprocess_wselob(
         time_unit="second" if continuous else f"{bin_seconds}-second interval",
         ticks_per_unit=1_000_000_000 if continuous else 1,
         adverse_event_name=(
-            "strictly-future 30-second adverse mid-price excursion onset"
+            "strictly-future 30-second realized-volatility burst onset"
+            if target_mode == "volatility_burst"
+            else "strictly-future 30-second adverse mid-price excursion onset"
             if target_mode == "adverse_excursion"
             else "strictly-future mid-price down-tick"
         ),
@@ -1156,7 +1301,8 @@ def preprocess_wselob(
             "atomic_predicates": True,
             "primitive_event_provenance": True,
             "independent_certification_units": True,
-            "target_threshold_fit_only": target_mode == "adverse_excursion",
+            "target_threshold_fit_only": target_mode
+            in {"adverse_excursion", "volatility_burst"},
             **(
                 {
                     "required_impact_lag": int(continuous_impact_seconds),
@@ -1168,7 +1314,9 @@ def preprocess_wselob(
         },
         provenance={
             "preprocessor": (
-                "crbstpp.preprocess.wselob.continuous_adverse_excursion_mechanism.v2"
+                "crbstpp.preprocess.wselob.continuous_volatility_mechanism.v3"
+                if target_mode == "volatility_burst"
+                else "crbstpp.preprocess.wselob.continuous_adverse_excursion_mechanism.v2"
                 if target_mode == "adverse_excursion"
                 else "crbstpp.preprocess.wselob.continuous_stock_day_microstructure.v1"
                 if continuous
@@ -1191,7 +1339,12 @@ def preprocess_wselob(
             },
             "entity_definition": "stock by continuous-session trading day",
             "target_definition": (
-                "one recurrent onset when the past-only 30-second log mid-price return "
+                "one recurrent onset when past-only 30-second realized volatility "
+                "crosses above its duration-weighted D_fit quantile; the process "
+                "rearms only after falling below half the threshold; source effects "
+                "start one nanosecond later"
+                if target_mode == "volatility_burst"
+                else "one recurrent onset when the past-only 30-second log mid-price return "
                 "crosses below the D_fit-frozen adverse-return quantile; the process "
                 "rearms only after half-threshold recovery; source effects start one "
                 "nanosecond later"
@@ -1213,6 +1366,19 @@ def preprocess_wselob(
                     "threshold_partition": "fit",
                 }
                 if target_mode == "adverse_excursion"
+                else None
+            ),
+            "target_volatility": (
+                {
+                    "horizon_seconds": int(target_horizon_seconds),
+                    "estimator": "square root of rolling squared log-mid jumps",
+                    "fit_quantile": float(target_quantile),
+                    "quantile_weighting": "continuous-time duration",
+                    "frozen_threshold": excursion_threshold,
+                    "rearm_fraction": float(target_rearm_fraction),
+                    "threshold_partition": "fit",
+                }
+                if target_mode == "volatility_burst"
                 else None
             ),
             "predicate_definition": (

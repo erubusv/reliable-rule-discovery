@@ -3,7 +3,7 @@ adaptive_kernel_mdl: false
 alpha: 0.05
 baseline_time_bins: 1
 cache_bytes: 4294967296
-dataset: data/crbstpp/wselob_pekao_mechanism_excursion_v2_60d_30s
+dataset: data/crbstpp/wselob_pekao_mechanism_volatility_v3_60d_30s
 dependency_aware_mdl: false
 discovery_noncase_fraction: 0.1
 discovery_reference_dataset: null
@@ -24,7 +24,7 @@ predicate_coverage_rashomon: false
 conditional_basin_branching: true
 ensemble_residual_dictionary_repricing: false
 exact_workers: 3
-formation_window_mode: fit_quantile
+formation_window_mode: fit_quantile_band
 formation_window_quantiles: [0.25, 0.5, 0.75, 0.9]
 formation_windows: [0, 5, 15, 30]
 frequency_effect_separation: false
@@ -39,14 +39,15 @@ max_rules_per_support: null
 metadata:
   baseline_contract: stock_weekday_x_4_fixed_intraday_time_only
   predicate_contract: mutually_exclusive_order_flow_liquidity_clearance_and_replenishment_mechanisms
-  target_contract: fit_Q90_30_second_adverse_midprice_excursion_onset_with_half_threshold_rearm
+  target_contract: fit_duration_weighted_Q90_30_second_realized_volatility_burst_onset_with_half_threshold_rearm
+  formation_window_contract: disjoint_D_fit_Q25_Q50_Q75_Q90_lag_bands_with_separate_same_tick_identity
   time_contract: exact_piecewise_constant_continuous_poisson_nanosecond_clock
   observation_contract: first_60_ordered_trading_days_20170102_through_20170327
   preprocessing_impact_seconds: 30
   preprocessing_kernel_knots: 4
   search_contract: support_Block-MDL_rule-effect_residual_Rashomon
   certification_family_contract: fit-only_compaction_then_F0-F3_Romano-Wolf
-  result_schema: crbstpp.result.wselob.continuous.mechanism.v2
+  result_schema: crbstpp.result.wselob.continuous.volatility.mechanism.v3
 precert_family_compaction: true
 ensemble_irreducible_family: false
 pricing_devices: [cuda:0, cuda:1]
@@ -60,7 +61,7 @@ romano_wolf_seed: 314159
 route_refinement_kkt_tolerance: null
 route_refinement_max_steps: 4
 route_workers: 2
-run_id: wselob_pekao_mechanism_excursion_v2_60d_30s
+run_id: wselob_pekao_mechanism_volatility_v3_60d_30s
 run_root: runs/crbstpp
 search_mode: atomic_rashomon_frontier
 search_tolerance: 1.0e-8
