@@ -12,7 +12,9 @@ dependencies = [
   "pandas>=2.0",
   "pyarrow>=14",
   "PyYAML>=6",
+  "requests>=2.31",
   "scipy>=1.11",
+  "tables>=3.9",
 ]
 
 [project.optional-dependencies]

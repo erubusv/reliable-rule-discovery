@@ -1,19 +1,42 @@
-dataset: data/crbstpp/freddie_2023q1_2024q3_events_v8
+dataset: data/crbstpp/freddie_2023q1_2024q3_controlled_v11
 run_root: runs/crbstpp
 q_max: 3
 impact_lag: 12
 knot_count: 4
-formation_windows: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+adaptive_kernel_mdl: true
+# Pre-registered coarse formation scales.  Baseline profiles initialize route
+# priority; identities retained at a terminal receive the complete conditional
+# W/sign envelope.
+formation_windows: [0, 3, 6, 12]
+formation_window_mode: fit_quantile
+formation_window_quantiles: [0.25, 0.50, 0.75, 0.90]
 # Retained for schema compatibility; the dataset's pre-registered partition wins.
 split_fractions: [0.60, 0.20, 0.20]
 split_seed: 111
 alpha: 0.05
 early_warning_horizon: 12
 probability_materiality: 0.0
+search_mode: gap_safe_rashomon_path
+adaptive_gradient_racing: false
+route_refinement_max_steps: 4
+route_refinement_kkt_tolerance: null
+# D_fit uses one entity-level materiality LCB for each selected Add.  Regime
+# robustness and component-wise drop-one reliability are tested only once on
+# independent D_cert by F3 and F2, respectively.
+reliability_aware_search: true
+# Primary discovery uses every D_fit entity; no IPW or subsampling is used.
+discovery_sampling: full
 solver_tolerance: 2.0e-7
-solver_max_iter: 100
+# Successful Freddie fits observed in the full-data audit converge within
+# 4--18 projected-Newton steps.  Thirty-two is the total fast-mode numerical
+# testability budget; a model that cannot reach the declared KKT tolerance is
+# rejected rather than continued in unbounded 100-step windows.
+solver_max_iter: 32
 search_tolerance: 1.0e-8
-exact_workers: 3
+# Two CUDA devices provide two exact-fit slots.  A third worker would be a
+# CPU straggler and make every deterministic wave wait for the slowest job.
+exact_workers: 2
 pricing_workers: 12
 pricing_devices: [cuda:0, cuda:1]
-cache_bytes: 34359738368
+route_workers: 2
+cache_bytes: 17179869184

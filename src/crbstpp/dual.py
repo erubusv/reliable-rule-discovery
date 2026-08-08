@@ -5,7 +5,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from .likelihood import conjugate_sum, loss_rows
+from .likelihood import conjugate_sum, is_poisson_likelihood, loss_rows
 from .response import ModelMatrix
 
 
@@ -152,7 +152,7 @@ def _clip_domain(
     margin: float,
 ) -> np.ndarray:
     output = dual.copy()
-    if likelihood == "poisson":
+    if is_poisson_likelihood(likelihood):
         output = np.maximum(output, -event_weight + margin)
         return output
     if likelihood != "first_event_cloglog":

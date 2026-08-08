@@ -15,6 +15,9 @@ class Certificate:
     holm_adjusted_pvalue: float | None
     certified: bool
     reasons: tuple[str, ...] = ()
+    family_adjusted_pvalue: float | None = None
+    multiplicity_method: str = "romano_wolf_stepdown_max_t"
+    romano_wolf_resamples: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

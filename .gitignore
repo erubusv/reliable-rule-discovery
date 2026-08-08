@@ -19,26 +19,30 @@ dist/
 *.so
 
 # Data, generated outputs, and experiment artifacts
-data/
-datasets/
-results/
-runs/
-outputs/
+/data/
+/datasets/
+/results/
+/runs/
+/logs/
+/outputs/
 *.log
 *.checkpoint.*
 
-# Documentation and notebooks
-docs/
-documentation/
-notes/
+# Local research material and notebooks
+/paper/
+/docs/
+/documentation/
+/notes/
 notebooks/
 *.md
 *.rst
 *.ipynb
 
 # Legacy and third-party source snapshots
-legacy/
-external/
+/legacy/
+/external/
+*.orig
+*.rej
 
 # Editor and OS files
 .idea/

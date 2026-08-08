@@ -7,8 +7,8 @@ from pathlib import Path
 from typing import Any
 
 
-CHECKPOINT_SCHEMA = "crbstpp.checkpoint.v2"
-RESULT_SCHEMA = "crbstpp.result.v3"
+CHECKPOINT_SCHEMA = "crbstpp.checkpoint.v14"
+RESULT_SCHEMA = "crbstpp.result.v14"
 
 
 def atomic_json(path: str | Path, payload: dict[str, Any]) -> None:
@@ -54,7 +54,7 @@ def load_checkpoint(
 ) -> dict[str, Any]:
     payload = json.loads(Path(path).read_text(encoding="utf-8"))
     if payload.get("schema") != CHECKPOINT_SCHEMA:
-        raise ValueError("legacy or unsupported checkpoint schema")
+        raise ValueError("unsupported checkpoint schema")
     if payload.get("config_digest") != config_digest:
         raise ValueError("checkpoint config digest mismatch")
     if payload.get("dataset_digest") != dataset_digest:

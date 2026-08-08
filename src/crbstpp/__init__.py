@@ -1,7 +1,6 @@
 """CRBS-TPP public API.
 
-The package intentionally has no dependency on the archived ``certscr``
-implementation.  Only the small, stable types below are public.
+Only the small, stable types below are public.
 """
 
 from .config import RunConfig

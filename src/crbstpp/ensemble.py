@@ -1,16 +1,19 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
 
 import numpy as np
 from scipy.optimize import minimize
+from scipy.sparse import csc_matrix
 
 from .config import RunConfig
-from .likelihood import cloglog_event_terms
+from .likelihood import cloglog_event_terms, is_poisson_likelihood, loss_rows
+from .native import configure_cpu_threads, sorted_unique_union
 from .response import Context, ModelMatrix, ResponseEngine
-from .rules import EMPTY_SUPPORT, Support
-from .solver import FitResult, fit_model_matrices, fit_model_matrix_continued
+from .rules import EMPTY_SUPPORT, ClosureTerm, RuleIdentity, Support
+from .solver import FitResult, fit_model_matrix_continued
 
 
 @dataclass(frozen=True)
@@ -24,6 +27,14 @@ class EnsembleResult:
     test_nll: float | None
     baseline_test_nll: float | None
     converged: bool
+    combination: str = "support_intensity_simplex"
+    rule_effects: tuple[RuleIdentity, ...] = ()
+    rule_effect_sources: tuple[Support, ...] = ()
+    rule_effect_weights: np.ndarray = field(
+        default_factory=lambda: np.zeros(0, dtype=np.float64)
+    )
+    support_simplex_train_nll: float | None = None
+    support_simplex_test_nll: float | None = None
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -38,6 +49,11 @@ class EnsembleResult:
                         "antecedent": list(rule.antecedent),
                         "window": rule.window,
                         "sign": rule.sign,
+                        "kernel_rank": rule.kernel_rank,
+                        "relation": rule.relation,
+                        "hierarchical": rule.hierarchical,
+                        "support_additive": rule.support_additive,
+                        "history_marks": [list(mark) for mark in rule.history_marks],
                     }
                     for rule in support.rules
                 ]
@@ -49,7 +65,57 @@ class EnsembleResult:
             "test_nll": self.test_nll,
             "baseline_test_nll": self.baseline_test_nll,
             "converged": self.converged,
+            "combination": self.combination,
+            "rule_effects": [
+                {
+                    "antecedent": list(rule.antecedent),
+                    "window": rule.window,
+                    "sign": rule.sign,
+                    "kernel_rank": rule.kernel_rank,
+                    "relation": rule.relation,
+                    "hierarchical": rule.hierarchical,
+                    "support_additive": rule.support_additive,
+                    "history_marks": [list(mark) for mark in rule.history_marks],
+                    "source_support": [
+                        {
+                            "antecedent": list(source_rule.antecedent),
+                            "window": source_rule.window,
+                            "sign": source_rule.sign,
+                            "kernel_rank": source_rule.kernel_rank,
+                            "relation": source_rule.relation,
+                            "hierarchical": source_rule.hierarchical,
+                            "support_additive": source_rule.support_additive,
+                            "history_marks": [
+                                list(mark) for mark in source_rule.history_marks
+                            ],
+                        }
+                        for source_rule in source.rules
+                    ],
+                    "weight": float(weight),
+                }
+                for rule, source, weight in zip(
+                    self.rule_effects,
+                    self.rule_effect_sources,
+                    self.rule_effect_weights,
+                    strict=True,
+                )
+            ],
+            "active_rule_effect_count": int(
+                np.count_nonzero(self.rule_effect_weights > 1.0e-12)
+            ),
+            "support_simplex_train_nll": self.support_simplex_train_nll,
+            "support_simplex_test_nll": self.support_simplex_test_nll,
         }
+
+
+@dataclass(frozen=True)
+class _RuleEffectStack:
+    rules: tuple[RuleIdentity, ...]
+    sources: tuple[Support, ...]
+    source_indices: tuple[tuple[int, int], ...]
+    weights: np.ndarray
+    nll: float
+    converged: bool
 
 
 @dataclass(frozen=True)
@@ -58,9 +124,108 @@ class _SparseComponents:
     baseline_intensity: np.ndarray
     active_event: np.ndarray
     active_noevent: np.ndarray
-    inactive_by_age: np.ndarray
+    inactive_baseline_groups: np.ndarray
     likelihood: str
     tick_exposure: float
+
+
+@dataclass(frozen=True)
+class _MixtureSufficientStatistics:
+    """Exact simplex-weight likelihood compressed to target rows.
+
+    For both supported likelihoods every non-target contribution is linear in
+    the mixed intensity.  Only target rows are nonlinear.  Consequently one
+    component-wise linear coefficient plus the target-row intensities is a
+    lossless sufficient statistic for all simplex objective, gradient and KKT
+    evaluations.
+    """
+
+    linear: np.ndarray
+    target_intensity: np.ndarray
+    target_weight: np.ndarray
+    likelihood: str
+
+
+@dataclass(frozen=True)
+class _SparseProfile:
+    """One fitted model represented only on rows differing from its intercept."""
+
+    rows: np.ndarray
+    intensity: np.ndarray
+    baseline_intensity: np.ndarray
+
+
+@dataclass(frozen=True)
+class _SimplexFit:
+    weights: np.ndarray
+    nll: float
+    converged: bool
+
+
+@dataclass(frozen=True)
+class _IntensityFamilySelection:
+    """Finite Add/Drop-stationary intensity-mixture family."""
+
+    indices: tuple[int, ...]
+    weights: np.ndarray
+    nll: float
+    initial_score: float
+    score: float
+    audits: int
+    moves: int
+
+
+def _fit_frozen_model_with_retry(
+    matrix: ModelMatrix,
+    *,
+    likelihood: str,
+    tolerance: float,
+    max_iter: int,
+    warm_start: np.ndarray | None,
+    device: str,
+    allow_cpu_fallback: bool = True,
+) -> FitResult:
+    """Fit one frozen ensemble component without silently losing the model.
+
+    A D_fit optimum can lie numerically on a nonnegative-cone boundary.  When
+    continued on D_fit+D_cert, tiny positive warm coefficients may put
+    linearly dependent columns on the critical face even though a cold solve
+    reaches the same predictive optimum on a lower-dimensional face.  Retry
+    from the canonical cold point before treating that model as unidentified.
+    A CPU retry distinguishes a device-specific numerical failure from a
+    genuine fixed-support failure.  Every attempt solves the identical convex
+    likelihood and therefore changes neither the estimator nor its KKT/rank
+    requirements.
+    """
+
+    attempts = [warm_start]
+    if warm_start is not None:
+        attempts.append(None)
+    devices = [device]
+    if allow_cpu_fallback and device != "cpu":
+        devices.append("cpu")
+    failures: list[str] = []
+    for retry_device in devices:
+        for start in attempts:
+            fit = fit_model_matrix_continued(
+                matrix,
+                likelihood=likelihood,
+                tolerance=tolerance,
+                max_iter=max_iter,
+                warm_start=start,
+                device=retry_device,
+            )
+            if fit.converged:
+                return fit
+            label = "warm" if start is not None else "cold"
+            failures.append(f"{retry_device}/{label}: {fit.message}")
+        # A cold start is canonical.  Do not repeat an absent warm start twice
+        # when the caller did not supply one.
+        attempts = [None]
+    raise RuntimeError(
+        "frozen ensemble component failed exact refit after fail-open retries: "
+        + "; ".join(failures)
+    )
 
 
 def _simplex_projection(values: np.ndarray) -> np.ndarray:
@@ -75,9 +240,7 @@ def _simplex_projection(values: np.ndarray) -> np.ndarray:
     return np.maximum(values - threshold, 0.0)
 
 
-def _simplex_kkt(
-    weights: np.ndarray, gradient: np.ndarray, objective: float
-) -> float:
+def _simplex_kkt(weights: np.ndarray, gradient: np.ndarray, objective: float) -> float:
     """Scale-free KKT residual for minimization on the probability simplex."""
     active = weights > 1.0e-10
     if not np.any(active):
@@ -94,19 +257,96 @@ def _simplex_kkt(
         abs(float(np.sum(weights)) - 1.0),
         max(0.0, -float(np.min(weights))),
     )
-    return max(active_residual, inactive_residual) / max(1.0, abs(objective), feasibility)
+    return max(active_residual, inactive_residual) / max(
+        1.0, abs(objective), feasibility
+    )
 
 
 def _events_at_rows(context: Context, rows: np.ndarray) -> np.ndarray:
-    event = np.zeros(len(rows), dtype=np.float64)
-    if not len(rows) or not len(context.target_rows):
-        return event
-    positions = np.searchsorted(context.target_rows, rows)
-    matched = positions < len(context.target_rows)
-    safe = np.minimum(positions, len(context.target_rows) - 1)
-    matched &= context.target_rows[safe] == rows
-    event[matched] = context.target_counts[positions[matched]]
-    return event
+    return context.target_counts_at_sorted_rows(rows)
+
+
+def _sparse_profile(
+    engine: ResponseEngine,
+    context: Context,
+    matrix: ModelMatrix,
+    fit: FitResult,
+) -> _SparseProfile:
+    if matrix.baseline_dimension != engine.baseline_dimension:
+        raise ValueError("matrix baseline-control dimension mismatch")
+    if matrix.x.shape[0]:
+        rows = np.ascontiguousarray(matrix.active_rows, dtype=np.int64)
+        eta = engine.linear_predictor_at_rows(context, matrix, fit.coefficients, rows)
+    else:
+        rows, eta = engine.frozen_active_predictor(context, matrix, fit.coefficients)
+    return _SparseProfile(
+        rows,
+        np.exp(np.clip(eta, -745.0, 700.0)),
+        np.exp(
+            np.clip(
+                fit.coefficients[: engine.free_baseline_dimension],
+                -745.0,
+                700.0,
+            )
+        ),
+    )
+
+
+def _components_from_profiles(
+    engine: ResponseEngine,
+    context: Context,
+    profiles: list[_SparseProfile],
+) -> _SparseComponents:
+    if not profiles:
+        raise ValueError("at least one sparse profile is required")
+    active_parts = [context.target_rows]
+    active_parts.extend(profile.rows for profile in profiles if len(profile.rows))
+    rows = sorted_unique_union(active_parts)
+    if rows is None:
+        rows = np.unique(np.concatenate(active_parts))
+    # Profiles use the engine's structural x age x calendar baseline.  Using
+    # the legacy static-stratum mapping here assigns all active exposure to the
+    # first cells while `_baseline_totals` remains temporal, which can make
+    # active mass exceed total observation mass.
+    row_groups = context.temporal_baseline_groups_at_rows(
+        rows, time_bins=engine.baseline_time_bins
+    )
+    active_by_group = np.bincount(
+        row_groups,
+        weights=context.weights_at_rows(rows),
+        minlength=engine.free_baseline_dimension,
+    ).astype(np.float64)
+    inactive_by_group = engine._baseline_totals(context) - active_by_group
+    if np.any(inactive_by_group < -1.0e-8):
+        raise AssertionError("ensemble active rows exceed the observation grid")
+    inactive_by_group = np.maximum(inactive_by_group, 0.0)
+    active_intensity = np.empty((len(profiles), len(rows)), dtype=np.float64)
+    baseline_intensity = np.empty(
+        (len(profiles), engine.free_baseline_dimension), dtype=np.float64
+    )
+    for index, profile in enumerate(profiles):
+        baseline_intensity[index] = profile.baseline_intensity
+        active_intensity[index] = profile.baseline_intensity[row_groups]
+        if len(profile.rows):
+            positions = np.searchsorted(rows, profile.rows)
+            active_intensity[index, positions] = profile.intensity
+    event = _events_at_rows(context, rows)
+    noevent = (
+        context.weights_at_rows(rows) - event
+        if context.dataset.likelihood == "first_event_cloglog"
+        else context.weights_at_rows(rows)
+    )
+    return _SparseComponents(
+        active_intensity,
+        baseline_intensity,
+        event,
+        noevent,
+        inactive_by_group,
+        context.dataset.likelihood,
+        1.0 / context.dataset.ticks_per_unit
+        if context.dataset.likelihood == "poisson"
+        else 1.0,
+    )
 
 
 def _sparse_components(
@@ -115,55 +355,13 @@ def _sparse_components(
     matrices: list[ModelMatrix],
     fits: list[FitResult],
 ) -> _SparseComponents:
-    active_parts = [context.target_rows]
-    active_parts.extend(
-        matrix.active_rows for matrix in matrices if len(matrix.active_rows)
-    )
-    rows = (
-        np.unique(np.concatenate(active_parts))
-        if active_parts
-        else np.zeros(0, dtype=np.int64)
-    )
-    local, times = context.rows_to_entity_time(rows)
-    ages = context.baseline_origins[local] + times - context.starts[local]
-    age_bins = np.minimum(ages // engine.lag, engine.baseline_dimension - 1).astype(
-        np.int64
-    )
-    active_by_age = np.bincount(age_bins, minlength=engine.baseline_dimension).astype(
-        np.float64
-    )
-    inactive_by_age = engine._baseline_totals(context) - active_by_age
-    if np.any(inactive_by_age < -1.0e-8):
-        raise AssertionError("ensemble active rows exceed the observation grid")
-    inactive_by_age = np.maximum(inactive_by_age, 0.0)
-    active_intensity = []
-    baseline_intensity = []
-    for matrix, fit in zip(matrices, fits, strict=True):
-        eta = engine.linear_predictor_at_rows(context, matrix, fit.coefficients, rows)
-        active_intensity.append(np.exp(np.clip(eta, -745.0, 700.0)))
-        baseline_dimension = matrix.free_dimension - matrix.closure_dimension
-        baseline_eta = np.full(
-            engine.baseline_dimension, fit.coefficients[0], dtype=np.float64
-        )
-        if baseline_dimension > 1:
-            baseline_eta[1:baseline_dimension] += fit.coefficients[1:baseline_dimension]
-        baseline_intensity.append(np.exp(np.clip(baseline_eta, -745.0, 700.0)))
-    event = _events_at_rows(context, rows)
-    noevent = (
-        1.0 - event
-        if context.dataset.likelihood == "first_event_cloglog"
-        else np.ones(len(rows))
-    )
-    return _SparseComponents(
-        np.asarray(active_intensity, dtype=np.float64),
-        np.asarray(baseline_intensity, dtype=np.float64),
-        event,
-        noevent,
-        inactive_by_age,
-        context.dataset.likelihood,
-        1.0 / context.dataset.ticks_per_unit
-        if context.dataset.likelihood == "poisson"
-        else 1.0,
+    return _components_from_profiles(
+        engine,
+        context,
+        [
+            _sparse_profile(engine, context, matrix, fit)
+            for matrix, fit in zip(matrices, fits, strict=True)
+        ],
     )
 
 
@@ -172,19 +370,23 @@ def _mixture_nll_gradient(
 ) -> tuple[float, np.ndarray]:
     active = np.maximum(weights @ components.active_intensity, np.finfo(float).tiny)
     baseline = np.maximum(weights @ components.baseline_intensity, np.finfo(float).tiny)
-    if components.likelihood == "poisson":
+    if is_poisson_likelihood(components.likelihood):
         nll = float(
-            components.tick_exposure * np.sum(active)
+            components.tick_exposure * (components.active_noevent @ active)
             - components.active_event @ np.log(active)
-            + components.tick_exposure * (components.inactive_by_age @ baseline)
+            + components.tick_exposure
+            * (components.inactive_baseline_groups @ baseline)
         )
-        active_derivative = components.tick_exposure - components.active_event / active
+        active_derivative = (
+            components.tick_exposure * components.active_noevent
+            - components.active_event / active
+        )
     else:
         event_value, event_first_eta, _ = cloglog_event_terms(np.log(active))
         nll = float(
             components.active_noevent @ active
             + components.active_event @ event_value
-            + components.inactive_by_age @ baseline
+            + components.inactive_baseline_groups @ baseline
         )
         active_derivative = (
             components.active_noevent
@@ -193,78 +395,97 @@ def _mixture_nll_gradient(
     gradient = (
         components.active_intensity @ active_derivative
         + components.tick_exposure
-        * (components.baseline_intensity @ components.inactive_by_age)
+        * (components.baseline_intensity @ components.inactive_baseline_groups)
     )
     return nll, gradient
 
 
-def _evaluate_mixture(
-    engine: ResponseEngine,
-    context: Context,
-    matrices: list[ModelMatrix],
-    fits: list[FitResult],
+def _mixture_sufficient_statistics(
+    components: _SparseComponents,
+) -> _MixtureSufficientStatistics:
+    target = components.active_event > 0.0
+    target_intensity = np.ascontiguousarray(
+        components.active_intensity[:, target], dtype=np.float64
+    )
+    target_weight = np.ascontiguousarray(
+        components.active_event[target], dtype=np.float64
+    )
+    if is_poisson_likelihood(components.likelihood):
+        linear = components.tick_exposure * (
+            components.active_intensity @ components.active_noevent
+            + components.baseline_intensity @ components.inactive_baseline_groups
+        )
+    else:
+        linear = (
+            components.active_intensity @ components.active_noevent
+            + components.baseline_intensity @ components.inactive_baseline_groups
+        )
+    return _MixtureSufficientStatistics(
+        np.ascontiguousarray(linear, dtype=np.float64),
+        target_intensity,
+        target_weight,
+        components.likelihood,
+    )
+
+
+def _mixture_statistics_nll_gradient(
+    statistics: _MixtureSufficientStatistics,
     weights: np.ndarray,
-) -> float:
-    return _mixture_nll_gradient(
-        _sparse_components(engine, context, matrices, fits), weights
-    )[0]
+) -> tuple[float, np.ndarray]:
+    weights = np.asarray(weights, dtype=np.float64)
+    intensity = np.maximum(
+        weights @ statistics.target_intensity,
+        np.finfo(float).tiny,
+    )
+    linear_value = float(statistics.linear @ weights)
+    if is_poisson_likelihood(statistics.likelihood):
+        nll = linear_value - float(statistics.target_weight @ np.log(intensity))
+        gradient = statistics.linear - statistics.target_intensity @ (
+            statistics.target_weight / intensity
+        )
+    else:
+        event_value, event_first_eta, _ = cloglog_event_terms(np.log(intensity))
+        nll = linear_value + float(statistics.target_weight @ event_value)
+        gradient = statistics.linear + statistics.target_intensity @ (
+            statistics.target_weight * event_first_eta / intensity
+        )
+    return nll, np.ascontiguousarray(gradient, dtype=np.float64)
 
 
-def fit_ensemble(
-    dataset_context: Context,
-    test_context: Context | None,
-    supports: tuple[Support, ...],
-    config: RunConfig,
-) -> EnsembleResult:
-    engine = ResponseEngine(
-        dataset_context.dataset,
-        lag=config.impact_lag,
-        knot_count=config.knot_count,
-        cache_bytes=config.cache_bytes,
+def _subset_mixture_statistics(
+    statistics: _MixtureSufficientStatistics,
+    indices: tuple[int, ...],
+) -> _MixtureSufficientStatistics:
+    selected = np.asarray(indices, dtype=np.int64)
+    return _MixtureSufficientStatistics(
+        np.ascontiguousarray(statistics.linear[selected]),
+        np.ascontiguousarray(statistics.target_intensity[selected]),
+        statistics.target_weight,
+        statistics.likelihood,
     )
-    baseline_matrix = engine.model_matrix(dataset_context, EMPTY_SUPPORT)
-    baseline_fit = fit_model_matrix_continued(
-        baseline_matrix,
-        likelihood=dataset_context.dataset.likelihood,
-        tolerance=config.solver_tolerance,
-        max_iter=config.solver_max_iter,
-        device=(config.pricing_devices or ("cpu",))[0],
+
+
+def _fit_simplex_statistics(
+    statistics: _MixtureSufficientStatistics,
+    *,
+    tolerance: float,
+    initial: np.ndarray | None = None,
+) -> _SimplexFit:
+    component_count = int(statistics.linear.shape[0])
+    if component_count < 1:
+        raise ValueError("at least one mixture component is required")
+    weights = (
+        np.full(component_count, 1.0 / component_count, dtype=np.float64)
+        if initial is None
+        else _simplex_projection(np.asarray(initial, dtype=np.float64))
     )
-    if not baseline_fit.converged:
-        return EnsembleResult(
-            (), (), np.zeros(0), 0.0, baseline_fit, math.inf, None, None, False
-        )
-    support_fits: list[FitResult] = []
-    support_matrices: list[ModelMatrix] = []
-    for start in range(0, len(supports), config.exact_workers):
-        support_wave = supports[start : start + config.exact_workers]
-        matrix_wave = [
-            engine.model_matrix(dataset_context, support) for support in support_wave
-        ]
-        fit_wave = fit_model_matrices(
-            matrix_wave,
-            likelihood=dataset_context.dataset.likelihood,
-            tolerance=config.solver_tolerance,
-            max_iter=config.solver_max_iter,
-            workers=config.exact_workers,
-            cpu_threads_per_worker=max(
-                1, config.pricing_workers // config.exact_workers
-            ),
-            devices=config.pricing_devices or ("cpu",),
-        )
-        for matrix, fit in zip(matrix_wave, fit_wave, strict=True):
-            if fit.converged:
-                support_fits.append(fit)
-                support_matrices.append(matrix)
-    matrices = [baseline_matrix, *support_matrices]
-    fits = [baseline_fit, *support_fits]
-    components = _sparse_components(engine, dataset_context, matrices, fits)
-    weights = np.full(len(fits), 1.0 / len(fits), dtype=np.float64)
+    if weights.shape != (component_count,):
+        raise ValueError("mixture initial weight dimension mismatch")
     result = minimize(
-        lambda value: _mixture_nll_gradient(components, value),
+        lambda value: _mixture_statistics_nll_gradient(statistics, value),
         weights,
         jac=True,
-        bounds=[(0.0, 1.0)] * len(weights),
+        bounds=[(0.0, 1.0)] * component_count,
         constraints={
             "type": "eq",
             "fun": lambda value: float(np.sum(value) - 1.0),
@@ -272,73 +493,940 @@ def fit_ensemble(
         },
         method="SLSQP",
         options={
-            "ftol": config.solver_tolerance,
+            "ftol": tolerance,
             "maxiter": 2_000,
             "disp": False,
         },
     )
     if result.x is not None and np.all(np.isfinite(result.x)):
         weights = _simplex_projection(np.asarray(result.x, dtype=np.float64))
-    nll, gradient = _mixture_nll_gradient(components, weights)
-    converged = _simplex_kkt(weights, gradient, nll) <= (
-        10.0 * config.solver_tolerance
-    )
-    # SLSQP is normally definitive, but retain a deterministic projected-
-    # gradient fallback and accept only an explicitly verified simplex KKT.
+    nll, gradient = _mixture_statistics_nll_gradient(statistics, weights)
+    converged = _simplex_kkt(weights, gradient, nll) <= 10.0 * tolerance
     for _ in range(0 if converged else 2_000):
-        nll, gradient = _mixture_nll_gradient(components, weights)
-        if _simplex_kkt(weights, gradient, nll) <= 10.0 * config.solver_tolerance:
+        nll, gradient = _mixture_statistics_nll_gradient(statistics, weights)
+        if _simplex_kkt(weights, gradient, nll) <= 10.0 * tolerance:
             converged = True
             break
         step = 1.0 / max(1.0, float(np.linalg.norm(gradient)))
         accepted = False
-        trial_nll = nll
         for _ in range(40):
             trial = _simplex_projection(weights - step * gradient)
-            trial_nll, _ = _mixture_nll_gradient(components, trial)
+            trial_nll, _ = _mixture_statistics_nll_gradient(statistics, trial)
             displacement = trial - weights
             if trial_nll <= nll + 1.0e-4 * float(gradient @ displacement):
                 weights, accepted = trial, True
                 break
             step *= 0.5
         if not accepted:
-            converged = _simplex_kkt(weights, gradient, nll) <= (
-                10.0 * config.solver_tolerance
+            break
+    nll, gradient = _mixture_statistics_nll_gradient(statistics, weights)
+    converged = _simplex_kkt(weights, gradient, nll) <= 10.0 * tolerance
+    return _SimplexFit(weights, nll, converged)
+
+
+def _fit_simplex_components(
+    components: _SparseComponents,
+    *,
+    tolerance: float,
+    initial: np.ndarray | None = None,
+) -> _SimplexFit:
+    """Exactly optimize fixed component intensities on the simplex.
+
+    The component kernels are frozen; only their nonnegative convex weights
+    are optimized.  The Poisson and cloglog mixture NLLs are convex in those
+    weights, so the verified simplex KKT residual is a global certificate for
+    this small subproblem.
+    """
+    return _fit_simplex_statistics(
+        _mixture_sufficient_statistics(components),
+        tolerance=tolerance,
+        initial=initial,
+    )
+
+
+def _fit_indexed_simplex_components(
+    components: _SparseComponents,
+    indices: tuple[int, ...],
+    *,
+    tolerance: float,
+    initial: np.ndarray | None = None,
+) -> _SimplexFit:
+    """Fit a component subset with one bounded row compaction."""
+    component_count = int(components.active_intensity.shape[0])
+    selected = np.asarray(indices, dtype=np.int64)
+    if (
+        not len(selected)
+        or np.any(selected < 0)
+        or np.any(selected >= component_count)
+        or len(np.unique(selected)) != len(selected)
+    ):
+        raise ValueError("indexed mixture requires unique in-range components")
+    if np.array_equal(selected, np.arange(component_count, dtype=np.int64)):
+        return _fit_simplex_components(
+            components,
+            tolerance=tolerance,
+            initial=initial,
+        )
+    # A BLAS product with a full K-vector of mostly zero weights still scans
+    # all K intensity rows on every SLSQP iteration.  Copy the selected rows
+    # once, then solve the identical smaller convex problem.  The full-family
+    # fit above remains zero-copy, so peak storage is bounded by
+    # ``full table + largest proper subset``.
+    subset = _SparseComponents(
+        active_intensity=np.ascontiguousarray(components.active_intensity[selected]),
+        baseline_intensity=np.ascontiguousarray(
+            components.baseline_intensity[selected]
+        ),
+        active_event=components.active_event,
+        active_noevent=components.active_noevent,
+        inactive_baseline_groups=components.inactive_baseline_groups,
+        likelihood=components.likelihood,
+        tick_exposure=components.tick_exposure,
+    )
+    return _fit_simplex_components(
+        subset,
+        tolerance=tolerance,
+        initial=initial,
+    )
+
+
+def _select_intensity_family(
+    components: _SparseComponents,
+    penalties: np.ndarray,
+    *,
+    baseline_nll: float,
+    n_entities: int,
+    tolerance: float,
+    search_tolerance: float,
+) -> _IntensityFamilySelection:
+    r"""Select a coded Add/Drop-stationary intensity-mixture family.
+
+    For a frozen family ``F`` this optimizes exactly
+
+    .. math::
+
+       \lambda_{F,w}(t)=\sum_{S\in F}w_S\lambda_S(t)
+
+    and scores it by twice its NLL gain minus all support codes,
+    ``(|F|-1) log(N)`` for the extra independently fitted component
+    intercepts, and ``(|F|-1) log(N)`` for the free simplex weights. Candidate fits reuse the
+    current weights but acceptance depends only on the verified simplex KKT,
+    so warm starts alter runtime rather than the selected optimum.
+    """
+    model_count = int(components.active_intensity.shape[0])
+    codes = np.ascontiguousarray(penalties, dtype=np.float64)
+    if model_count < 1 or codes.shape != (model_count,):
+        raise ValueError("intensity family penalties must align with components")
+    if not np.all(np.isfinite(codes)):
+        raise ValueError("intensity family penalties must be finite")
+    if not math.isfinite(baseline_nll) or n_entities < 1:
+        raise ValueError("intensity family requires a finite baseline")
+    weight_unit = math.log(max(2, int(n_entities)))
+    statistics = _mixture_sufficient_statistics(components)
+    cache: dict[tuple[int, ...], tuple[float, _SimplexFit | None]] = {}
+    audits = 0
+    moves = 0
+
+    def evaluate(
+        indices: tuple[int, ...],
+        initial: np.ndarray | None = None,
+    ) -> tuple[float, _SimplexFit | None]:
+        nonlocal audits
+        cached = cache.get(indices)
+        if cached is not None:
+            return cached
+        audits += 1
+        if not indices:
+            result: tuple[float, _SimplexFit | None] = (0.0, None)
+            cache[indices] = result
+            return result
+        fitted = _fit_simplex_statistics(
+            _subset_mixture_statistics(statistics, indices),
+            tolerance=tolerance,
+            initial=initial,
+        )
+        if not fitted.converged or not math.isfinite(fitted.nll):
+            result = (-math.inf, fitted)
+            cache[indices] = result
+            return result
+        code = float(np.sum(codes[np.asarray(indices, dtype=np.int64)]))
+        # Each support penalty excludes the one baseline intercept shared by
+        # the null model.  A K-component family contains K independently
+        # fitted intercepts, hence K-1 additional intercept parameters as
+        # well as K-1 free simplex weights.
+        code += 2 * max(0, len(indices) - 1) * weight_unit
+        score = 2.0 * (float(baseline_nll) - fitted.nll) - code
+        result = (float(score), fitted)
+        cache[indices] = result
+        return result
+
+    def inherited_initial(
+        source: tuple[int, ...],
+        source_fit: _SimplexFit | None,
+        target: tuple[int, ...],
+    ) -> np.ndarray | None:
+        if source_fit is None:
+            return None
+        weights = np.zeros(len(target), dtype=np.float64)
+        positions = {index: position for position, index in enumerate(target)}
+        for index, weight in zip(source, source_fit.weights, strict=True):
+            position = positions.get(index)
+            if position is not None:
+                weights[position] = weight
+        total = float(np.sum(weights))
+        return None if total <= np.finfo(float).eps else weights / total
+
+    current = tuple(range(model_count))
+    current_score, current_fit = evaluate(current)
+    initial_score = float(current_score)
+    if current_fit is None or not math.isfinite(current_score):
+        return _IntensityFamilySelection(
+            (),
+            np.zeros(0, dtype=np.float64),
+            math.inf,
+            initial_score,
+            -math.inf,
+            audits,
+            moves,
+        )
+    zero_tolerance = max(1.0e-12, 10.0 * tolerance)
+    zero_pruned_exact = False
+    positive = tuple(
+        index
+        for index, weight in zip(current, current_fit.weights, strict=True)
+        if weight > zero_tolerance
+    )
+    if positive and len(positive) < len(current):
+        reduced_score, reduced_fit = evaluate(
+            positive,
+            inherited_initial(current, current_fit, positive),
+        )
+        if reduced_fit is not None and reduced_score > current_score + search_tolerance:
+            nll_slack = max(
+                1.0e-9,
+                10.0 * tolerance,
+                256.0
+                * np.finfo(np.float64).eps
+                * max(1.0, abs(current_fit.nll), abs(reduced_fit.nll)),
             )
+            zero_pruned_exact = abs(reduced_fit.nll - current_fit.nll) <= nll_slack
+            current, current_score, current_fit = (
+                positive,
+                reduced_score,
+                reduced_fit,
+            )
+            moves += 1
+
+    while True:
+        alternatives: list[tuple[float, tuple[int, ...], _SimplexFit | None]] = []
+        for index in current:
+            trial = tuple(item for item in current if item != index)
+            score, fitted = evaluate(
+                trial,
+                inherited_initial(current, current_fit, trial),
+            )
+            alternatives.append((score, trial, fitted))
+        improving_drops = [
+            item
+            for item in alternatives
+            if item[2] is not None and item[0] > current_score + search_tolerance
+        ]
+        # If the only move so far removed exact zero-weight components, the
+        # reduced predictor is the verified optimum of the original full
+        # simplex.  Every excluded Add therefore has nonnegative directional
+        # derivative and an additional positive model code: it cannot improve
+        # the family score.  Audit Drops only.  Once a positive-weight model is
+        # removed, that KKT certificate no longer applies and the complete Add
+        # audit below is restored.
+        if zero_pruned_exact:
+            if not improving_drops:
+                break
+            next_score, next_family, next_fit = min(
+                improving_drops,
+                key=lambda item: (-item[0], item[1]),
+            )
+            if next_fit is None:
+                raise AssertionError("improving Drop is missing its simplex fit")
+            current, current_score, current_fit = (
+                next_family,
+                next_score,
+                next_fit,
+            )
+            moves += 1
+            zero_pruned_exact = False
+            continue
+        current_set = set(current)
+        for index in range(model_count):
+            if index in current_set:
+                continue
+            trial = tuple(sorted((*current, index)))
+            score, fitted = evaluate(
+                trial,
+                inherited_initial(current, current_fit, trial),
+            )
+            alternatives.append((score, trial, fitted))
+        improving = improving_drops + [
+            item
+            for item in alternatives[len(current) :]
+            if item[2] is not None and item[0] > current_score + search_tolerance
+        ]
+        if not improving:
             break
-        _, trial_gradient = _mixture_nll_gradient(components, weights)
-        if _simplex_kkt(weights, trial_gradient, trial_nll) <= (
-            10.0 * config.solver_tolerance
+        next_score, next_family, next_fit = min(
+            improving,
+            key=lambda item: (-item[0], item[1]),
+        )
+        if next_fit is None:
+            raise AssertionError("improving family is missing its simplex fit")
+        current, current_score, current_fit = (
+            next_family,
+            next_score,
+            next_fit,
+        )
+        moves += 1
+
+    return _IntensityFamilySelection(
+        current,
+        np.asarray(current_fit.weights, dtype=np.float64),
+        float(current_fit.nll),
+        initial_score,
+        float(current_score),
+        audits,
+        moves,
+    )
+
+
+def _fixed_model_mixture(
+    engine: ResponseEngine,
+    context: Context,
+    matrices: list[ModelMatrix],
+    fits: list[FitResult],
+    *,
+    tolerance: float,
+) -> _SimplexFit:
+    """Fit simplex weights for already fitted support models."""
+    if len(matrices) != len(fits) or not matrices:
+        raise ValueError("fixed mixture requires aligned nonempty models")
+    return _fit_simplex_components(
+        _sparse_components(engine, context, matrices, fits),
+        tolerance=tolerance,
+    )
+
+
+def _fit_sparse_profiles(
+    engine: ResponseEngine,
+    context: Context,
+    profiles: list[_SparseProfile],
+    *,
+    tolerance: float,
+) -> _SimplexFit:
+    """Optimize a fixed-model mixture after dense matrices were released."""
+    return _fit_simplex_components(
+        _components_from_profiles(engine, context, profiles),
+        tolerance=tolerance,
+    )
+
+
+def _rule_effect_design(
+    engine: ResponseEngine,
+    context: Context,
+    support_matrices: list[ModelMatrix],
+    support_fits: list[FitResult],
+    *,
+    frozen_sources: tuple[tuple[int, int], ...] | None = None,
+) -> tuple[
+    tuple[RuleIdentity, ...],
+    tuple[Support, ...],
+    tuple[tuple[int, int], ...],
+    np.ndarray,
+    csc_matrix,
+]:
+    """Build one sparse, support-conditioned effect column per unique rule."""
+
+    if frozen_sources is None:
+        candidates: dict[RuleIdentity, tuple[int, int]] = {}
+        for support_index, matrix in enumerate(support_matrices):
+            for rule_index, rule in enumerate(matrix.support.rules):
+                incumbent = candidates.get(rule)
+                if incumbent is None:
+                    candidates[rule] = (support_index, rule_index)
+                    continue
+                incumbent_support = support_matrices[incumbent[0]].support
+                candidate_key = (
+                    len(matrix.support.rules),
+                    matrix.support.rules,
+                    rule_index,
+                )
+                incumbent_key = (
+                    len(incumbent_support.rules),
+                    incumbent_support.rules,
+                    incumbent[1],
+                )
+                if candidate_key < incumbent_key:
+                    candidates[rule] = (support_index, rule_index)
+        rules = tuple(sorted(candidates))
+        sources = tuple(candidates[rule] for rule in rules)
+    else:
+        sources = tuple(frozen_sources)
+        rules = tuple(
+            support_matrices[support_index].support.rules[rule_index]
+            for support_index, rule_index in sources
+        )
+
+    retained_rules: list[RuleIdentity] = []
+    retained_sources: list[tuple[int, int]] = []
+    blocks: list[tuple[np.ndarray, np.ndarray]] = []
+    for rule, (support_index, rule_index) in zip(rules, sources, strict=True):
+        matrix = support_matrices[support_index]
+        fit = support_fits[support_index]
+        response_blocks = engine.total_state_rule_blocks(context, matrix.support)
+        rows = np.ascontiguousarray(response_blocks[rule_index].rows, dtype=np.int64)
+        if not len(rows):
+            if frozen_sources is not None:
+                retained_rules.append(rule)
+                retained_sources.append((support_index, rule_index))
+                blocks.append(
+                    (
+                        rows,
+                        np.zeros(0, dtype=np.float64),
+                    )
+                )
+            continue
+        values = engine.frozen_contextual_rule_contribution_at_rows(
+            context,
+            matrix,
+            fit.coefficients,
+            rule_index=rule_index,
+            rows=rows,
+        )
+        if not np.any(np.abs(values) > 0.0):
+            if frozen_sources is not None:
+                retained_rules.append(rule)
+                retained_sources.append((support_index, rule_index))
+                blocks.append((rows, np.zeros(len(rows), dtype=np.float64)))
+            continue
+        retained_rules.append(rule)
+        retained_sources.append((support_index, rule_index))
+        blocks.append((rows, np.ascontiguousarray(values, dtype=np.float64)))
+    if not blocks:
+        return (), (), (), np.zeros(0, dtype=np.int64), csc_matrix((0, 0))
+
+    nonempty = [item[0] for item in blocks if len(item[0])]
+    rows = sorted_unique_union(nonempty) if nonempty else None
+    if rows is None:
+        rows = (
+            np.unique(np.concatenate(nonempty))
+            if nonempty
+            else np.zeros(0, dtype=np.int64)
+        )
+    rows = np.ascontiguousarray(rows, dtype=np.int64)
+    positions = [np.searchsorted(rows, item[0]) for item in blocks]
+    row_index = np.concatenate(positions) if positions else np.zeros(0, dtype=np.int64)
+    column_index = np.concatenate(
+        [
+            np.full(len(item[0]), index, dtype=np.int32)
+            for index, item in enumerate(blocks)
+        ]
+    )
+    values = np.concatenate([item[1] for item in blocks])
+    design = csc_matrix(
+        (values, (row_index, column_index)),
+        shape=(len(rows), len(blocks)),
+    )
+    return (
+        tuple(retained_rules),
+        tuple(
+            support_matrices[support_index].support
+            for support_index, _ in retained_sources
+        ),
+        tuple(retained_sources),
+        rows,
+        design,
+    )
+
+
+def _fit_rule_effect_stack(
+    engine: ResponseEngine,
+    context: Context,
+    baseline_matrix: ModelMatrix,
+    baseline_fit: FitResult,
+    support_matrices: list[ModelMatrix],
+    support_fits: list[FitResult],
+    *,
+    tolerance: float,
+) -> _RuleEffectStack:
+    """Fit the exact common-baseline nonnegative rule-effect stack."""
+
+    rules, sources, source_indices, rows, design = _rule_effect_design(
+        engine, context, support_matrices, support_fits
+    )
+    if not rules:
+        return _RuleEffectStack(
+            (), (), (), np.zeros(0, dtype=np.float64), baseline_fit.nll, True
+        )
+    eta0 = engine.frozen_linear_predictor_at_rows(
+        context, baseline_matrix, baseline_fit.coefficients, rows
+    )
+    row_weight = context.weights_at_rows(rows)
+    event_weight = context.target_counts_at_sorted_rows(rows)
+    noevent_weight = (
+        row_weight - event_weight
+        if context.dataset.likelihood == "first_event_cloglog"
+        else row_weight
+    )
+    exposure_weight = engine.tick_exposure * row_weight
+    baseline_rows = float(
+        np.sum(
+            loss_rows(
+                eta0,
+                likelihood=context.dataset.likelihood,
+                exposure_weight=exposure_weight,
+                noevent_weight=noevent_weight,
+                event_weight=event_weight,
+            )[0]
+        )
+    )
+
+    def derivatives(
+        weights: np.ndarray, *, with_hessian: bool
+    ) -> tuple[float, np.ndarray, np.ndarray | None]:
+        eta = eta0 + np.asarray(design @ weights, dtype=np.float64).reshape(-1)
+        values, first, second = loss_rows(
+            eta,
+            likelihood=context.dataset.likelihood,
+            exposure_weight=exposure_weight,
+            noevent_weight=noevent_weight,
+            event_weight=event_weight,
+        )
+        gradient = np.asarray(design.T @ first).reshape(-1)
+        if not with_hessian:
+            return float(np.sum(values)), gradient, None
+        weighted_design = design.multiply(second[:, None])
+        hessian = np.asarray((design.T @ weighted_design).toarray(), dtype=np.float64)
+        hessian = 0.5 * (hessian + hessian.T)
+        return float(np.sum(values)), gradient, hessian
+
+    def objective(weights: np.ndarray) -> tuple[float, np.ndarray]:
+        value, gradient, _ = derivatives(weights, with_hessian=False)
+        return value, gradient
+
+    def kkt_residual(weights: np.ndarray, gradient: np.ndarray) -> float:
+        active = weights > max(1.0e-10, 10.0 * tolerance)
+        active_residual = (
+            float(np.max(np.abs(gradient[active]))) if np.any(active) else 0.0
+        )
+        inactive_residual = (
+            float(np.max(np.maximum(-gradient[~active], 0.0)))
+            if np.any(~active)
+            else 0.0
+        )
+        return max(active_residual, inactive_residual)
+
+    initial = np.ones(len(rules), dtype=np.float64)
+    result = minimize(
+        objective,
+        initial,
+        jac=True,
+        bounds=[(0.0, None)] * len(rules),
+        method="L-BFGS-B",
+        # scipy's ftol is relative to the *summed* NLL.  Reusing the model
+        # tolerance here made a large Home Credit objective stop while its
+        # projected gradient was still material.  Keep objective stopping at
+        # machine precision and let the explicit cone-KKT check below decide.
+        options={
+            "ftol": 1.0e-15,
+            "gtol": tolerance,
+            "maxiter": 2_000,
+            "maxls": 100,
+        },
+    )
+    weights = np.maximum(
+        0.0,
+        np.asarray(result.x if result.x is not None else initial, dtype=np.float64),
+    )
+    rows_nll, gradient, _ = derivatives(weights, with_hessian=False)
+    full_nll = float(baseline_fit.nll + rows_nll - baseline_rows)
+    threshold = 10.0 * tolerance * max(1.0, abs(full_nll))
+
+    # Correlated certified rules can still trigger an L-BFGS line-search stop.
+    # The stack normally has only a handful of columns, so finish with an
+    # exact small-Hessian projected Newton refinement.  Every accepted step is
+    # feasible and decreases the same frozen common-baseline likelihood.
+    for _ in range(64):
+        residual = kkt_residual(weights, gradient)
+        if residual <= threshold:
+            break
+        rows_nll, gradient, hessian = derivatives(weights, with_hessian=True)
+        assert hessian is not None
+        free = (weights > max(1.0e-10, 10.0 * tolerance)) | (gradient < 0.0)
+        if not np.any(free):
+            break
+        indices = np.flatnonzero(free)
+        block = hessian[np.ix_(indices, indices)]
+        scale = max(1.0, float(np.max(np.diag(block))))
+        block = block + np.eye(len(indices), dtype=np.float64) * (
+            np.finfo(np.float64).eps * scale
+        )
+        try:
+            direction_free = -np.linalg.solve(block, gradient[indices])
+        except np.linalg.LinAlgError:
+            diagonal = np.maximum(np.diag(block), np.finfo(np.float64).eps * scale)
+            direction_free = -gradient[indices] / diagonal
+        direction = np.zeros_like(weights)
+        direction[indices] = direction_free
+        projected = np.maximum(0.0, weights + direction)
+        direction = projected - weights
+        directional = float(gradient @ direction)
+        if not np.isfinite(directional) or directional >= 0.0:
+            diagonal = np.maximum(
+                np.diag(hessian), np.finfo(np.float64).eps * scale
+            )
+            projected = np.maximum(0.0, weights - gradient / diagonal)
+            direction = projected - weights
+            directional = float(gradient @ direction)
+        if not np.isfinite(directional) or directional >= 0.0:
+            break
+        accepted = False
+        step = 1.0
+        for _ in range(60):
+            trial = np.maximum(0.0, weights + step * direction)
+            trial_nll, trial_gradient, _ = derivatives(
+                trial, with_hessian=False
+            )
+            if np.isfinite(trial_nll) and trial_nll <= rows_nll + 1.0e-4 * step * directional:
+                weights = trial
+                rows_nll = trial_nll
+                gradient = trial_gradient
+                accepted = True
+                break
+            step *= 0.5
+        if not accepted:
+            break
+    full_nll = float(baseline_fit.nll + rows_nll - baseline_rows)
+    converged = kkt_residual(weights, gradient) <= 10.0 * tolerance * max(
+        1.0, abs(full_nll)
+    )
+    return _RuleEffectStack(
+        rules, sources, source_indices, weights, full_nll, converged
+    )
+
+
+def _evaluate_rule_effect_stack(
+    engine: ResponseEngine,
+    context: Context,
+    baseline_matrix: ModelMatrix,
+    baseline_fit: FitResult,
+    support_matrices: list[ModelMatrix],
+    support_fits: list[FitResult],
+    stack: _RuleEffectStack,
+    *,
+    baseline_nll: float,
+) -> float:
+    if not stack.rules:
+        return float(baseline_nll)
+    rules, _, _, rows, design = _rule_effect_design(
+        engine,
+        context,
+        support_matrices,
+        support_fits,
+        frozen_sources=stack.source_indices,
+    )
+    if rules != stack.rules:
+        raise AssertionError("test rule-effect design changed its frozen identity")
+    eta0 = engine.frozen_linear_predictor_at_rows(
+        context, baseline_matrix, baseline_fit.coefficients, rows
+    )
+    row_weight = context.weights_at_rows(rows)
+    event_weight = context.target_counts_at_sorted_rows(rows)
+    noevent_weight = (
+        row_weight - event_weight
+        if context.dataset.likelihood == "first_event_cloglog"
+        else row_weight
+    )
+    exposure_weight = engine.tick_exposure * row_weight
+    baseline_rows = float(
+        np.sum(
+            loss_rows(
+                eta0,
+                likelihood=context.dataset.likelihood,
+                exposure_weight=exposure_weight,
+                noevent_weight=noevent_weight,
+                event_weight=event_weight,
+            )[0]
+        )
+    )
+    eta = eta0 + np.asarray(design @ stack.weights).reshape(-1)
+    stacked_rows = float(
+        np.sum(
+            loss_rows(
+                eta,
+                likelihood=context.dataset.likelihood,
+                exposure_weight=exposure_weight,
+                noevent_weight=noevent_weight,
+                event_weight=event_weight,
+            )[0]
+        )
+    )
+    return float(baseline_nll + stacked_rows - baseline_rows)
+
+
+def fit_ensemble(
+    dataset_context: Context,
+    test_context: Context | None,
+    supports: tuple[Support, ...],
+    config: RunConfig,
+    *,
+    closure_signs: dict[ClosureTerm, int] | None = None,
+    baseline_warm_start: np.ndarray | None = None,
+    support_warm_starts: dict[Support, np.ndarray] | None = None,
+    mixture_warm_start: dict[Support, float] | None = None,
+) -> EnsembleResult:
+    engine = ResponseEngine(
+        dataset_context.dataset,
+        lag=config.impact_lag,
+        knot_count=config.knot_count,
+        baseline_time_bins=config.baseline_time_bins,
+        effect_model=config.effect_model,
+        cache_bytes=config.cache_bytes,
+    )
+    for term, sign in (closure_signs or {}).items():
+        engine.set_closure_sign(term, sign)
+    baseline_matrix = engine.model_matrix(dataset_context, EMPTY_SUPPORT)
+    baseline_fit = _fit_frozen_model_with_retry(
+        baseline_matrix,
+        likelihood=dataset_context.dataset.likelihood,
+        tolerance=config.solver_tolerance,
+        max_iter=config.solver_max_iter,
+        warm_start=baseline_warm_start,
+        device=(config.pricing_devices or ("cpu",))[0],
+    )
+    support_fits: list[FitResult] = []
+    support_matrices: list[ModelMatrix] = []
+    cuda_slots = len(
+        {device for device in config.pricing_devices if device.startswith("cuda")}
+    )
+    physical_exact_workers = (
+        min(config.exact_workers, cuda_slots) if cuda_slots else config.exact_workers
+    )
+    for start in range(0, len(supports), physical_exact_workers):
+        support_wave = supports[start : start + physical_exact_workers]
+        devices = config.pricing_devices or ("cpu",)
+        threads_per_fit = max(1, config.pricing_workers // physical_exact_workers)
+
+        def build_and_fit(
+            item: tuple[int, Support],
+        ) -> tuple[ModelMatrix, FitResult | None, RuntimeError | None]:
+            index, support = item
+            configure_cpu_threads(threads_per_fit)
+            # Certified supports are immutable total-rule models.  The
+            # ResponseEngine synchronizes its shared response caches; once
+            # built, each fixed design is owned by this worker's solver.
+            matrix = engine.model_matrix(dataset_context, support)
+            try:
+                fit = _fit_frozen_model_with_retry(
+                    matrix,
+                    likelihood=dataset_context.dataset.likelihood,
+                    tolerance=config.solver_tolerance,
+                    max_iter=config.solver_max_iter,
+                    warm_start=(
+                        None
+                        if support_warm_starts is None
+                        else support_warm_starts.get(support)
+                    ),
+                    device=devices[index % len(devices)],
+                    allow_cpu_fallback=False,
+                )
+            except RuntimeError as error:
+                # Do not launch a CPU fallback while another CUDA worker is
+                # still mutating process-global native thread/workspace state.
+                # Return the failure and retry it serially after the wave has
+                # joined.  The retry solves the identical fixed design.
+                return matrix, None, error
+            return matrix, fit, None
+
+        indexed_wave = list(enumerate(support_wave))
+        if len(indexed_wave) == 1:
+            completed_wave = [build_and_fit(indexed_wave[0])]
+        else:
+            with ThreadPoolExecutor(
+                max_workers=len(indexed_wave),
+                thread_name_prefix="crbstpp-ensemble",
+            ) as executor:
+                completed_wave = list(executor.map(build_and_fit, indexed_wave))
+        matrix_wave = [item[0] for item in completed_wave]
+        fit_wave: list[FitResult] = []
+        for wave_index, (support, (matrix, fit, parallel_error)) in enumerate(
+            zip(support_wave, completed_wave, strict=True)
         ):
-            converged = True
-            break
-    train_nll, _ = _mixture_nll_gradient(components, weights)
+            if fit is None:
+                configure_cpu_threads(config.pricing_workers)
+                try:
+                    # Rebuild the same sufficient statistics canonically.
+                    # Incremental group splitting is algebraically exact, but
+                    # its different summation order can leave a boundary KKT
+                    # residual above a strict tolerance on very uneven
+                    # weights.  The canonical design is a numerical fail-open,
+                    # not a different model or objective.
+                    matrix = engine.model_matrix(
+                        dataset_context,
+                        support,
+                        _allow_extension=False,
+                    )
+                    matrix_wave[wave_index] = matrix
+                    fit = _fit_frozen_model_with_retry(
+                        matrix,
+                        likelihood=dataset_context.dataset.likelihood,
+                        tolerance=config.solver_tolerance,
+                        max_iter=config.solver_max_iter,
+                        warm_start=None,
+                        device="cpu",
+                    )
+                except RuntimeError as serial_error:
+                    raise RuntimeError(
+                        "certified support failed frozen ensemble refit: "
+                        f"support={support!r}; parallel={parallel_error}; "
+                        f"serial_cpu={serial_error}"
+                    ) from serial_error
+            fit_wave.append(fit)
+        for matrix, fit in zip(matrix_wave, fit_wave, strict=True):
+            support_fits.append(fit)
+            support_matrices.append(matrix)
+    if len(support_matrices) != len(supports):
+        raise AssertionError("certified support was omitted from ensemble refit")
+    matrices = [baseline_matrix, *support_matrices]
+    fits = [baseline_fit, *support_fits]
+    retained_supports = tuple(matrix.support for matrix in support_matrices)
+    model_specs = tuple((matrix.support, matrix.closure) for matrix in matrices)
+    components = _sparse_components(engine, dataset_context, matrices, fits)
+    rule_stack = (
+        _fit_rule_effect_stack(
+            engine,
+            dataset_context,
+            baseline_matrix,
+            baseline_fit,
+            support_matrices,
+            support_fits,
+            tolerance=config.solver_tolerance,
+        )
+        if config.rule_effect_stacking_search
+        else None
+    )
+    # Sparse mixture components and fitted matrices are self-contained.  The
+    # potentially multi-GiB response/completion LRU is no longer useful and
+    # must not overlap the independently cached D_test engine below.
+    engine.clear_caches()
+    # Only frozen coefficients, support identities and mixture intensities are
+    # needed from this point.  Release all training ModelMatrix objects before
+    # simplex optimization and D_test construction.
+    del baseline_matrix, support_matrices, matrices
+    simplex_initial: np.ndarray | None = None
+    if mixture_warm_start:
+        support_initial = np.asarray(
+            [
+                max(0.0, float(mixture_warm_start.get(support, 0.0)))
+                for support in retained_supports
+            ],
+            dtype=np.float64,
+        )
+        support_total = float(np.sum(support_initial))
+        if support_total > 0.0:
+            baseline_initial = max(0.0, 1.0 - support_total)
+            simplex_initial = np.r_[baseline_initial, support_initial]
+            simplex_initial /= float(np.sum(simplex_initial))
+    simplex = _fit_simplex_components(
+        components,
+        tolerance=config.solver_tolerance,
+        initial=simplex_initial,
+    )
+    if config.ensemble_irreducible_family and retained_supports:
+        zero_tolerance = max(1.0e-12, 10.0 * config.solver_tolerance)
+        active_positions = tuple(
+            index
+            for index, weight in enumerate(simplex.weights[1:])
+            if float(weight) > zero_tolerance
+        )
+        if len(active_positions) < len(retained_supports):
+            # Components are fixed after D_fit+D_cert support refitting, so
+            # zero-weight pruning needs only another exact convex simplex fit;
+            # no support model is fitted twice. Baseline remains component 0.
+            component_indices = (0,) + tuple(
+                position + 1 for position in active_positions
+            )
+            statistics = _mixture_sufficient_statistics(components)
+            initial = np.asarray(
+                simplex.weights[np.asarray(component_indices, dtype=np.int64)],
+                dtype=np.float64,
+            )
+            initial /= float(np.sum(initial))
+            simplex = _fit_simplex_statistics(
+                _subset_mixture_statistics(statistics, component_indices),
+                tolerance=config.solver_tolerance,
+                initial=initial,
+            )
+            retained_supports = tuple(
+                retained_supports[position] for position in active_positions
+            )
+            support_fits = [support_fits[position] for position in active_positions]
+            model_specs = (model_specs[0],) + tuple(
+                model_specs[position + 1] for position in active_positions
+            )
+            fits = [baseline_fit, *support_fits]
+    weights = simplex.weights
+    converged = simplex.converged
+    support_simplex_train_nll = simplex.nll
+    train_nll = rule_stack.nll if rule_stack is not None else support_simplex_train_nll
+    # The learned simplex weights are frozen before D_test.  Training
+    # intensities can therefore be released, preventing train/test
+    # ``models x active_rows`` arrays from overlapping at peak memory.
+    components = None
     test_nll = baseline_test_nll = None
+    support_simplex_test_nll = None
     if test_context is not None:
         test_engine = ResponseEngine(
             test_context.dataset,
             lag=config.impact_lag,
             knot_count=config.knot_count,
+            baseline_time_bins=config.baseline_time_bins,
+            effect_model=config.effect_model,
             cache_bytes=config.cache_bytes,
         )
+        for term, sign in (closure_signs or {}).items():
+            test_engine.set_closure_sign(term, sign)
         test_matrices = [
-            test_engine.model_matrix(
-                test_context, matrix.support, forced_closure=matrix.closure
-            )
-            for matrix in matrices
+            test_engine.model_metadata(support, forced_closure=closure)
+            for support, closure in model_specs
         ]
-        test_nll = _evaluate_mixture(
-            test_engine, test_context, test_matrices, fits, weights
+        test_components = _sparse_components(
+            test_engine, test_context, test_matrices, fits
         )
-        baseline_test_matrix = test_engine.model_matrix(test_context, EMPTY_SUPPORT)
-        baseline_test_nll = _evaluate_mixture(
-            test_engine,
-            test_context,
-            [baseline_test_matrix],
-            [baseline_fit],
-            np.ones(1, dtype=np.float64),
+        support_simplex_test_nll = _mixture_nll_gradient(test_components, weights)[0]
+        baseline_components = _SparseComponents(
+            active_intensity=test_components.active_intensity[:1],
+            baseline_intensity=test_components.baseline_intensity[:1],
+            active_event=test_components.active_event,
+            active_noevent=test_components.active_noevent,
+            inactive_baseline_groups=test_components.inactive_baseline_groups,
+            likelihood=test_components.likelihood,
+            tick_exposure=test_components.tick_exposure,
         )
-    retained_supports = tuple(matrix.support for matrix in support_matrices)
+        baseline_test_nll = _mixture_nll_gradient(
+            baseline_components, np.ones(1, dtype=np.float64)
+        )[0]
+        if rule_stack is not None:
+            test_nll = _evaluate_rule_effect_stack(
+                test_engine,
+                test_context,
+                test_matrices[0],
+                baseline_fit,
+                test_matrices[1:],
+                support_fits,
+                rule_stack,
+                baseline_nll=baseline_test_nll,
+            )
+        else:
+            test_nll = support_simplex_test_nll
+        test_engine.clear_caches()
+        del test_matrices
     return EnsembleResult(
         retained_supports,
         tuple(support_fits),
@@ -348,5 +1436,17 @@ def fit_ensemble(
         train_nll,
         test_nll,
         baseline_test_nll,
-        converged,
+        converged and (rule_stack is None or rule_stack.converged),
+        combination=(
+            "common_baseline_nonnegative_rule_effect_stack"
+            if rule_stack is not None
+            else "support_intensity_simplex"
+        ),
+        rule_effects=() if rule_stack is None else rule_stack.rules,
+        rule_effect_sources=() if rule_stack is None else rule_stack.sources,
+        rule_effect_weights=(
+            np.zeros(0, dtype=np.float64) if rule_stack is None else rule_stack.weights
+        ),
+        support_simplex_train_nll=support_simplex_train_nll,
+        support_simplex_test_nll=support_simplex_test_nll,
     )

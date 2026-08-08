@@ -1,0 +1,72 @@
+adaptive_gradient_racing: true
+adaptive_kernel_mdl: false
+alpha: 0.05
+baseline_time_bins: 1
+cache_bytes: 4294967296
+dataset: data/crbstpp/wselob_pekao_mechanism_excursion_v2_60d_30s
+dependency_aware_mdl: false
+discovery_noncase_fraction: 0.1
+discovery_reference_dataset: null
+discovery_sampling: full
+discovery_sampling_seed: 271828
+early_warning_horizon: 30
+effect_model: support_additive
+ensemble_aware_roots: false
+ensemble_residual_search: false
+rule_effect_stacking_search: true
+predictive_basin_rashomon_search: true
+standalone_positive_atom_expansion: true
+anchor_aware_representation_audit: true
+fisher_orthogonal_route_order: true
+fisher_separated_rashomon: true
+online_predicate_pareto_frontier: false
+predicate_coverage_rashomon: false
+conditional_basin_branching: true
+ensemble_residual_dictionary_repricing: false
+exact_workers: 3
+formation_window_mode: fit_quantile
+formation_window_quantiles: [0.25, 0.5, 0.75, 0.9]
+formation_windows: [0, 5, 15, 30]
+frequency_effect_separation: false
+history_count_quantiles: [0.25, 0.5, 0.75, 0.9]
+history_lookback_windows: [30]
+history_marked_events: true
+history_max_marked_atoms: 1
+history_state_family_search: false
+impact_lag: 30
+knot_count: 4
+max_rules_per_support: null
+metadata:
+  baseline_contract: stock_weekday_x_4_fixed_intraday_time_only
+  predicate_contract: mutually_exclusive_order_flow_liquidity_clearance_and_replenishment_mechanisms
+  target_contract: fit_Q90_30_second_adverse_midprice_excursion_onset_with_half_threshold_rearm
+  time_contract: exact_piecewise_constant_continuous_poisson_nanosecond_clock
+  observation_contract: first_60_ordered_trading_days_20170102_through_20170327
+  preprocessing_impact_seconds: 30
+  preprocessing_kernel_knots: 4
+  search_contract: support_Block-MDL_rule-effect_residual_Rashomon
+  certification_family_contract: fit-only_compaction_then_F0-F3_Romano-Wolf
+  result_schema: crbstpp.result.wselob.continuous.mechanism.v2
+precert_family_compaction: true
+ensemble_irreducible_family: false
+pricing_devices: [cuda:0, cuda:1]
+pricing_workers: 12
+probability_materiality: 0.0
+q_max: 3
+rashomon_branching: true
+reliability_aware_search: true
+romano_wolf_resamples: 20000
+romano_wolf_seed: 314159
+route_refinement_kkt_tolerance: null
+route_refinement_max_steps: 4
+route_workers: 2
+run_id: wselob_pekao_mechanism_excursion_v2_60d_30s
+run_root: runs/crbstpp
+search_mode: atomic_rashomon_frontier
+search_tolerance: 1.0e-8
+solver_max_iter: 100
+solver_tolerance: 2.0e-7
+split_fractions: [0.5, 0.3, 0.2]
+split_seed: 111
+temporal_relations: [unordered]
+terminal_add_audit: block_score

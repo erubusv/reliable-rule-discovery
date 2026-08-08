@@ -4,6 +4,15 @@ import math
 
 import numpy as np
 
+from .native import fill_cloglog_mixed_conjugate
+
+
+POISSON_LIKELIHOODS = frozenset({"poisson", "continuous_poisson"})
+
+
+def is_poisson_likelihood(likelihood: str) -> bool:
+    return str(likelihood) in POISSON_LIKELIHOODS
+
 
 def cloglog_event_terms(eta: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     eta = np.asarray(eta, dtype=np.float64)
@@ -48,43 +57,98 @@ def loss_rows(
     event_weight: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     eta = np.asarray(eta, dtype=np.float64)
-    intensity = np.exp(np.clip(eta, -745.0, 700.0))
-    if likelihood == "poisson":
-        value = exposure_weight * intensity - event_weight * eta
-        first = exposure_weight * intensity - event_weight
-        second = exposure_weight * intensity
+    if is_poisson_likelihood(likelihood):
+        # Overflow represents an invalid line-search trial and is intentionally
+        # propagated as +inf to the Armijo rejection.  Silence only the NumPy
+        # warning; do not clip or otherwise alter the objective.
+        with np.errstate(over="ignore", invalid="ignore"):
+            intensity = np.exp(eta)
+            value = exposure_weight * intensity - event_weight * eta
+            first = exposure_weight * intensity - event_weight
+            second = exposure_weight * intensity
         return value, first, second
     if likelihood != "first_event_cloglog":
         raise ValueError(f"unknown likelihood: {likelihood}")
+    intensity = np.exp(np.clip(eta, -745.0, 700.0))
     event_value, event_first, event_second = cloglog_event_terms(eta)
-    return (
-        noevent_weight * intensity + event_weight * event_value,
-        noevent_weight * intensity + event_weight * event_first,
-        noevent_weight * intensity + event_weight * event_second,
+    with np.errstate(over="ignore", invalid="ignore"):
+        return (
+            noevent_weight * intensity + event_weight * event_value,
+            noevent_weight * intensity + event_weight * event_first,
+            noevent_weight * intensity + event_weight * event_second,
+        )
+
+
+def loss_value_rows(
+    eta: np.ndarray,
+    *,
+    likelihood: str,
+    exposure_weight: np.ndarray,
+    noevent_weight: np.ndarray,
+    event_weight: np.ndarray,
+) -> np.ndarray:
+    """Likelihood values without allocating unused derivative buffers."""
+    eta = np.asarray(eta, dtype=np.float64)
+    if is_poisson_likelihood(likelihood):
+        with np.errstate(over="ignore", invalid="ignore"):
+            intensity = np.exp(eta)
+            return exposure_weight * intensity - event_weight * eta
+    if likelihood != "first_event_cloglog":
+        raise ValueError(f"unknown likelihood: {likelihood}")
+    intensity = np.exp(np.clip(eta, -745.0, 700.0))
+    with np.errstate(over="ignore", invalid="ignore"):
+        value = noevent_weight * intensity
+    event_rows = event_weight > 0.0
+    if not np.any(event_rows):
+        return value
+    x = intensity[event_rows]
+    event_value = np.empty_like(x)
+    small = x < 1.0e-4
+    large = x > 40.0
+    middle = ~(small | large)
+    xs = x[small]
+    event_value[small] = (
+        -np.log(np.maximum(xs, np.finfo(float).tiny)) + xs / 2.0 - xs * xs / 24.0
     )
+    xm = x[middle]
+    event_value[middle] = -np.log(-np.expm1(-xm))
+    xl = x[large]
+    event_value[large] = -np.log1p(-np.exp(-xl))
+    value[event_rows] += event_weight[event_rows] * event_value
+    return value
 
 
 def loss_grid_sparse_event_derivatives(
     eta: np.ndarray,
     *,
     likelihood: str,
-    exposure: float,
+    exposure: float | np.ndarray,
     event_rows: np.ndarray,
     event_counts: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Exact grid derivatives using only two dense output buffers."""
     eta = np.asarray(eta, dtype=np.float64)
+    row_exposure = np.asarray(exposure, dtype=np.float64)
+    if row_exposure.ndim not in {0, 1} or (
+        row_exposure.ndim == 1 and row_exposure.shape != eta.shape
+    ):
+        raise ValueError("exposure must be scalar or aligned with the predictor grid")
     rows = np.asarray(event_rows, dtype=np.int64)
     counts = np.asarray(event_counts, dtype=np.float64)
     if rows.shape != counts.shape or (
         len(rows) and (rows[0] < 0 or rows[-1] >= len(eta))
     ):
         raise ValueError("sparse event rows do not match the predictor grid")
-    first = float(exposure) * np.exp(np.clip(eta, -745.0, 700.0))
+    with np.errstate(over="ignore"):
+        first = row_exposure * (
+            np.exp(eta)
+            if is_poisson_likelihood(likelihood)
+            else np.exp(np.clip(eta, -745.0, 700.0))
+        )
     second = first.copy()
     if not len(rows):
         return first, second
-    if likelihood == "poisson":
+    if is_poisson_likelihood(likelihood):
         first[rows] -= counts
         return first, second
     if likelihood != "first_event_cloglog":
@@ -174,42 +238,52 @@ def cloglog_conjugate(
     empty = (noevent_weight == 0) & (event_weight == 0)
     output[empty & (dual == 0)] = 0.0
     mixed = (noevent_weight > 0) & (event_weight > 0)
-    for index in np.flatnonzero(mixed):
-        u = float(dual[index])
-        noevent = float(noevent_weight[index])
-        event = float(event_weight[index])
-        lower_domain = -event
-        upper_domain = math.inf if noevent > 0 else 0.0
-        if u < lower_domain or u > upper_domain:
-            output[index] = math.inf
-            continue
-        if abs(u - lower_domain) <= 1.0e-14 or (
-            math.isfinite(upper_domain) and abs(u - upper_domain) <= 1.0e-14
-        ):
-            output[index] = 0.0
-            continue
-        low, high = -50.0, 50.0
-        _, low_gradient = _mixed_cloglog_value_gradient(low, noevent, event)
-        _, high_gradient = _mixed_cloglog_value_gradient(high, noevent, event)
-        while low_gradient > u and low > -740.0:
-            low *= 2.0
+    compiled = fill_cloglog_mixed_conjugate(
+        dual, noevent_weight, event_weight, output
+    )
+    if not compiled:
+        for index in np.flatnonzero(mixed):
+            u = float(dual[index])
+            noevent = float(noevent_weight[index])
+            event = float(event_weight[index])
+            lower_domain = -event
+            upper_domain = math.inf if noevent > 0 else 0.0
+            if u < lower_domain or u > upper_domain:
+                output[index] = math.inf
+                continue
+            if abs(u - lower_domain) <= 1.0e-14 or (
+                math.isfinite(upper_domain) and abs(u - upper_domain) <= 1.0e-14
+            ):
+                output[index] = 0.0
+                continue
+            low, high = -50.0, 50.0
             _, low_gradient = _mixed_cloglog_value_gradient(low, noevent, event)
-        while high_gradient < u and high < 700.0:
-            high *= 2.0
             _, high_gradient = _mixed_cloglog_value_gradient(high, noevent, event)
-        if not low_gradient <= u <= high_gradient:
-            output[index] = math.inf
-            continue
-        for _ in range(100):
-            middle = 0.5 * (low + high)
-            _, gradient = _mixed_cloglog_value_gradient(middle, noevent, event)
-            if gradient < u:
-                low = middle
-            else:
-                high = middle
-        eta = 0.5 * (low + high)
-        value, _ = _mixed_cloglog_value_gradient(eta, noevent, event)
-        output[index] = u * eta - value
+            while low_gradient > u and low > -740.0:
+                low *= 2.0
+                _, low_gradient = _mixed_cloglog_value_gradient(
+                    low, noevent, event
+                )
+            while high_gradient < u and high < 700.0:
+                high *= 2.0
+                _, high_gradient = _mixed_cloglog_value_gradient(
+                    high, noevent, event
+                )
+            if not low_gradient <= u <= high_gradient:
+                output[index] = math.inf
+                continue
+            for _ in range(100):
+                middle = 0.5 * (low + high)
+                _, gradient = _mixed_cloglog_value_gradient(
+                    middle, noevent, event
+                )
+                if gradient < u:
+                    low = middle
+                else:
+                    high = middle
+            eta = 0.5 * (low + high)
+            value, _ = _mixed_cloglog_value_gradient(eta, noevent, event)
+            output[index] = u * eta - value
     return output
 
 
@@ -221,7 +295,7 @@ def conjugate_sum(
     noevent_weight: np.ndarray,
     event_weight: np.ndarray,
 ) -> float:
-    if likelihood == "poisson":
+    if is_poisson_likelihood(likelihood):
         values = poisson_conjugate(dual, exposure_weight, event_weight)
     elif likelihood == "first_event_cloglog":
         values = cloglog_conjugate(dual, noevent_weight, event_weight)
