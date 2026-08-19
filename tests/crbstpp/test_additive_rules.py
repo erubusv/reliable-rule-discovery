@@ -16,6 +16,7 @@ from crbstpp.rules import (
     state_aware_temporal_patterns,
 )
 from crbstpp.search import SupportOptimizer, support_from_key, support_key
+from crbstpp.state import active_at, transition_state_intervals
 
 
 F0 = {
@@ -26,6 +27,23 @@ F0 = {
     "atomic_predicates": True,
     "primitive_event_provenance": True,
 }
+
+
+def test_transition_state_is_active_after_entry_through_exit() -> None:
+    intervals = transition_state_intervals(
+        np.asarray([0], dtype=np.int32),
+        np.asarray([2], dtype=np.int64),
+        np.asarray([20], dtype=np.int64),
+        np.asarray([0], dtype=np.int32),
+        np.asarray([5], dtype=np.int64),
+        np.asarray([8], dtype=np.int64),
+    )
+    observed = active_at(
+        intervals,
+        np.zeros(5, dtype=np.int32),
+        np.asarray([2, 3, 5, 6, 8], dtype=np.int64),
+    )
+    np.testing.assert_array_equal(observed, [False, True, True, False, False])
 
 
 def _state_dataset(root: Path) -> Dataset:

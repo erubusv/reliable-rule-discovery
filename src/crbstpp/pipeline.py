@@ -328,15 +328,18 @@ def _record_payload(
             return "zero"
         return "mixed"
 
-    baseline_controls = []
-    control_indices = [
-        index for index, role in enumerate(predicate_roles) if role != "reported"
-    ]
     role_signs = {
         "baseline_control": 1,
         "exposure_increase_control": 1,
         "exposure_decrease_control": -1,
     }
+    baseline_controls = []
+    # Hidden state-transition sources are used only to construct persistent
+    # state intervals.  They are not fitted baseline controls and therefore
+    # have neither a coefficient block nor a reportable lag profile.
+    control_indices = [
+        index for index, role in enumerate(predicate_roles) if role in role_signs
+    ]
     for position, predicate in enumerate(control_indices):
         left = record.matrix.free_dimension + position * basis.shape[0]
         coefficients = record.fit.coefficients[left : left + basis.shape[0]]
@@ -753,13 +756,14 @@ def run(
     run_started = time.perf_counter()
     config.validate()
     dataset = Dataset.load(config.dataset)
-    if dataset.likelihood == "continuous_poisson" and (
-        config.dependency_aware_mdl or config.frequency_effect_separation
+    if (
+        dataset.likelihood == "continuous_poisson"
+        and config.frequency_effect_separation
     ):
         raise ValueError(
-            "continuous_poisson currently requires dependency_aware_mdl=false "
-            "and frequency_effect_separation=false; raw nanosecond timestamps "
-            "cannot be treated as a dense regular calendar grid"
+            "continuous_poisson currently requires "
+            "frequency_effect_separation=false; dependency-aware MDL uses "
+            "the declared sampling-unit groups rather than a dense calendar grid"
         )
     _validate_preassigned_partition_contract(
         dataset, config.split_fractions, config.split_seed
@@ -1459,17 +1463,24 @@ def run(
                     (
                         (
                             (
-                                "predictive_family_and_fisher_mdl_rashomon_"
-                                "basin_block_score_terminal_exact"
-                                if config.predictive_basin_rashomon_search
-                                else "score_basin_representative_ensemble_"
-                                "residual_block_score_terminal_exact"
+                                "rule_set_block_mdl_basin_rashomon_"
+                                "terminal_one_step_stationary"
                             )
-                            if (
-                                config.ensemble_residual_search
-                                or config.rule_effect_stacking_search
+                            if config.posthoc_rule_effect_stacking
+                            else (
+                                (
+                                    "unified_family_block_mdl_best_first_"
+                                    "rashomon_terminal_one_step_stationary"
+                                    if config.predictive_basin_rashomon_search
+                                    else "score_basin_representative_ensemble_"
+                                    "residual_block_score_terminal_exact"
+                                )
+                                if (
+                                    config.ensemble_residual_search
+                                    or config.rule_effect_stacking_search
+                                )
+                                else "monotone_family_block_mdl_terminal_stationary"
                             )
-                            else "monotone_block_score_rashomon_terminal_exact"
                         )
                         if config.terminal_add_audit == "block_score"
                         else "atomic_descendant_safe_shared_rashomon_frontier"
@@ -1623,18 +1634,37 @@ def run(
     }
     search_payload["objective"] = (
         (
-            "two_way_wallet_calendar_dependency_CLBIC_"
+            (
+                "prediction_opportunity_additive_rule_dependency_CLBIC_"
+                if config.dependency_mdl_sample_size == "prediction_opportunities"
+                and config.dependency_mdl_dimension == "additive_rule_godambe"
+                else "geometric_cluster_opportunity_dependency_CLBIC_"
+                if config.dependency_mdl_sample_size
+                == "geometric_cluster_opportunities"
+                and config.dependency_mdl_dimension == "additive_rule_godambe"
+                else "two_way_wallet_calendar_dependency_CLBIC_"
+            )
             if config.dependency_aware_mdl
             else "common_baseline_"
         )
         + (
-            "closure_matched_additive_hierarchy_rule_MDL_"
-            if config.effect_model == "additive_hierarchy"
-            else "support_relative_additive_rule_MDL_"
-            if config.effect_model == "support_additive"
-            else "total_state_rule_MDL_"
+            "individual_rule_set_Block_MDL_for_standalone_add_drop_"
+            "none_and_identity_with_postcert_rule_effect_stacking"
+            if config.posthoc_rule_effect_stacking
+            else
+            "support_conditioned_rule_effect_stacking_family_MDL_"
+            "for_standalone_joint_separate_drop_identity_and_representation"
+            if config.rule_effect_stacking_search
+            else (
+                "closure_matched_additive_hierarchy_rule_MDL_"
+                if config.effect_model == "additive_hierarchy"
+                else "support_relative_additive_rule_MDL_"
+                if config.effect_model == "support_additive"
+                else "total_state_rule_MDL_"
+            )
+            + "with_local_representation_audit_and_"
+            "family_intensity_mixture_MDL_selection"
         )
-        + "with_local_representation_audit_and_family_intensity_mixture_MDL_selection"
     )
     proposal_role = (
         "which is the approximate intermediate-route admission rule; it may "
@@ -1642,19 +1672,31 @@ def run(
         if config.adaptive_gradient_racing
         else "which orders work but never accepts or rejects a support"
     )
-    representation_role = "with exact W/sign coordinate reoptimization"
+    representation_role = (
+        "with rule-set Block-MDL W/sign/history one-step reoptimization"
+        if config.terminal_add_audit == "block_score"
+        and (
+            config.rule_effect_stacking_search
+            or config.posthoc_rule_effect_stacking
+        )
+        else "with exact W/sign coordinate reoptimization"
+    )
     terminal_kernel_role = (
         "choose one normalized amplitude or the full M-knot kernel by exact common MDL"
         if config.adaptive_kernel_mdl
         else "retain the configured full M-knot kernel"
     )
     terminal_add_role = (
-        "exact-safe finite-dictionary family-aware Add"
+        "exact-safe finite-dictionary rule-set Add"
         if config.terminal_add_audit == "exact"
-        else "certified block-score finite-dictionary family-aware Add"
+        else (
+            "finite-dictionary rule-set Block-MDL one-step Add"
+            if config.posthoc_rule_effect_stacking
+            else "finite-dictionary Family Block-MDL one-step Add"
+        )
     )
     representation_contract = (
-        "support-additive representations retain exact W/sign auditing, while "
+        "support-additive representations retain terminal W/sign/history auditing, while "
         "structural representation pruning removes only prediction-equivalent "
         "or strictly fit-MDL-dominated supports"
         if config.effect_model == "support_additive"
@@ -1705,7 +1747,7 @@ def run(
         f"{terminal_kernel_role}; singleton, pair and "
         "triplet proposals share the same normalized one-amplitude relaxation, "
         f"{proposal_role}; exact terminal correction is followed by "
-        f"{terminal_add_role}, exact Drop and exact W/sign "
+        f"{terminal_add_role}, family-aware Drop and W/sign/history "
         f"auditing; {add_contract}; "
         "standalone routes are the deterministic same-order exchange-graph "
         "score-basin maxima, while every screened atom remains an Add candidate; "
@@ -1718,24 +1760,29 @@ def run(
         "enumeration of every local optimum are not claimed"
     )
     if config.dependency_aware_mdl:
-        search_payload["guarantee"] += (
-            "; fixed-support coefficients remain exact TPP maximum-likelihood "
-            "estimates, while standalone, exact Add/Drop/W-sign decisions and "
-            "D_fit family compaction use one wallet-by-calendar two-way "
-            "Godambe effective-dimension code with the structural BIC "
-            "dimension as a lower floor"
-        )
+        if config.dependency_mdl_dimension == "additive_rule_godambe":
+            search_payload["guarantee"] += (
+                "; fixed-support coefficients remain exact TPP maximum-likelihood "
+                "estimates, while every rule identity receives one fixed "
+                "standalone dependency-effective dimension that is added across "
+                "the rule set and lower-bounded by its structural dimension"
+            )
+        else:
+            search_payload["guarantee"] += (
+                "; fixed-support coefficients remain exact TPP maximum-likelihood "
+                "estimates, while standalone, exact Add/Drop/W-sign decisions and "
+                "D_fit family compaction use one wallet-by-calendar two-way "
+                "Godambe effective-dimension code with the structural BIC "
+                "dimension as a lower floor"
+            )
     if config.adaptive_gradient_racing:
         terminal_stationarity = (
             "exact family-aware Add/Drop/W-sign stationary"
             if config.terminal_add_audit == "exact"
             else (
-                "complete-finite-dictionary Add block-score stationary and "
-                + (
-                    "exact Drop/W-sign stationary"
-                    if config.effect_model == "support_additive"
-                    else "exact Drop/W-sign/representation stationary"
-                )
+                "rule-set Block-MDL Add/Drop/W-sign/history one-step stationary"
+                if config.posthoc_rule_effect_stacking
+                else "Family Block-MDL Add/Drop/W-sign/history one-step stationary"
             )
         )
         search_payload["guarantee"] += (
@@ -1762,15 +1809,34 @@ def run(
     }
     ensemble_payload = ensemble.to_dict()
     ensemble_zero_tolerance = max(1.0e-12, 10.0 * config.solver_tolerance)
-    ensemble_active = [
-        support_key(support)
-        for support, weight in zip(ensemble.supports, ensemble.weights, strict=True)
-        if float(weight) > ensemble_zero_tolerance
-    ]
+    if config.posthoc_rule_effect_stacking:
+        active_source_supports = {
+            source
+            for source, weight in zip(
+                ensemble.rule_effect_sources,
+                ensemble.rule_effect_weights,
+                strict=True,
+            )
+            if float(weight) > ensemble_zero_tolerance
+        }
+        ensemble_active = [
+            support_key(support)
+            for support in ensemble.supports
+            if support in active_source_supports
+        ]
+    else:
+        ensemble_active = [
+            support_key(support)
+            for support, weight in zip(
+                ensemble.supports, ensemble.weights, strict=True
+            )
+            if float(weight) > ensemble_zero_tolerance
+        ]
+    active_support_keys = set(ensemble_active)
     ensemble_alternatives = [
         support_key(support)
-        for support, weight in zip(ensemble.supports, ensemble.weights, strict=True)
-        if float(weight) <= ensemble_zero_tolerance
+        for support in ensemble.supports
+        if support_key(support) not in active_support_keys
     ]
     ensemble_payload["active_support_count"] = len(ensemble_active)
     ensemble_payload["active_ensemble_supports"] = ensemble_active

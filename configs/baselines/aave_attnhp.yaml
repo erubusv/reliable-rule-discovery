@@ -1,0 +1,32 @@
+dataset: data/crbstpp/aave_ethereum_v2_v3_canonical_history_v16
+dataset_id: aave-v2-v3-deadline
+run_root: runs/baselines_deadline
+models: [attnhp]
+warning_horizon: 3
+history_horizon: 30
+effect_horizon: 30
+baseline_time_bins: 4
+cache_bytes: 4294967296
+device: cuda:1
+num_workers: 12
+max_sequence_length: 64
+sequence_context_length: 16
+batch_size: 32
+max_epochs: 3
+patience: 2
+learning_rate: 0.001
+hidden_sizes: [64]
+logistic_c: [0.01]
+xgboost_depths: [4]
+xgboost_learning_rates: [0.05]
+hawkes_half_lives: [1, 3, 10, 30]
+logical_max_rules: 20
+logical_max_order: 3
+logical_time_limit_seconds: 300
+easytpp_version: 0.3.0
+easytpp_commit: a3466985e76357b3dd235da845ec69e7a9fee0f8
+branch_price_commit: 4160b27bb4606e87129bd36985fbba2ccdb9c925
+metadata:
+  protocol: fixed_deadline_2026_08_10
+  architecture_specific_sequence_length: quadratic_attention_memory_control
+  test_contract: evaluate_once_after_fit_and_cert_selection

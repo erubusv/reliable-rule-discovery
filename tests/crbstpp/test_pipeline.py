@@ -44,12 +44,32 @@ from crbstpp.reliability import (
 )
 from crbstpp.response import Context, ResponseEngine
 from crbstpp.rules import EMPTY_SUPPORT, RuleIdentity, Support
+from crbstpp.search import _nonnegative_quadratic_minimum
 from crbstpp.solver import fit_model_matrix
 
 from tests.crbstpp.test_core import synthetic_dataset
 
 
 class PipelineContractTests(unittest.TestCase):
+    def test_intermediate_family_quadratic_solves_correlated_cone(self) -> None:
+        linear = np.asarray([-2.0, -1.0, 0.5], dtype=np.float64)
+        hessian = np.asarray(
+            [[3.0, 1.0, 0.0], [1.0, 2.0, 0.25], [0.0, 0.25, 1.0]],
+            dtype=np.float64,
+        )
+        value, weights, converged = _nonnegative_quadratic_minimum(
+            linear,
+            hessian,
+            np.zeros(3, dtype=np.float64),
+            tolerance=1.0e-10,
+        )
+        gradient = linear + hessian @ weights
+        active = weights > 1.0e-8
+        self.assertTrue(converged)
+        self.assertLess(value, 0.0)
+        np.testing.assert_allclose(gradient[active], 0.0, atol=1.0e-7)
+        self.assertTrue(np.all(gradient[~active] >= -1.0e-7))
+
     def test_rule_effect_stack_reaches_nonnegative_cone_kkt(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             data = synthetic_dataset(Path(directory) / "data", 240)
@@ -90,6 +110,53 @@ class PipelineContractTests(unittest.TestCase):
             self.assertTrue(stack.converged)
             self.assertTrue(np.all(stack.weights >= 0.0))
             self.assertLessEqual(stack.nll, baseline_fit.nll + 1.0e-9)
+
+    def test_unified_rule_stack_keeps_support_conditioned_sources(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            data = synthetic_dataset(Path(directory) / "data", 240)
+            context = Context.make(data, np.arange(data.n_entities, dtype=np.int32))
+            engine = ResponseEngine(
+                data, lag=3, knot_count=2, cache_bytes=16 * 1024**2
+            )
+            baseline_matrix = engine.model_matrix(context, EMPTY_SUPPORT)
+            baseline_fit = fit_model_matrix(
+                baseline_matrix,
+                likelihood=data.likelihood,
+                tolerance=1.0e-9,
+                max_iter=150,
+            )
+            first = RuleIdentity((0,), 0, 1)
+            second = RuleIdentity((1,), 0, 1)
+            supports = [
+                Support.of((first,)),
+                Support.of((first, second)),
+            ]
+            matrices = [engine.model_matrix(context, support) for support in supports]
+            fits = [
+                fit_model_matrix(
+                    matrix,
+                    likelihood=data.likelihood,
+                    tolerance=1.0e-9,
+                    max_iter=150,
+                )
+                for matrix in matrices
+            ]
+            stack = _fit_rule_effect_stack(
+                engine,
+                context,
+                baseline_matrix,
+                baseline_fit,
+                matrices,
+                fits,
+                tolerance=1.0e-9,
+                deduplicate_rules=False,
+            )
+            self.assertTrue(stack.converged)
+            self.assertEqual(stack.rules.count(first), 2)
+            self.assertEqual(
+                stack.source_indices,
+                ((0, 0), (1, 0), (1, 1)),
+            )
 
     def test_overlapping_blocks_have_no_arbitrary_boundary(self) -> None:
         values = np.zeros(40, dtype=np.float64)

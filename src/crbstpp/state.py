@@ -163,6 +163,74 @@ def history_state_intervals(
     )
 
 
+def transition_state_intervals(
+    entry_entities: np.ndarray,
+    entry_times: np.ndarray,
+    entry_primitive_ids: np.ndarray,
+    exit_entities: np.ndarray,
+    exit_times: np.ndarray,
+    entity_ends: np.ndarray,
+) -> StateIntervals:
+    """Build predictable intervals from target-blind state transitions.
+
+    Entry at ``s`` activates the state strictly after ``s``.  Exit at ``e``
+    leaves it active through ``e`` so an action that caused the observed exit
+    is still evaluated under its immediately preceding state.  Redundant
+    entries and exits are ignored deterministically.
+    """
+
+    entry_entities = np.asarray(entry_entities, dtype=np.int32)
+    entry_times = np.asarray(entry_times, dtype=np.int64)
+    entry_primitive_ids = np.asarray(entry_primitive_ids, dtype=np.int64)
+    exit_entities = np.asarray(exit_entities, dtype=np.int32)
+    exit_times = np.asarray(exit_times, dtype=np.int64)
+    entity_ends = np.asarray(entity_ends, dtype=np.int64)
+    if not (
+        entry_entities.shape == entry_times.shape == entry_primitive_ids.shape
+    ):
+        raise ValueError("transition-state entry arrays must align")
+    if exit_entities.shape != exit_times.shape:
+        raise ValueError("transition-state exit arrays must align")
+
+    output: list[tuple[int, int, int, int]] = []
+    for entity in np.union1d(entry_entities, exit_entities).tolist():
+        entries = np.flatnonzero(entry_entities == entity)
+        exits = np.flatnonzero(exit_entities == entity)
+        transitions = [
+            *( (int(entry_times[i]), 1, int(entry_primitive_ids[i])) for i in entries ),
+            *( (int(exit_times[i]), 0, -1) for i in exits ),
+        ]
+        transitions.sort(key=lambda item: (item[0], -item[1], item[2]))
+        active_start: int | None = None
+        active_primitive = -1
+        for tick, entering, primitive in transitions:
+            if entering:
+                if active_start is None:
+                    active_start = tick
+                    active_primitive = primitive
+                continue
+            if active_start is None:
+                continue
+            output.append((int(entity), active_start, tick, active_primitive))
+            active_start = None
+            active_primitive = -1
+        if active_start is not None:
+            output.append(
+                (
+                    int(entity),
+                    active_start,
+                    int(entity_ends[int(entity)]),
+                    active_primitive,
+                )
+            )
+    return StateIntervals(
+        np.asarray([item[0] for item in output], dtype=np.int32),
+        np.asarray([item[1] for item in output], dtype=np.int64),
+        np.asarray([item[2] for item in output], dtype=np.int64),
+        np.asarray([item[3] for item in output], dtype=np.int64),
+    )
+
+
 def active_at(
     intervals: StateIntervals,
     entities: np.ndarray,

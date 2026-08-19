@@ -116,6 +116,9 @@ class _RuleEffectStack:
     weights: np.ndarray
     nll: float
     converged: bool
+    iterations: int = 0
+    warm_start_stationary: bool = False
+    device_resident: bool = False
 
 
 @dataclass(frozen=True)
@@ -834,6 +837,7 @@ def _rule_effect_design(
     support_fits: list[FitResult],
     *,
     frozen_sources: tuple[tuple[int, int], ...] | None = None,
+    deduplicate_rules: bool = True,
 ) -> tuple[
     tuple[RuleIdentity, ...],
     tuple[Support, ...],
@@ -841,31 +845,50 @@ def _rule_effect_design(
     np.ndarray,
     csc_matrix,
 ]:
-    """Build one sparse, support-conditioned effect column per unique rule."""
+    """Build sparse fitted-effect columns on one common baseline.
+
+    Final legacy stacking uses one canonical source for each rule identity.
+    Unified family discovery instead sets ``deduplicate_rules=False`` so the
+    same identity fitted inside two different rule sets remains two distinct
+    columns.  This distinction is required for an exact joint-versus-separate
+    comparison: the fitted effect of a rule may change after another rule is
+    added to its set.
+    """
 
     if frozen_sources is None:
-        candidates: dict[RuleIdentity, tuple[int, int]] = {}
-        for support_index, matrix in enumerate(support_matrices):
-            for rule_index, rule in enumerate(matrix.support.rules):
-                incumbent = candidates.get(rule)
-                if incumbent is None:
-                    candidates[rule] = (support_index, rule_index)
-                    continue
-                incumbent_support = support_matrices[incumbent[0]].support
-                candidate_key = (
-                    len(matrix.support.rules),
-                    matrix.support.rules,
-                    rule_index,
-                )
-                incumbent_key = (
-                    len(incumbent_support.rules),
-                    incumbent_support.rules,
-                    incumbent[1],
-                )
-                if candidate_key < incumbent_key:
-                    candidates[rule] = (support_index, rule_index)
-        rules = tuple(sorted(candidates))
-        sources = tuple(candidates[rule] for rule in rules)
+        if deduplicate_rules:
+            candidates: dict[RuleIdentity, tuple[int, int]] = {}
+            for support_index, matrix in enumerate(support_matrices):
+                for rule_index, rule in enumerate(matrix.support.rules):
+                    incumbent = candidates.get(rule)
+                    if incumbent is None:
+                        candidates[rule] = (support_index, rule_index)
+                        continue
+                    incumbent_support = support_matrices[incumbent[0]].support
+                    candidate_key = (
+                        len(matrix.support.rules),
+                        matrix.support.rules,
+                        rule_index,
+                    )
+                    incumbent_key = (
+                        len(incumbent_support.rules),
+                        incumbent_support.rules,
+                        incumbent[1],
+                    )
+                    if candidate_key < incumbent_key:
+                        candidates[rule] = (support_index, rule_index)
+            rules = tuple(sorted(candidates))
+            sources = tuple(candidates[rule] for rule in rules)
+        else:
+            sources = tuple(
+                (support_index, rule_index)
+                for support_index, matrix in enumerate(support_matrices)
+                for rule_index, _ in enumerate(matrix.support.rules)
+            )
+            rules = tuple(
+                support_matrices[support_index].support.rules[rule_index]
+                for support_index, rule_index in sources
+            )
     else:
         sources = tuple(frozen_sources)
         rules = tuple(
@@ -954,12 +977,36 @@ def _fit_rule_effect_stack(
     support_fits: list[FitResult],
     *,
     tolerance: float,
+    deduplicate_rules: bool = True,
+    precomputed_design: tuple[
+        tuple[RuleIdentity, ...],
+        tuple[Support, ...],
+        tuple[tuple[int, int], ...],
+        np.ndarray,
+        csc_matrix,
+    ]
+    | None = None,
+    initial_weights: np.ndarray | None = None,
+    prefer_warm_newton: bool = False,
+    one_step_only: bool = False,
+    evaluation_device: str | None = None,
 ) -> _RuleEffectStack:
     """Fit the exact common-baseline nonnegative rule-effect stack."""
 
-    rules, sources, source_indices, rows, design = _rule_effect_design(
-        engine, context, support_matrices, support_fits
-    )
+    if precomputed_design is None:
+        rules, sources, source_indices, rows, design = _rule_effect_design(
+            engine,
+            context,
+            support_matrices,
+            support_fits,
+            deduplicate_rules=deduplicate_rules,
+        )
+    else:
+        rules, sources, source_indices, rows, design = precomputed_design
+        if design.shape != (len(rows), len(rules)):
+            raise ValueError("precomputed rule-effect design shape mismatch")
+        if len(sources) != len(rules) or len(source_indices) != len(rules):
+            raise ValueError("precomputed rule-effect identities are misaligned")
     if not rules:
         return _RuleEffectStack(
             (), (), (), np.zeros(0, dtype=np.float64), baseline_fit.nll, True
@@ -987,9 +1034,113 @@ def _fit_rule_effect_stack(
         )
     )
 
+    # Fixed-support Newton already keeps its small-dimensional design resident
+    # on CUDA.  Rule-effect stacking has the same geometry but historically
+    # fell back to repeated CPU sparse matvecs.  Materialize this tiny-column
+    # design once on the assigned GPU and return only scalar/O(p)/O(p^2)
+    # results.  Any upload or device failure falls back to the byte-for-byte
+    # CPU formulas below.
+    torch_state = None
+    if (
+        evaluation_device is not None
+        and str(evaluation_device).startswith("cuda")
+        and len(rows)
+        and design.shape[1]
+    ):
+        try:
+            import torch
+
+            torch_device = torch.device(str(evaluation_device))
+            torch_design = torch.zeros(
+                design.shape,
+                dtype=torch.float64,
+                device=torch_device,
+            )
+            sparse = design.tocsc()
+            for column in range(sparse.shape[1]):
+                left = int(sparse.indptr[column])
+                right = int(sparse.indptr[column + 1])
+                if left == right:
+                    continue
+                positions = torch.as_tensor(
+                    sparse.indices[left:right],
+                    dtype=torch.int64,
+                    device=torch_device,
+                )
+                column_values = torch.as_tensor(
+                    sparse.data[left:right],
+                    dtype=torch.float64,
+                    device=torch_device,
+                )
+                torch_design[positions, column] = column_values
+            torch_state = (
+                torch,
+                torch_design,
+                torch.as_tensor(eta0, dtype=torch.float64, device=torch_device),
+                torch.as_tensor(
+                    exposure_weight, dtype=torch.float64, device=torch_device
+                ),
+                torch.as_tensor(
+                    event_weight, dtype=torch.float64, device=torch_device
+                ),
+            )
+        except (ImportError, RuntimeError, MemoryError):
+            torch_state = None
+
     def derivatives(
         weights: np.ndarray, *, with_hessian: bool
     ) -> tuple[float, np.ndarray, np.ndarray | None]:
+        if torch_state is not None and is_poisson_likelihood(
+            context.dataset.likelihood
+        ):
+            torch, torch_design, torch_eta0, torch_exposure, torch_events = (
+                torch_state
+            )
+            coefficients = torch.as_tensor(
+                np.ascontiguousarray(weights),
+                dtype=torch.float64,
+                device=torch_design.device,
+            )
+            eta_device = torch_eta0 + torch_design.mv(coefficients)
+            intensity = torch.exp(eta_device)
+            first_device = torch_exposure * intensity - torch_events
+            value_device = (
+                torch_exposure.dot(intensity) - torch_events.dot(eta_device)
+            )
+            gradient_device = torch_design.T.mv(first_device)
+            if not with_hessian:
+                return (
+                    float(value_device.item()),
+                    gradient_device.cpu().numpy(),
+                    None,
+                )
+            second_device = torch_exposure * intensity
+            dimension = int(torch_design.shape[1])
+            hessian_device = torch.zeros(
+                (dimension, dimension),
+                dtype=torch.float64,
+                device=torch_design.device,
+            )
+            bytes_per_row = 8 * max(1, dimension)
+            row_chunk = max(
+                1,
+                min(
+                    len(rows),
+                    max(262_144, (512 * 1024**2) // bytes_per_row),
+                ),
+            )
+            for row_left in range(0, len(rows), row_chunk):
+                row_right = min(len(rows), row_left + row_chunk)
+                block = torch_design[row_left:row_right]
+                hessian_device.add_(
+                    block.T.mm(block * second_device[row_left:row_right, None])
+                )
+            hessian = hessian_device.cpu().numpy()
+            return (
+                float(value_device.item()),
+                gradient_device.cpu().numpy(),
+                0.5 * (hessian + hessian.T),
+            )
         eta = eta0 + np.asarray(design @ weights, dtype=np.float64).reshape(-1)
         values, first, second = loss_rows(
             eta,
@@ -1022,92 +1173,194 @@ def _fit_rule_effect_stack(
         )
         return max(active_residual, inactive_residual)
 
-    initial = np.ones(len(rules), dtype=np.float64)
-    result = minimize(
-        objective,
-        initial,
-        jac=True,
-        bounds=[(0.0, None)] * len(rules),
-        method="L-BFGS-B",
-        # scipy's ftol is relative to the *summed* NLL.  Reusing the model
-        # tolerance here made a large Home Credit objective stop while its
-        # projected gradient was still material.  Keep objective stopping at
-        # machine precision and let the explicit cone-KKT check below decide.
-        options={
-            "ftol": 1.0e-15,
-            "gtol": tolerance,
-            "maxiter": 2_000,
-            "maxls": 100,
-        },
-    )
-    weights = np.maximum(
-        0.0,
-        np.asarray(result.x if result.x is not None else initial, dtype=np.float64),
-    )
-    rows_nll, gradient, _ = derivatives(weights, with_hessian=False)
+    if initial_weights is None:
+        initial = np.ones(len(rules), dtype=np.float64)
+    else:
+        initial = np.asarray(initial_weights, dtype=np.float64).reshape(-1)
+        if len(initial) != len(rules):
+            raise ValueError("rule-effect warm start dimension mismatch")
+        if not np.all(np.isfinite(initial)):
+            raise ValueError("rule-effect warm start must be finite")
+        initial = np.maximum(0.0, initial).copy()
+
+    # A neighbouring family differs by only one rule-set block.  Mapping the
+    # previous exact solution onto the unchanged columns gives a feasible
+    # point.  If the newly introduced zero columns also satisfy cone KKT, this
+    # point is already the global optimum of the augmented convex problem and
+    # no optimizer call is necessary.
+    rows_nll, gradient, _ = derivatives(initial, with_hessian=False)
     full_nll = float(baseline_fit.nll + rows_nll - baseline_rows)
     threshold = 10.0 * tolerance * max(1.0, abs(full_nll))
+    warm_start_stationary = bool(
+        initial_weights is not None
+        and kkt_residual(initial, gradient) <= threshold
+    )
+    skip_lbfgs = warm_start_stationary
+    def projected_newton_refine(
+        weights: np.ndarray,
+        rows_nll: float,
+        gradient: np.ndarray,
+        *,
+        max_steps: int,
+    ) -> tuple[np.ndarray, float, np.ndarray, int]:
+        """Damped exact Newton refinement on the nonnegative cone."""
 
-    # Correlated certified rules can still trigger an L-BFGS line-search stop.
-    # The stack normally has only a handful of columns, so finish with an
-    # exact small-Hessian projected Newton refinement.  Every accepted step is
-    # feasible and decreases the same frozen common-baseline likelihood.
-    for _ in range(64):
-        residual = kkt_residual(weights, gradient)
-        if residual <= threshold:
-            break
-        rows_nll, gradient, hessian = derivatives(weights, with_hessian=True)
-        assert hessian is not None
-        free = (weights > max(1.0e-10, 10.0 * tolerance)) | (gradient < 0.0)
-        if not np.any(free):
-            break
-        indices = np.flatnonzero(free)
-        block = hessian[np.ix_(indices, indices)]
-        scale = max(1.0, float(np.max(np.diag(block))))
-        block = block + np.eye(len(indices), dtype=np.float64) * (
-            np.finfo(np.float64).eps * scale
-        )
-        try:
-            direction_free = -np.linalg.solve(block, gradient[indices])
-        except np.linalg.LinAlgError:
-            diagonal = np.maximum(np.diag(block), np.finfo(np.float64).eps * scale)
-            direction_free = -gradient[indices] / diagonal
-        direction = np.zeros_like(weights)
-        direction[indices] = direction_free
-        projected = np.maximum(0.0, weights + direction)
-        direction = projected - weights
-        directional = float(gradient @ direction)
-        if not np.isfinite(directional) or directional >= 0.0:
-            diagonal = np.maximum(
-                np.diag(hessian), np.finfo(np.float64).eps * scale
+        used = 0
+        for _ in range(max_steps):
+            full_value = float(baseline_fit.nll + rows_nll - baseline_rows)
+            threshold_value = 10.0 * tolerance * max(1.0, abs(full_value))
+            if kkt_residual(weights, gradient) <= threshold_value:
+                break
+            rows_nll, gradient, hessian = derivatives(
+                weights, with_hessian=True
             )
-            projected = np.maximum(0.0, weights - gradient / diagonal)
+            assert hessian is not None
+            free = (weights > max(1.0e-10, 10.0 * tolerance)) | (
+                gradient < 0.0
+            )
+            if not np.any(free):
+                break
+            indices = np.flatnonzero(free)
+            block = hessian[np.ix_(indices, indices)]
+            scale = max(1.0, float(np.max(np.diag(block))))
+            block = block + np.eye(len(indices), dtype=np.float64) * (
+                np.finfo(np.float64).eps * scale
+            )
+            try:
+                direction_free = -np.linalg.solve(block, gradient[indices])
+            except np.linalg.LinAlgError:
+                diagonal = np.maximum(
+                    np.diag(block), np.finfo(np.float64).eps * scale
+                )
+                direction_free = -gradient[indices] / diagonal
+            direction = np.zeros_like(weights)
+            direction[indices] = direction_free
+            projected = np.maximum(0.0, weights + direction)
             direction = projected - weights
             directional = float(gradient @ direction)
-        if not np.isfinite(directional) or directional >= 0.0:
-            break
-        accepted = False
-        step = 1.0
-        for _ in range(60):
-            trial = np.maximum(0.0, weights + step * direction)
-            trial_nll, trial_gradient, _ = derivatives(
-                trial, with_hessian=False
-            )
-            if np.isfinite(trial_nll) and trial_nll <= rows_nll + 1.0e-4 * step * directional:
-                weights = trial
-                rows_nll = trial_nll
-                gradient = trial_gradient
-                accepted = True
+            if not np.isfinite(directional) or directional >= 0.0:
+                diagonal = np.maximum(
+                    np.diag(hessian), np.finfo(np.float64).eps * scale
+                )
+                projected = np.maximum(0.0, weights - gradient / diagonal)
+                direction = projected - weights
+                directional = float(gradient @ direction)
+            if not np.isfinite(directional) or directional >= 0.0:
                 break
-            step *= 0.5
-        if not accepted:
-            break
+            accepted = False
+            step = 1.0
+            for _ in range(60):
+                trial = np.maximum(0.0, weights + step * direction)
+                trial_nll, trial_gradient, _ = derivatives(
+                    trial, with_hessian=False
+                )
+                if (
+                    np.isfinite(trial_nll)
+                    and trial_nll
+                    <= rows_nll + 1.0e-4 * step * directional
+                ):
+                    weights = trial
+                    rows_nll = trial_nll
+                    gradient = trial_gradient
+                    accepted = True
+                    used += 1
+                    break
+                step *= 0.5
+            if not accepted:
+                break
+        return weights, rows_nll, gradient, used
+
+    iterations = 0
+    weights = initial
+    if one_step_only:
+        # A route/terminal Family Block-MDL audit asks whether one feasible
+        # projected block step improves the common family objective.  It does
+        # not require the whole neighbouring stacking cone to be optimized.
+        # The line search evaluates the original likelihood, so a positive
+        # score is a genuine feasible improvement.  Full optimization remains
+        # mandatory after such a move is selected.
+        weights, rows_nll, gradient, used = projected_newton_refine(
+            weights, rows_nll, gradient, max_steps=1
+        )
+        iterations += used
+        full_nll = float(baseline_fit.nll + rows_nll - baseline_rows)
+        converged = kkt_residual(weights, gradient) <= 10.0 * tolerance * max(
+            1.0, abs(full_nll)
+        )
+        return _RuleEffectStack(
+            rules,
+            sources,
+            source_indices,
+            weights,
+            full_nll,
+            converged,
+            iterations,
+            warm_start_stationary,
+            torch_state is not None,
+        )
+    if not skip_lbfgs and initial_weights is not None and prefer_warm_newton:
+        # A mapped neighbouring optimum is normally already in the local
+        # quadratic basin.  Newton reaches the same cone-KKT solution in a few
+        # passes; any difficult case falls back to the original L-BFGS path.
+        weights, rows_nll, gradient, used = projected_newton_refine(
+            weights, rows_nll, gradient, max_steps=24
+        )
+        iterations += used
+        full_nll = float(baseline_fit.nll + rows_nll - baseline_rows)
+        threshold = 10.0 * tolerance * max(1.0, abs(full_nll))
+        skip_lbfgs = bool(
+            kkt_residual(weights, gradient) <= threshold
+        )
+    if not skip_lbfgs:
+        result = minimize(
+            objective,
+            weights,
+            jac=True,
+            bounds=[(0.0, None)] * len(rules),
+            method="L-BFGS-B",
+            # scipy's ftol is relative to the *summed* NLL.  Reusing the model
+            # tolerance here made a large Home Credit objective stop while its
+            # projected gradient was still material.  Keep objective stopping at
+            # machine precision and let the explicit cone-KKT check below decide.
+            options={
+                "ftol": 1.0e-15,
+                "gtol": tolerance,
+                "maxiter": 2_000,
+                "maxls": 100,
+            },
+        )
+        iterations += int(getattr(result, "nit", 0) or 0)
+        weights = np.maximum(
+            0.0,
+            np.asarray(
+                result.x if result.x is not None else weights,
+                dtype=np.float64,
+            ),
+        )
+        rows_nll, gradient, _ = derivatives(weights, with_hessian=False)
+        full_nll = float(baseline_fit.nll + rows_nll - baseline_rows)
+        threshold = 10.0 * tolerance * max(1.0, abs(full_nll))
+
+    # Finish any line-search endpoint with the same exact projected Newton
+    # KKT refinement used above.
+    weights, rows_nll, gradient, used = projected_newton_refine(
+        weights, rows_nll, gradient, max_steps=64
+    )
+    iterations += used
     full_nll = float(baseline_fit.nll + rows_nll - baseline_rows)
     converged = kkt_residual(weights, gradient) <= 10.0 * tolerance * max(
         1.0, abs(full_nll)
     )
     return _RuleEffectStack(
-        rules, sources, source_indices, weights, full_nll, converged
+        rules,
+        sources,
+        source_indices,
+        weights,
+        full_nll,
+        converged,
+        iterations,
+        warm_start_stationary,
+        torch_state is not None,
     )
 
 
@@ -1297,7 +1550,11 @@ def fit_ensemble(
     fits = [baseline_fit, *support_fits]
     retained_supports = tuple(matrix.support for matrix in support_matrices)
     model_specs = tuple((matrix.support, matrix.closure) for matrix in matrices)
-    components = _sparse_components(engine, dataset_context, matrices, fits)
+    components = (
+        None
+        if config.posthoc_rule_effect_stacking
+        else _sparse_components(engine, dataset_context, matrices, fits)
+    )
     rule_stack = (
         _fit_rule_effect_stack(
             engine,
@@ -1307,8 +1564,12 @@ def fit_ensemble(
             support_matrices,
             support_fits,
             tolerance=config.solver_tolerance,
+            deduplicate_rules=False,
         )
-        if config.rule_effect_stacking_search
+        if (
+            config.rule_effect_stacking_search
+            or config.posthoc_rule_effect_stacking
+        )
         else None
     )
     # Sparse mixture components and fitted matrices are self-contained.  The
@@ -1319,26 +1580,34 @@ def fit_ensemble(
     # needed from this point.  Release all training ModelMatrix objects before
     # simplex optimization and D_test construction.
     del baseline_matrix, support_matrices, matrices
-    simplex_initial: np.ndarray | None = None
-    if mixture_warm_start:
-        support_initial = np.asarray(
-            [
-                max(0.0, float(mixture_warm_start.get(support, 0.0)))
-                for support in retained_supports
-            ],
-            dtype=np.float64,
+    simplex = None
+    if not config.posthoc_rule_effect_stacking:
+        simplex_initial: np.ndarray | None = None
+        if mixture_warm_start:
+            support_initial = np.asarray(
+                [
+                    max(0.0, float(mixture_warm_start.get(support, 0.0)))
+                    for support in retained_supports
+                ],
+                dtype=np.float64,
+            )
+            support_total = float(np.sum(support_initial))
+            if support_total > 0.0:
+                baseline_initial = max(0.0, 1.0 - support_total)
+                simplex_initial = np.r_[baseline_initial, support_initial]
+                simplex_initial /= float(np.sum(simplex_initial))
+        if components is None:
+            raise AssertionError("support-simplex components were not built")
+        simplex = _fit_simplex_components(
+            components,
+            tolerance=config.solver_tolerance,
+            initial=simplex_initial,
         )
-        support_total = float(np.sum(support_initial))
-        if support_total > 0.0:
-            baseline_initial = max(0.0, 1.0 - support_total)
-            simplex_initial = np.r_[baseline_initial, support_initial]
-            simplex_initial /= float(np.sum(simplex_initial))
-    simplex = _fit_simplex_components(
-        components,
-        tolerance=config.solver_tolerance,
-        initial=simplex_initial,
-    )
-    if config.ensemble_irreducible_family and retained_supports:
+    if (
+        simplex is not None
+        and config.ensemble_irreducible_family
+        and retained_supports
+    ):
         zero_tolerance = max(1.0e-12, 10.0 * config.solver_tolerance)
         active_positions = tuple(
             index
@@ -1371,10 +1640,18 @@ def fit_ensemble(
                 model_specs[position + 1] for position in active_positions
             )
             fits = [baseline_fit, *support_fits]
-    weights = simplex.weights
-    converged = simplex.converged
-    support_simplex_train_nll = simplex.nll
-    train_nll = rule_stack.nll if rule_stack is not None else support_simplex_train_nll
+    weights = (
+        simplex.weights
+        if simplex is not None
+        else np.r_[1.0, np.zeros(len(retained_supports), dtype=np.float64)]
+    )
+    converged = True if simplex is None else simplex.converged
+    support_simplex_train_nll = None if simplex is None else simplex.nll
+    train_nll = (
+        rule_stack.nll
+        if rule_stack is not None
+        else float(support_simplex_train_nll)
+    )
     # The learned simplex weights are frozen before D_test.  Training
     # intensities can therefore be released, preventing train/test
     # ``models x active_rows`` arrays from overlapping at peak memory.
@@ -1396,18 +1673,19 @@ def fit_ensemble(
             test_engine.model_metadata(support, forced_closure=closure)
             for support, closure in model_specs
         ]
-        test_components = _sparse_components(
-            test_engine, test_context, test_matrices, fits
-        )
-        support_simplex_test_nll = _mixture_nll_gradient(test_components, weights)[0]
-        baseline_components = _SparseComponents(
-            active_intensity=test_components.active_intensity[:1],
-            baseline_intensity=test_components.baseline_intensity[:1],
-            active_event=test_components.active_event,
-            active_noevent=test_components.active_noevent,
-            inactive_baseline_groups=test_components.inactive_baseline_groups,
-            likelihood=test_components.likelihood,
-            tick_exposure=test_components.tick_exposure,
+        test_components = None
+        if simplex is not None:
+            test_components = _sparse_components(
+                test_engine, test_context, test_matrices, fits
+            )
+            support_simplex_test_nll = _mixture_nll_gradient(
+                test_components, weights
+            )[0]
+        baseline_components = _sparse_components(
+            test_engine,
+            test_context,
+            test_matrices[:1],
+            fits[:1],
         )
         baseline_test_nll = _mixture_nll_gradient(
             baseline_components, np.ones(1, dtype=np.float64)

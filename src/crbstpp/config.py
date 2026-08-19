@@ -53,6 +53,16 @@ class RunConfig:
     # fitted by the declared point-process likelihood; model selection uses a
     # wallet/entity x calendar two-way Godambe complexity correction.
     dependency_aware_mdl: bool = False
+    # The legacy code uses the number of dependency clusters in log(N).  The
+    # prediction-opportunity definition uses one entity episode for a
+    # first-event model and exposure / impact horizon for a recurrent model.
+    # The geometric option is the log-scale midpoint of the cluster and
+    # opportunity counts for a sensitivity analysis with nested observations.
+    dependency_mdl_sample_size: str = "dependency_clusters"
+    # The legacy code recomputes one joint Godambe dimension for every rule
+    # set.  The additive rule code estimates each rule identity once and sums
+    # those fixed costs, so adding a rule can never reduce the parameter code.
+    dependency_mdl_dimension: str = "support_godambe"
     # Treat the target-blind recent/recurrent/accelerating/decelerating lifts
     # of one primitive predicate as alternative representations of one
     # history mechanism while constructing provisional roots and routes.  The
@@ -80,12 +90,19 @@ class RunConfig:
     reliability_aware_search: bool = True
     ensemble_aware_roots: bool = False
     ensemble_residual_search: bool = False
-    # Prioritize (never prune) standalone routes by the common-baseline
-    # gradient/Fisher residual of their individual fitted rule effects, then
-    # combine the certified rule library with an exact nonnegative effect
-    # stack. Support Block-MDL Add/Drop and support-level certification stay
-    # unchanged.
+    # Use one common-baseline nonnegative rule-effect Family Block-MDL for
+    # standalone family selection, joint-vs-separate Add decisions, route
+    # Add/Drop/identity acceptance and the final predictive stack. The
+    # gradient/Fisher model only orders trials of this same exact objective;
+    # support-level certification remains unchanged.
     rule_effect_stacking_search: bool = False
+    # Learn nonnegative rule-effect stacking weights only after the complete
+    # D_fit terminal family has been frozen and independently certified. The
+    # discovery search itself then uses only the individual rule-set Block-MDL
+    # objective for standalone, Add, Drop and identity decisions. This keeps
+    # predictively redundant but structurally distinct Rashomon explanations
+    # from being removed merely because their eventual stacking weight is 0.
+    posthoc_rule_effect_stacking: bool = False
     # Separate discovery into exact family-MDL-positive predictive columns
     # and Fisher/MDL-resolution Rashomon basins. Predictive roots are always
     # explored; zero-reduced-cost roots launch one route per predictively
@@ -136,9 +153,12 @@ class RunConfig:
     rashomon_branching: bool = False
     search_mode: str = "exact_safe"
     # ``exact`` proves complete Add stationarity by refitting every unresolved
-    # terminal neighbour.  ``block_score`` keeps the monotone multi-step route
-    # certificate and performs exact fitting/audits only for selected terminal
-    # supports.  Drop, W/sign and representation audits remain exact.
+    # terminal neighbour. ``block_score`` uses the same Family Block-MDL
+    # quadratic objective for standalone, Add, Drop and active-identity
+    # coordinates. Positive coordinates are exact-checked in score order and
+    # the first exact family improvement resumes the route. A reported
+    # terminal has no remaining validated one-step family improvement. The
+    # selected terminal itself is still an exact fixed-support fit.
     terminal_add_audit: str = "exact"
     adaptive_gradient_racing: bool = False
     route_refinement_max_steps: int = 4
@@ -256,6 +276,30 @@ class RunConfig:
             raise ValueError("frequency_effect_separation must be boolean")
         if not isinstance(self.dependency_aware_mdl, bool):
             raise ValueError("dependency_aware_mdl must be boolean")
+        if self.dependency_mdl_sample_size not in {
+            "dependency_clusters",
+            "geometric_cluster_opportunities",
+            "prediction_opportunities",
+        }:
+            raise ValueError(
+                "dependency_mdl_sample_size must be dependency_clusters, "
+                "geometric_cluster_opportunities, or prediction_opportunities"
+            )
+        if self.dependency_mdl_dimension not in {
+            "support_godambe",
+            "additive_rule_godambe",
+        }:
+            raise ValueError(
+                "dependency_mdl_dimension must be support_godambe or "
+                "additive_rule_godambe"
+            )
+        if not self.dependency_aware_mdl and (
+            self.dependency_mdl_sample_size != "dependency_clusters"
+            or self.dependency_mdl_dimension != "support_godambe"
+        ):
+            raise ValueError(
+                "nondefault dependency MDL settings require dependency_aware_mdl"
+            )
         if not isinstance(self.history_state_family_search, bool):
             raise ValueError("history_state_family_search must be boolean")
         if not isinstance(self.history_marked_events, bool):
@@ -304,11 +348,19 @@ class RunConfig:
             raise ValueError("ensemble_residual_search must be boolean")
         if not isinstance(self.rule_effect_stacking_search, bool):
             raise ValueError("rule_effect_stacking_search must be boolean")
+        if not isinstance(self.posthoc_rule_effect_stacking, bool):
+            raise ValueError("posthoc_rule_effect_stacking must be boolean")
+        if self.rule_effect_stacking_search and self.posthoc_rule_effect_stacking:
+            raise ValueError(
+                "search-time and posthoc rule-effect stacking are mutually exclusive"
+            )
         if self.ensemble_residual_search and self.rule_effect_stacking_search:
             raise ValueError(
                 "support-intensity and rule-effect residual search are mutually exclusive"
             )
-        if self.rule_effect_stacking_search and self.ensemble_irreducible_family:
+        if (
+            self.rule_effect_stacking_search or self.posthoc_rule_effect_stacking
+        ) and self.ensemble_irreducible_family:
             raise ValueError(
                 "rule-effect stacking reports every certified rule and is incompatible "
                 "with pre-emptive support-simplex pruning"

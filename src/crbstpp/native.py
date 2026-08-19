@@ -951,6 +951,7 @@ def _cuda_library():
                         int_pointer,
                         int_pointer,
                         int64_pointer,
+                        int64_pointer,
                         int_pointer,
                         int64_pointer,
                         int_pointer,
@@ -1002,6 +1003,7 @@ def _cuda_library():
                         ctypes.c_int,
                         int_pointer,
                         int_pointer,
+                        int64_pointer,
                         int64_pointer,
                         int_pointer,
                         int64_pointer,
@@ -1506,6 +1508,7 @@ def continuous_single_block_moments(
     current_x: np.ndarray,
     current_columns: np.ndarray | None = None,
     *,
+    candidate_minimum_spans: np.ndarray | None = None,
     workers: int = 0,
     gradient_only: bool = False,
     prefix_first: np.ndarray | None = None,
@@ -1530,6 +1533,11 @@ def continuous_single_block_moments(
     candidate_starts = np.ascontiguousarray(candidate_starts, dtype=np.int64)
     candidate_ends = np.ascontiguousarray(candidate_ends, dtype=np.int64)
     candidate_windows = np.ascontiguousarray(candidate_windows, dtype=np.int64)
+    minimum_spans = (
+        np.full(len(candidate_windows), -1, dtype=np.int64)
+        if candidate_minimum_spans is None
+        else np.ascontiguousarray(candidate_minimum_spans, dtype=np.int64)
+    )
     entity_ends = np.ascontiguousarray(entity_ends, dtype=np.int64)
     grid_offsets = np.ascontiguousarray(grid_offsets, dtype=np.int64)
     row_times = np.ascontiguousarray(row_times, dtype=np.int64)
@@ -1549,6 +1557,8 @@ def continuous_single_block_moments(
         or completion_spans.shape != completion_entities.shape
         or candidate_ends.shape != candidate_starts.shape
         or candidate_windows.shape != candidate_starts.shape
+        or minimum_spans.shape != candidate_starts.shape
+        or np.any(minimum_spans >= candidate_windows)
         or first.shape != row_times.shape
         or second.shape != row_times.shape
         or group_by_row.shape != row_times.shape
@@ -1606,6 +1616,7 @@ def continuous_single_block_moments(
         candidate_starts,
         candidate_ends,
         candidate_windows,
+        minimum_spans,
         entity_ends,
         grid_offsets,
         row_times,
@@ -2332,6 +2343,7 @@ def implicit_moments_batch(
     compact_poisson_events: np.ndarray | None = None,
     compact_cloglog_event_deltas: tuple[np.ndarray, np.ndarray] | None = None,
     completion_mode: bool | int = False,
+    block_minimum_spans: np.ndarray | None = None,
     current_columns: np.ndarray | None = None,
     validated_source_offsets: bool = False,
     gradient_only: bool = False,
@@ -2386,6 +2398,11 @@ def implicit_moments_batch(
     block_predicates = np.ascontiguousarray(block_predicates, dtype=np.int32)
     block_orders = np.ascontiguousarray(block_orders, dtype=np.int32)
     block_windows = np.ascontiguousarray(block_windows, dtype=np.int64)
+    minimum_spans = (
+        np.full(block_windows.shape, -1, dtype=np.int64)
+        if block_minimum_spans is None
+        else np.ascontiguousarray(block_minimum_spans, dtype=np.int64)
+    )
     block_counts = np.ascontiguousarray(block_counts, dtype=np.int32)
     candidate_entity_offsets = np.ascontiguousarray(
         candidate_entity_offsets, dtype=np.int64
@@ -2461,6 +2478,7 @@ def implicit_moments_batch(
         or block_predicates.shape[2] != 3
         or block_orders.shape != block_predicates.shape[:2]
         or block_windows.shape != block_predicates.shape[:2]
+        or minimum_spans.shape != block_predicates.shape[:2]
         or block_counts.shape != (block_predicates.shape[0],)
     ):
         raise ValueError("implicit candidate metadata shape mismatch")
@@ -2568,6 +2586,8 @@ def implicit_moments_batch(
         raise ValueError("implicit antecedent order must lie in [1, 3]")
     if np.any(block_windows[active_metadata] < 0):
         raise ValueError("implicit formation windows must be nonnegative")
+    if np.any(minimum_spans[active_metadata] >= block_windows[active_metadata]):
+        raise ValueError("implicit formation-band lower spans must be smaller")
     active_predicates = block_predicates[active_metadata]
     active_orders = block_orders[active_metadata]
     for row, order in zip(active_predicates, active_orders, strict=True):
@@ -2624,6 +2644,7 @@ def implicit_moments_batch(
         basis.shape[1],
         block_predicates.ctypes.data_as(int_pointer),
         block_orders.ctypes.data_as(int_pointer),
+        minimum_spans.ctypes.data_as(int64_pointer),
         block_windows.ctypes.data_as(int64_pointer),
         block_counts.ctypes.data_as(int_pointer),
         candidate_entity_offsets.ctypes.data_as(int64_pointer),
@@ -2692,6 +2713,7 @@ def implicit_objective_batch(
     coefficients: np.ndarray,
     group_eta: np.ndarray,
     *,
+    block_minimum_spans: np.ndarray | None = None,
     likelihood: str,
     source_token: int,
     derivative_token: int,
@@ -2719,6 +2741,11 @@ def implicit_objective_batch(
     predicates = np.ascontiguousarray(block_predicates, dtype=np.int32)
     orders = np.ascontiguousarray(block_orders, dtype=np.int32)
     windows = np.ascontiguousarray(block_windows, dtype=np.int64)
+    minimum_spans = (
+        np.full(windows.shape, -1, dtype=np.int64)
+        if block_minimum_spans is None
+        else np.ascontiguousarray(block_minimum_spans, dtype=np.int64)
+    )
     counts = np.ascontiguousarray(block_counts, dtype=np.int32)
     entity_offsets = np.ascontiguousarray(
         candidate_entity_offsets, dtype=np.int64
@@ -2737,6 +2764,7 @@ def implicit_objective_batch(
         or predicates.shape[2] != 3
         or orders.shape != predicates.shape[:2]
         or windows.shape != predicates.shape[:2]
+        or minimum_spans.shape != predicates.shape[:2]
         or counts.shape != (predicates.shape[0],)
     ):
         raise ValueError("implicit objective metadata shape mismatch")
@@ -2768,6 +2796,8 @@ def implicit_objective_batch(
     active = np.arange(maximum_blocks)[None, :] < counts[:, None]
     if np.any(orders[active] < 1) or np.any(orders[active] > 3):
         raise ValueError("implicit objective antecedent order is invalid")
+    if np.any(minimum_spans[active] >= windows[active]):
+        raise ValueError("implicit objective band lower spans are invalid")
     output = np.empty(candidates, dtype=np.float64)
     pointer = ctypes.POINTER(ctypes.c_double)
     int64_pointer = ctypes.POINTER(ctypes.c_int64)
@@ -2782,6 +2812,7 @@ def implicit_objective_batch(
         int(lag),
         predicates.ctypes.data_as(int_pointer),
         orders.ctypes.data_as(int_pointer),
+        minimum_spans.ctypes.data_as(int64_pointer),
         windows.ctypes.data_as(int64_pointer),
         counts.ctypes.data_as(int_pointer),
         entity_offsets.ctypes.data_as(int64_pointer),

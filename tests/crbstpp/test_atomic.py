@@ -3,6 +3,7 @@ from __future__ import annotations
 import itertools
 import math
 import tempfile
+import threading
 import unittest
 from dataclasses import replace
 from pathlib import Path
@@ -17,6 +18,7 @@ from crbstpp.atomic import (
     minimum_descendant_penalty,
 )
 from crbstpp.config import RunConfig
+from crbstpp.ensemble import _fit_rule_effect_stack, _rule_effect_design
 from crbstpp.objective import ObjectiveSpec
 from crbstpp.response import Context
 from crbstpp.rules import EMPTY_SUPPORT, RuleIdentity, Support
@@ -25,6 +27,450 @@ from tests.crbstpp.test_higher_order import cell_dataset, optimizer
 
 
 class AtomicSubtreeTests(unittest.TestCase):
+    def test_posthoc_stacking_never_changes_discovery_block_ranking(self) -> None:
+        fitted = object.__new__(SupportOptimizer)
+        fitted.config = SimpleNamespace(
+            posthoc_rule_effect_stacking=True,
+            rule_effect_stacking_search=False,
+            terminal_add_audit="block_score",
+            search_mode="atomic_rashomon_frontier",
+        )
+        fitted._state_lock = threading.RLock()
+        fitted.diagnostics = SearchDiagnostics()
+        parent = SimpleNamespace(fit=SimpleNamespace(converged=True))
+        first = RuleIdentity((0,), 0, 1, support_additive=True)
+        second = RuleIdentity((1,), 0, -1, support_additive=True)
+        ranked = [(4.0, 2.0, first), (1.0, 0.5, second)]
+        with mock.patch.object(
+            fitted,
+            "_separate_family_scores",
+            side_effect=AssertionError("posthoc stacking leaked into discovery"),
+        ):
+            observed, raw = fitted._family_adjusted_block_ranking(parent, ranked)
+        self.assertEqual(observed, ranked)
+        self.assertEqual(raw, {first: 4.0, second: 1.0})
+
+    def test_posthoc_block_penalty_carries_parent_dependency_code(self) -> None:
+        fitted = object.__new__(SupportOptimizer)
+        fitted.config = SimpleNamespace(
+            dependency_aware_mdl=True,
+            dependency_mdl_dimension="additive_rule_godambe",
+            posthoc_rule_effect_stacking=True,
+            rule_effect_stacking_search=False,
+            terminal_add_audit="block_score",
+            search_mode="atomic_rashomon_frontier",
+        )
+        fitted.objective = ObjectiveSpec(
+            n_entities=100,
+            skeleton_count=3,
+            knot_count=4,
+            window_count_by_order=(1, 1, 1),
+        )
+        fitted._state_lock = threading.RLock()
+        fitted._fixed_rule_dependency_cache = {}
+        first = RuleIdentity((0,), 0, 1, support_additive=True)
+        second = RuleIdentity((1,), 0, 1, support_additive=True)
+        parent = Support.of((first,))
+        child = parent.add(second)
+        current = SimpleNamespace(
+            support=parent,
+            dependency_effective_dimension=8.0,
+        )
+        with mock.patch.object(
+            fitted,
+            "_route_dependency_fraction",
+            return_value=0.5,
+        ):
+            observed = fitted._route_dependency_child_penalty(
+                current,
+                child,
+                second,
+            )
+        expected_dimension = 8.0 + 4.0 / 0.5
+        expected = fitted.objective.penalty_for_effective_dimension(
+            child,
+            expected_dimension,
+        )
+        self.assertAlmostEqual(observed, expected, places=12)
+
+    def test_posthoc_terminal_cleanup_uses_only_rule_set_objective(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            data = self._three_predicate_data(Path(directory) / "data")
+            fitted = optimizer(
+                data,
+                3,
+                search_mode="atomic_rashomon_frontier",
+                terminal_add_audit="block_score",
+            )
+            fitted.config = replace(
+                fitted.config,
+                rule_effect_stacking_search=False,
+                posthoc_rule_effect_stacking=True,
+            )
+            try:
+                current = fitted.records[EMPTY_SUPPORT]
+                with (
+                    mock.patch.object(
+                        fitted,
+                        "_best_exact_nonpositive_branch_drop",
+                        side_effect=AssertionError("branch subobjective used"),
+                    ),
+                    mock.patch.object(
+                        fitted,
+                        "_best_exact_nonrobust_rule_drop",
+                        side_effect=AssertionError("fit reliability used"),
+                    ),
+                    mock.patch.object(
+                        fitted,
+                        "_best_exact_family_decomposition_drop",
+                        side_effect=AssertionError("support ensemble used"),
+                    ),
+                    mock.patch.object(
+                        fitted,
+                        "_best_exact_rule_objective_drop",
+                        return_value=None,
+                    ) as exact_drop,
+                ):
+                    decision = fitted._best_terminal_cleanup_decision(
+                        current,
+                        audit_add=False,
+                        audit_identity=False,
+                    )
+                self.assertIsNone(decision.record)
+                exact_drop.assert_called_once()
+            finally:
+                fitted.close()
+
+    def test_posthoc_block_terminal_does_not_exact_fit_every_add_candidate(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            data = self._three_predicate_data(Path(directory) / "data")
+            fitted = optimizer(
+                data,
+                3,
+                search_mode="atomic_rashomon_frontier",
+                adaptive_gradient_racing=True,
+                terminal_add_audit="block_score",
+            )
+            fitted.config = replace(
+                fitted.config,
+                rule_effect_stacking_search=False,
+                posthoc_rule_effect_stacking=True,
+                conditional_basin_branching=True,
+            )
+            original = fitted._normalize_composite_addition
+
+            def guarded_normalize(*args, **kwargs):
+                if fitted._block_score_terminal_audit_active:
+                    raise AssertionError(
+                        "posthoc Block-MDL terminal promoted an Add to exact fit"
+                    )
+                return original(*args, **kwargs)
+
+            try:
+                with mock.patch.object(
+                    fitted,
+                    "_normalize_composite_addition",
+                    side_effect=guarded_normalize,
+                ):
+                    result = fitted.search()
+                self.assertTrue(result.terminals)
+                self.assertTrue(all(item.fit.converged for item in result.terminals))
+            finally:
+                fitted.close()
+
+    def test_posthoc_routes_do_not_exact_branch_every_intermediate_basin(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            data = self._three_predicate_data(Path(directory) / "data")
+            fitted = optimizer(
+                data,
+                3,
+                search_mode="atomic_rashomon_frontier",
+                adaptive_gradient_racing=True,
+                terminal_add_audit="block_score",
+            )
+            fitted.config = replace(
+                fitted.config,
+                rule_effect_stacking_search=False,
+                posthoc_rule_effect_stacking=True,
+            )
+            current = fitted.records[EMPTY_SUPPORT]
+            try:
+                with (
+                    mock.patch.object(
+                        fitted,
+                        "_intermediate_frontier_successors",
+                        side_effect=AssertionError("intermediate basins were branched"),
+                    ),
+                    mock.patch.object(
+                        fitted,
+                        "_best_fast_route_decision",
+                        return_value=SimpleNamespace(record=None, drop_stable=False),
+                    ) as direct,
+                ):
+                    decision, alternatives = (
+                        fitted._best_intermediate_frontier_route_decision(current)
+                    )
+                direct.assert_called_once()
+                self.assertIsNone(decision.record)
+                self.assertEqual(alternatives, ())
+            finally:
+                fitted.close()
+
+    def test_posthoc_stacking_does_not_fisher_pack_precert_family(self) -> None:
+        """Distinct Rashomon explanations must reach held-out certification."""
+
+        fitted = object.__new__(SupportOptimizer)
+        fitted.config = SimpleNamespace(
+            posthoc_rule_effect_stacking=True,
+            fisher_separated_rashomon=True,
+        )
+        records = (object(), object())
+        observed = fitted._fisher_separated_family(records)
+        self.assertIs(observed, records)
+
+    def test_precert_compaction_keeps_deletion_family_with_posthoc_stacking(self) -> None:
+        """Posthoc prediction must not suppress D_fit minimal subsets."""
+
+        source = Path(__file__).parents[2] / "src" / "crbstpp" / "search.py"
+        text = source.read_text(encoding="utf-8")
+        self.assertIn(
+            "self._deletion_minimal_subsupport_family(compact_family)\n"
+            "            if self.config.precert_family_compaction\n"
+            "            else ()",
+            text,
+        )
+        self.assertIn(
+            "self._uses_rule_set_block_stationarity\n"
+            "            or (\n"
+            "                self.config.fisher_separated_rashomon",
+            text,
+        )
+
+    def test_cached_family_effect_design_is_exactly_legacy_design(self) -> None:
+        """Column caching changes representation, never the family objective."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            data = self._three_predicate_data(Path(directory) / "data")
+            fitted = optimizer(
+                data,
+                3,
+                search_mode="atomic_rashomon_frontier",
+                terminal_add_audit="block_score",
+            )
+            fitted.config = replace(
+                fitted.config,
+                rule_effect_stacking_search=True,
+            )
+            try:
+                self.assertTrue(fitted._defer_representation_until_add_stall)
+                empty = fitted.records[EMPTY_SUPPORT]
+                first = RuleIdentity((0,), 0, 1, support_additive=True)
+                second = RuleIdentity(
+                    (1, 2),
+                    0,
+                    1,
+                    relation="unordered",
+                    support_additive=True,
+                )
+                records = tuple(
+                    fitted._attach_rule_score(fitted.fit(support, empty))
+                    for support in (
+                        Support.of((first,)),
+                        Support.of((first, second)),
+                    )
+                )
+                self.assertTrue(all(item.fit.converged for item in records))
+                legacy = _rule_effect_design(
+                    fitted.engine,
+                    fitted.context,
+                    [item.matrix for item in records],
+                    [item.fit for item in records],
+                    deduplicate_rules=False,
+                )
+                cached = fitted._cached_rule_effect_design(records)
+                self.assertEqual(cached[:3], legacy[:3])
+                np.testing.assert_array_equal(cached[3], legacy[3])
+                np.testing.assert_allclose(
+                    cached[4].toarray(), legacy[4].toarray(), rtol=0.0, atol=0.0
+                )
+                direct = _fit_rule_effect_stack(
+                    fitted.engine,
+                    fitted.context,
+                    empty.matrix,
+                    empty.fit,
+                    [item.matrix for item in records],
+                    [item.fit for item in records],
+                    tolerance=fitted.config.solver_tolerance,
+                    deduplicate_rules=False,
+                )
+                reused = _fit_rule_effect_stack(
+                    fitted.engine,
+                    fitted.context,
+                    empty.matrix,
+                    empty.fit,
+                    [item.matrix for item in records],
+                    [item.fit for item in records],
+                    tolerance=fitted.config.solver_tolerance,
+                    deduplicate_rules=False,
+                    precomputed_design=cached,
+                )
+                self.assertEqual(reused.rules, direct.rules)
+                self.assertEqual(reused.sources, direct.sources)
+                self.assertAlmostEqual(reused.nll, direct.nll, places=10)
+                np.testing.assert_allclose(
+                    reused.weights, direct.weights, rtol=0.0, atol=1.0e-10
+                )
+                warm = _fit_rule_effect_stack(
+                    fitted.engine,
+                    fitted.context,
+                    empty.matrix,
+                    empty.fit,
+                    [item.matrix for item in records],
+                    [item.fit for item in records],
+                    tolerance=fitted.config.solver_tolerance,
+                    deduplicate_rules=False,
+                    precomputed_design=cached,
+                    initial_weights=direct.weights,
+                )
+                self.assertTrue(warm.warm_start_stationary)
+                self.assertEqual(warm.iterations, 0)
+                self.assertAlmostEqual(warm.nll, direct.nll, places=10)
+                np.testing.assert_allclose(
+                    warm.weights, direct.weights, rtol=0.0, atol=1.0e-12
+                )
+            finally:
+                fitted.close()
+
+    def test_unified_family_empty_add_records_finite_joint_gain(self) -> None:
+        fitted = object.__new__(SupportOptimizer)
+        fitted._state_lock = threading.RLock()
+        fitted.config = SimpleNamespace(
+            search_tolerance=1.0e-8,
+            rule_effect_stacking_search=True,
+        )
+        fitted.diagnostics = SearchDiagnostics()
+        fitted._route_predictive_records = {}
+        fitted._support_contract_add_decisions = {}
+        fitted._family_move_scores = {}
+        fitted._intermediate_frontier_family_updates = {}
+        rule = RuleIdentity((0,), 0, 1, support_additive=True)
+        child = SimpleNamespace(support=Support.of((rule,)))
+        parent = SimpleNamespace(support=EMPTY_SUPPORT)
+
+        def family_fit(records):
+            records = tuple(records)
+            return SimpleNamespace(
+                score=5.0 if records else 0.0,
+                records=records,
+            )
+
+        fitted._rule_effect_family_fit = family_fit
+        with mock.patch(
+            "crbstpp.search.freeze_support_record", side_effect=lambda value: value
+        ):
+            self.assertTrue(fitted._add_is_indecomposable(parent, child, rule))
+        self.assertEqual(
+            fitted._family_move_scores[(EMPTY_SUPPORT, child.support)],
+            (0.0, 5.0),
+        )
+        self.assertTrue(
+            all(
+                math.isfinite(value)
+                for value in fitted._family_move_scores[
+                    (EMPTY_SUPPORT, child.support)
+                ]
+            )
+        )
+
+    def test_shared_family_replacements_match_individual_exact_scores(self) -> None:
+        """Leave-one-out reuse preserves every exact family decision."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            data = self._three_predicate_data(Path(directory) / "data")
+            fitted = optimizer(
+                data,
+                3,
+                search_mode="atomic_rashomon_frontier",
+                terminal_add_audit="block_score",
+            )
+            fitted.config = replace(
+                fitted.config,
+                rule_effect_stacking_search=True,
+            )
+            try:
+                empty = fitted.records[EMPTY_SUPPORT]
+                first = RuleIdentity((0,), 0, 1, support_additive=True)
+                second = RuleIdentity(
+                    (1, 2),
+                    0,
+                    1,
+                    relation="unordered",
+                    support_additive=True,
+                )
+                current = fitted._attach_rule_score(
+                    fitted.fit(Support.of((first, second)), empty)
+                )
+                candidates = tuple(
+                    fitted._attach_rule_score(
+                        fitted.fit(
+                            current.support.replace(second, replacement),
+                            current,
+                        )
+                    )
+                    for replacement in (
+                        RuleIdentity(
+                            (1, 2),
+                            0,
+                            -1,
+                            relation="unordered",
+                            support_additive=True,
+                        ),
+                        RuleIdentity(
+                            (1, 2),
+                            1,
+                            1,
+                            relation="unordered",
+                            support_additive=True,
+                        ),
+                    )
+                )
+                self.assertTrue(current.fit.converged)
+                self.assertTrue(all(item.fit.converged for item in candidates))
+                fitted._route_predictive_records = {current.support: current}
+                expected = {
+                    candidate.support: fitted._rule_effect_family_replacement(
+                        current, candidate
+                    )
+                    for candidate in candidates
+                }
+                fitted._rule_effect_family_fit_cache.clear()
+                base_score, observed = (
+                    fitted._rule_effect_family_replacements_shared(
+                        current, candidates
+                    )
+                )
+                for candidate in candidates:
+                    expected_base, expected_score, expected_selected, expected_active = (
+                        expected[candidate.support]
+                    )
+                    observed_score, observed_selected, observed_active = observed[
+                        candidate.support
+                    ]
+                    self.assertAlmostEqual(base_score, expected_base, places=9)
+                    self.assertAlmostEqual(observed_score, expected_score, places=9)
+                    self.assertEqual(observed_active, expected_active)
+                    self.assertEqual(set(observed_selected), set(expected_selected))
+                self.assertEqual(
+                    fitted.diagnostics.family_replacement_shared_candidates,
+                    len(candidates),
+                )
+            finally:
+                fitted.close()
+
     def test_empty_route_geometry_uses_baseline_batch(self) -> None:
         fitted = object.__new__(SupportOptimizer)
         fitted._baseline_batched_component_items = mock.Mock(return_value=[])
@@ -126,7 +572,10 @@ class AtomicSubtreeTests(unittest.TestCase):
                 self.assertTrue(
                     all(
                         path.get("terminal_add_audit")
-                        == "complete_dictionary_block_score"
+                        in {
+                            "complete_dictionary_block_score",
+                            "family_block_mdl_one_step_stationary",
+                        }
                         for path in result.paths
                     )
                 )
@@ -424,6 +873,173 @@ class AtomicSubtreeTests(unittest.TestCase):
                     fitted._conditional_parent_forbidden,
                 )
                 self.assertEqual(fitted.diagnostics.composite_add_rejections, 1)
+            finally:
+                fitted.close()
+
+    def test_unified_composite_add_rejects_cleanup_back_to_empty(self) -> None:
+        """A family-aware Add cannot encode progress as empty -> empty."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            data = self._three_predicate_data(Path(directory) / "data")
+            fitted = optimizer(
+                data,
+                3,
+                search_mode="atomic_rashomon_frontier",
+                adaptive_gradient_racing=True,
+                terminal_add_audit="block_score",
+            )
+            fitted.config = replace(
+                fitted.config,
+                rule_effect_stacking_search=True,
+            )
+            try:
+                current = fitted.records[EMPTY_SUPPORT]
+                rule = RuleIdentity((0,), 0, 1, support_additive=True)
+                proposal = fitted.fit(Support.of((rule,)), current)
+                self.assertTrue(proposal.fit.converged, proposal.fit.message)
+                fitted._route_predictive_records = {}
+                fitted._intermediate_frontier_family_updates = {
+                    (current.support, proposal.support): {
+                        proposal.support: proposal
+                    }
+                }
+                fitted._family_move_scores = {
+                    (current.support, proposal.support): (0.0, 1.0)
+                }
+                with (
+                    mock.patch.object(
+                        fitted, "_add_is_indecomposable", return_value=True
+                    ),
+                    mock.patch.object(
+                        fitted, "_frequency_evidence_for_move", return_value=None
+                    ),
+                    mock.patch.object(
+                        fitted, "_exact_family_drop_normal_form", return_value=current
+                    ),
+                ):
+                    selected = fitted._normalize_composite_addition(
+                        current, proposal, rule
+                    )
+                self.assertIsNone(selected)
+                self.assertIn(
+                    (current.support, proposal.support),
+                    fitted._conditional_parent_forbidden,
+                )
+                self.assertNotIn(
+                    (current.support, proposal.support),
+                    fitted._family_move_scores,
+                )
+            finally:
+                fitted.close()
+
+    def test_lifted_family_bound_contains_signed_and_high_order_exact_scores(self) -> None:
+        """The unified prefit bound may screen only above every exact child."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            data = self._three_predicate_data(Path(directory) / "data")
+            fitted = optimizer(
+                data,
+                3,
+                search_mode="atomic_rashomon_frontier",
+                adaptive_gradient_racing=True,
+                terminal_add_audit="block_score",
+            )
+            fitted.config = replace(
+                fitted.config,
+                rule_effect_stacking_search=True,
+            )
+            try:
+                current = fitted.records[EMPTY_SUPPORT]
+                probes = []
+                identities = (
+                    (1, (0,)),
+                    (-1, (1,)),
+                    (1, (0, 1)),
+                    (-1, (0, 1)),
+                    (1, (0, 1, 2)),
+                    (-1, (0, 1, 2)),
+                )
+                for sign, antecedent in identities:
+                    rule = next(
+                        identity
+                        for identity in fitted.dictionary
+                        if identity.antecedent == antecedent and identity.sign == sign
+                    )
+                    exact = fitted._attach_rule_score(
+                        fitted.fit(Support.of((rule,)), current)
+                    )
+                    self.assertTrue(exact.fit.converged, exact.fit.message)
+                    proposal = replace(
+                        exact,
+                        fit=replace(exact.fit, converged=False),
+                    )
+                    bound = fitted._lifted_family_add_upper_score(
+                        current, proposal, rule
+                    )
+                    exact_family = fitted._rule_effect_family_fit((exact,))
+                    exact_active = any(
+                        record.support == exact.support
+                        for record in exact_family.records
+                    )
+                    if exact_active:
+                        self.assertGreaterEqual(
+                            bound.score_upper_bound + 1.0e-7,
+                            exact_family.score,
+                        )
+                    else:
+                        # The exact selector chose the no-Add action.  The
+                        # lifted endpoint bounds the forced-active joint arm,
+                        # so it may correctly lie below the no-Add score.
+                        self.assertLessEqual(
+                            bound.score_upper_bound,
+                            bound.threshold + 1.0e-7,
+                        )
+                    probes.append(bound)
+                self.assertEqual(len(probes), len(identities))
+            finally:
+                fitted.close()
+
+    def test_unified_cleanup_is_one_rule_drop_only_before_identity_audit(self) -> None:
+        """Unified cleanup must not repeat branch/reliability subobjectives."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            data = self._three_predicate_data(Path(directory) / "data")
+            fitted = optimizer(data, 3)
+            fitted.config = replace(
+                fitted.config,
+                rule_effect_stacking_search=True,
+            )
+            try:
+                current = fitted.records[EMPTY_SUPPORT]
+                with (
+                    mock.patch.object(
+                        fitted,
+                        "_best_exact_nonpositive_branch_drop",
+                        side_effect=AssertionError("legacy branch objective used"),
+                    ),
+                    mock.patch.object(
+                        fitted,
+                        "_best_exact_nonrobust_rule_drop",
+                        side_effect=AssertionError("D_fit reliability used"),
+                    ),
+                    mock.patch.object(
+                        fitted,
+                        "_best_exact_family_decomposition_drop",
+                        side_effect=AssertionError("legacy family objective used"),
+                    ),
+                    mock.patch.object(
+                        fitted,
+                        "_best_exact_rule_objective_drop",
+                        return_value=None,
+                    ) as exact_drop,
+                ):
+                    decision = fitted._best_terminal_cleanup_decision(
+                        current,
+                        audit_add=False,
+                        audit_identity=False,
+                    )
+                self.assertIsNone(decision.record)
+                exact_drop.assert_called_once()
             finally:
                 fitted.close()
 

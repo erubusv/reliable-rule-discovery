@@ -4,13 +4,33 @@
 !.env.example
 .venv/
 venv/
+credentials.json
+credentials.*.json
+secrets.*
+*.pem
+*.key
+*.keystore
+id_rsa*
+id_ed25519*
+.aws/
+.ssh/
+.gnupg/
+.config/gcloud/
+.netrc
+.envrc
+auth.json
+*.p12
+*.pfx
+*.ovpn
 
 # Python caches and build artifacts
 __pycache__/
 *.py[cod]
 .pytest_cache/
+.hypothesis/
 .mypy_cache/
 .ruff_cache/
+.cache/
 .coverage
 htmlcov/
 build/
@@ -25,17 +45,21 @@ dist/
 /runs/
 /logs/
 /outputs/
+/artifacts/
+/checkpoints/
+/wandb/
+/lightning_logs/
 *.log
 *.checkpoint.*
+*.ckpt
+*.pt
+*.pth
+*.onnx
 
 # Local research material and notebooks
 /paper/
-/docs/
-/documentation/
 /notes/
 notebooks/
-*.md
-*.rst
 *.ipynb
 
 # Legacy and third-party source snapshots
@@ -47,6 +71,7 @@ notebooks/
 # Editor and OS files
 .idea/
 .vscode/
+.history/
 .DS_Store
 Thumbs.db
 *~

@@ -1199,9 +1199,7 @@ def test_oracle_unavailable_history_is_cached_but_not_used_as_price(
 
 
 def test_current_aave_config_keeps_fixed_support_and_block_score_guarantees() -> None:
-    config = RunConfig.from_yaml(
-        "configs/crbstpp/aave_v37_rule_effect_search_full.yaml"
-    )
+    config = RunConfig.from_yaml("configs/experiments/aave.yaml")
     assert config.split_fractions == (0.5, 0.3, 0.2)
     assert config.temporal_relations == ("unordered",)
     assert config.formation_window_quantiles == (0.25, 0.5, 0.75, 0.9)
@@ -1210,4 +1208,6 @@ def test_current_aave_config_keeps_fixed_support_and_block_score_guarantees() ->
     assert config.route_workers == 1
     assert not config.adaptive_kernel_mdl
     assert not config.ensemble_residual_search
-    assert config.rule_effect_stacking_search
+    assert not config.rule_effect_stacking_search
+    assert config.posthoc_rule_effect_stacking
+    assert config.dependency_aware_mdl

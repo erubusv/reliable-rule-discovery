@@ -34,7 +34,12 @@ from .rules import (
     normalize_pattern,
     normalize_relation,
 )
-from .state import StateIntervals, active_at, history_state_intervals
+from .state import (
+    StateIntervals,
+    active_at,
+    history_state_intervals,
+    transition_state_intervals,
+)
 
 
 _MODEL_MATRIX_TOKENS = count(1)
@@ -1408,18 +1413,36 @@ class ResponseEngine:
             if cached is not None:
                 return cached
         definition = self.dataset.predicate_definition(predicate)
-        if definition.get("kind") != "history_state":
+        if not self.dataset.is_state_predicate(predicate):
             raise ValueError("requested predicate is not a history state")
-        source = int(definition["source_predicate"])
-        source_entities, source_times, source_ids = self._source(source, context)
-        result = history_state_intervals(
-            source_entities,
-            source_times,
-            source_ids,
-            context.ends,
-            transform=str(definition["transform"]),
-            horizon_ticks=(int(definition["horizon"]) * self.dataset.ticks_per_unit),
-        )
+        if definition.get("kind") == "transition_state":
+            entry_entities, entry_times, entry_ids = self._source(
+                int(definition["entry_predicate"]), context
+            )
+            exit_entities, exit_times, _ = self._source(
+                int(definition["exit_predicate"]), context
+            )
+            result = transition_state_intervals(
+                entry_entities,
+                entry_times,
+                entry_ids,
+                exit_entities,
+                exit_times,
+                context.ends,
+            )
+        else:
+            source = int(definition["source_predicate"])
+            source_entities, source_times, source_ids = self._source(source, context)
+            result = history_state_intervals(
+                source_entities,
+                source_times,
+                source_ids,
+                context.ends,
+                transform=str(definition["transform"]),
+                horizon_ticks=(
+                    int(definition["horizon"]) * self.dataset.ticks_per_unit
+                ),
+            )
         with self._lock:
             incumbent = self._state_interval_cache.setdefault(key, result)
         return incumbent

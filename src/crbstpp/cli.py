@@ -9,20 +9,30 @@ import time
 from pathlib import Path
 
 from .checkpoint import atomic_json
+from .baselines.config import BASELINE_NAMES, BaselineConfig
+from .baselines.runner import (
+    inspect_baseline,
+    prepare_baselines,
+    run_baseline,
+    run_suite,
+)
 from .config import RunConfig
 from .consistency import compare_runs
+from .metric_report import collect_metric_report
 from .pipeline import inspect_run, run
+from .rule_prediction import evaluate_rule_model_landmarks
 from .preprocess.aave import (
     DEFAULT_RPC_URLS,
     STATE_RPC_URLS,
     download_aave_pool_logs,
     preprocess_aave_full,
-    stage_finsurvival_sample,
 )
-from .preprocess.freddie import preprocess_freddie
-from .preprocess.home_credit import preprocess_home_credit
-from .preprocess.ibm import preprocess_ibm
-from .preprocess.wselob import WSELOB_FILES, download_wselob, preprocess_wselob
+from .preprocess.wselob import (
+    WSELOB_FILES,
+    download_wselob,
+    merge_wselob_datasets,
+    preprocess_wselob,
+)
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -30,82 +40,14 @@ def _parser() -> argparse.ArgumentParser:
     commands = parser.add_subparsers(dest="command", required=True)
     preprocess = commands.add_parser("preprocess")
     datasets = preprocess.add_subparsers(dest="dataset_name", required=True)
-    freddie = datasets.add_parser("freddie")
-    freddie.add_argument("--input-root", type=Path, default=Path("data/freddiemac"))
-    freddie.add_argument("--output-root", type=Path, required=True)
-    freddie.add_argument("--vintage", action="append", default=[])
-    freddie.add_argument("--test-vintage", action="append", default=[])
-    freddie.add_argument("--development-fit-fraction", type=float, default=0.75)
-    freddie.add_argument("--partition-seed", type=int, default=111)
-    freddie.add_argument("--max-observation-months", type=int, default=36)
-    freddie.add_argument("--overwrite", action="store_true")
-    ibm = datasets.add_parser("ibm")
-    ibm.add_argument(
-        "--raw-zip", type=Path, default=Path("data/ibm_aml/raw/HI-Small_Trans.csv.zip")
-    )
-    ibm.add_argument("--output-root", type=Path, required=True)
-    ibm.add_argument("--partition-seed", type=int, default=111)
-    ibm.add_argument("--overwrite", action="store_true")
-    home_credit = datasets.add_parser(
-        "home-credit",
-        help=(
-            "build client-level multi-product Home Credit histories with a "
-            "first 30+ DPD target"
-        ),
-    )
-    home_credit.add_argument(
-        "--input-root",
-        type=Path,
-        default=Path(
-            "data/home_credit_default_risk/kagglehub_cache/competitions/"
-            "home-credit-default-risk"
-        ),
-    )
-    home_credit.add_argument("--output-root", type=Path, required=True)
-    home_credit.add_argument("--partition-seed", type=int, default=111)
-    home_credit.add_argument("--max-observation-months", type=int, default=36)
-    home_credit.add_argument(
-        "--partition-fractions",
-        type=float,
-        nargs=3,
-        metavar=("FIT", "CERT", "TEST"),
-        default=(0.5, 0.3, 0.2),
-        help="client-hash fit/cert/test fractions (default: 0.5 0.3 0.2)",
-    )
-    home_credit.add_argument(
-        "--diagnostic-max-clients",
-        type=int,
-        help=(
-            "target-blind deterministic client cap for smoke tests only; "
-            "omit for the primary estimator"
-        ),
-    )
-    home_credit.add_argument(
-        "--target-source",
-        choices=(
-            "pooled_first",
-            "unified",
-            "bureau",
-            "credit_card",
-            "pos_cash",
-            "all_recurrent",
-        ),
-        default="pooled_first",
-        help=(
-            "target process: legacy pooled first 30+ DPD, one recurrent source, "
-            "or all three recurrent source datasets"
-        ),
-    )
-    home_credit.add_argument("--overwrite", action="store_true")
     aave = datasets.add_parser(
         "aave",
-        help="download Ethereum Aave V2/V3 Pool logs or normalize a raw sample",
+        help="download and build Ethereum Aave V2/V3 borrower histories",
     )
     aave.add_argument(
         "--raw-root", type=Path, default=Path("data/aave/raw/ethereum_v2_v3")
     )
     aave.add_argument("--output-root", type=Path)
-    aave.add_argument("--sample-csv", type=Path)
     aave.add_argument("--download", action="store_true")
     aave.add_argument(
         "--build-dataset",
@@ -135,14 +77,6 @@ def _parser() -> argparse.ArgumentParser:
         action="store_true",
         help="download wallet actions only; the primary Aave dataset keeps market state",
     )
-    aave.add_argument(
-        "--history-states",
-        action="store_true",
-        help=(
-            "append fit-frozen recent/recurrent/accelerating/decelerating "
-            "history-state predicates (v14)"
-        ),
-    )
     aave.add_argument("--overwrite", action="store_true")
     wselob = datasets.add_parser(
         "wselob",
@@ -153,15 +87,24 @@ def _parser() -> argparse.ArgumentParser:
     wselob.add_argument("--stock", choices=tuple(WSELOB_FILES), default="PEKAO")
     wselob.add_argument("--download", action="store_true")
     wselob.add_argument("--build-dataset", action="store_true")
-    wselob.add_argument("--bin-seconds", type=int, default=5)
     wselob.add_argument(
-        "--continuous",
-        action="store_true",
-        help="use exact raw-timestamp recurrent Poisson risk intervals",
+        "--merge-input-root",
+        type=Path,
+        nargs="+",
+        help="merge separately preprocessed WSELOB stocks",
     )
-    wselob.add_argument("--impact-seconds", type=int, default=60)
+    wselob.add_argument("--impact-seconds", type=int, default=30)
+    wselob.add_argument(
+        "--continuous-time-unit",
+        choices=("second", "millisecond"),
+        default="millisecond",
+        help=(
+            "model time unit for continuous WSELOB data; millisecond keeps "
+            "sub-second formation-window quantiles without discretizing raw timestamps"
+        ),
+    )
     wselob.add_argument("--kernel-knots", type=int, default=4)
-    wselob.add_argument("--baseline-bins", type=int, default=8)
+    wselob.add_argument("--baseline-bins", type=int, default=4)
     wselob.add_argument(
         "--partition-fractions",
         type=float,
@@ -169,17 +112,13 @@ def _parser() -> argparse.ArgumentParser:
         metavar=("FIT", "CERT", "TEST"),
         default=(0.5, 0.3, 0.2),
     )
+    wselob.add_argument(
+        "--partition-method",
+        choices=("ordered", "month_stratified"),
+        default="month_stratified",
+    )
+    wselob.add_argument("--partition-seed", type=int, default=111)
     wselob.add_argument("--diagnostic-max-days", type=int)
-    wselob.add_argument(
-        "--predicate-schema",
-        choices=("legacy", "mechanism_v2"),
-        default="legacy",
-    )
-    wselob.add_argument(
-        "--target-mode",
-        choices=("down_tick", "adverse_excursion", "volatility_burst"),
-        default="down_tick",
-    )
     wselob.add_argument("--target-horizon-seconds", type=int, default=30)
     wselob.add_argument("--target-quantile", type=float, default=0.90)
     wselob.add_argument("--target-rearm-fraction", type=float, default=0.50)
@@ -194,6 +133,32 @@ def _parser() -> argparse.ArgumentParser:
     consistency = commands.add_parser("consistency")
     consistency.add_argument("run_dirs", nargs="+", type=Path)
     consistency.add_argument("--output", type=Path, required=True)
+    metrics = commands.add_parser(
+        "metrics", help="collect completed baseline and rule-search metrics"
+    )
+    metrics.add_argument("--spec", type=Path, required=True)
+    landmark_metrics = commands.add_parser(
+        "evaluate-landmarks",
+        help="evaluate a frozen discovered rule model on common landmark rows",
+    )
+    landmark_metrics.add_argument("--run-dir", type=Path, required=True)
+    landmark_metrics.add_argument("--baseline-config", type=Path, required=True)
+    baseline = commands.add_parser("baseline")
+    baseline_commands = baseline.add_subparsers(
+        dest="baseline_command", required=True
+    )
+    baseline_prepare = baseline_commands.add_parser("prepare")
+    baseline_prepare.add_argument("--config", type=Path, required=True)
+    baseline_prepare.add_argument("--seed", type=int, required=True)
+    baseline_fit = baseline_commands.add_parser("fit")
+    baseline_fit.add_argument("--config", type=Path, required=True)
+    baseline_fit.add_argument("--model", choices=BASELINE_NAMES, required=True)
+    baseline_fit.add_argument("--seed", type=int, required=True)
+    baseline_suite = baseline_commands.add_parser("suite")
+    baseline_suite.add_argument("--config", type=Path, required=True)
+    baseline_suite.add_argument("--seed", type=int, required=True)
+    baseline_inspect = baseline_commands.add_parser("inspect")
+    baseline_inspect.add_argument("run_dir", type=Path)
     return parser
 
 
@@ -273,58 +238,67 @@ def _supervised_fit(config_path: Path, run_dir: Path) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
+    if args.command == "baseline":
+        if args.baseline_command == "inspect":
+            payload = inspect_baseline(args.run_dir)
+        else:
+            config = BaselineConfig.from_yaml(args.config)
+            if args.baseline_command == "prepare":
+                prepared = prepare_baselines(config, seed=args.seed)
+                payload = {
+                    "root": str(prepared.root),
+                    "manifest": prepared.manifest,
+                    "seed": int(args.seed),
+                }
+            elif args.baseline_command == "fit":
+                payload = run_baseline(
+                    config, args.model, seed=args.seed
+                )
+            else:
+                payload = run_suite(config, seed=args.seed)
+        print(json.dumps(payload, indent=2, sort_keys=True))
+        return 0
     if args.command == "preprocess":
-        if args.dataset_name == "freddie":
-            output = preprocess_freddie(
-                args.input_root,
-                args.output_root,
-                vintages=tuple(args.vintage),
-                test_vintages=tuple(args.test_vintage),
-                development_fit_fraction=args.development_fit_fraction,
-                partition_seed=args.partition_seed,
-                max_observation_months=args.max_observation_months,
-                overwrite=args.overwrite,
-            )
-        elif args.dataset_name == "ibm":
-            output = preprocess_ibm(
-                args.raw_zip,
-                args.output_root,
-                partition_seed=args.partition_seed,
-                overwrite=args.overwrite,
-            )
-        elif args.dataset_name == "home-credit":
-            output = preprocess_home_credit(
-                args.input_root,
-                args.output_root,
-                partition_seed=args.partition_seed,
-                partition_fractions=tuple(args.partition_fractions),
-                max_observation_months=args.max_observation_months,
-                diagnostic_max_clients=args.diagnostic_max_clients,
-                target_source=args.target_source,
-                overwrite=args.overwrite,
-            )
-        elif args.dataset_name == "wselob":
-            if args.download:
+        if args.dataset_name == "wselob":
+            if args.merge_input_root:
+                if args.output_root is None:
+                    raise SystemExit("wselob merge requires --output-root")
+                if args.download or args.build_dataset:
+                    raise SystemExit(
+                        "wselob merge cannot be combined with download/build-dataset"
+                    )
+                output = merge_wselob_datasets(
+                    tuple(args.merge_input_root),
+                    args.output_root,
+                    overwrite=args.overwrite,
+                )
+            elif args.download:
                 download_wselob(args.raw_root, stock=args.stock)
-            if args.build_dataset:
+            if args.merge_input_root:
+                pass
+            elif args.build_dataset:
                 if args.output_root is None:
                     raise SystemExit("wselob --build-dataset requires --output-root")
                 output = preprocess_wselob(
                     args.raw_root,
                     args.output_root,
                     stock=args.stock,
-                    bin_seconds=args.bin_seconds,
-                    continuous=args.continuous,
+                    bin_seconds=1,
+                    continuous=True,
                     continuous_impact_seconds=args.impact_seconds,
                     continuous_knot_count=args.kernel_knots,
                     continuous_baseline_bins=args.baseline_bins,
+                    continuous_time_unit=args.continuous_time_unit,
                     partition_fractions=tuple(args.partition_fractions),
+                    partition_method=args.partition_method,
+                    partition_seed=args.partition_seed,
                     diagnostic_max_days=args.diagnostic_max_days,
-                    predicate_schema=args.predicate_schema,
-                    target_mode=args.target_mode,
+                    predicate_schema="mechanism_v5",
+                    target_mode="volatility_burst",
                     target_horizon_seconds=args.target_horizon_seconds,
                     target_quantile=args.target_quantile,
                     target_rearm_fraction=args.target_rearm_fraction,
+                    context_states=True,
                     overwrite=args.overwrite,
                 )
             elif args.download:
@@ -350,19 +324,12 @@ def main(argv: list[str] | None = None) -> int:
                     partition_fractions=tuple(args.partition_fractions),
                     rpc_urls=tuple(args.rpc_url or STATE_RPC_URLS),
                     workers=args.workers,
-                    include_history_states=args.history_states,
-                    overwrite=args.overwrite,
-                )
-            elif args.sample_csv is not None and args.output_root is not None:
-                output = stage_finsurvival_sample(
-                    args.sample_csv,
-                    args.output_root,
+                    include_history_states=False,
                     overwrite=args.overwrite,
                 )
             else:
                 raise SystemExit(
-                    "aave requires --download, --build-dataset with --output-root, "
-                    "or both --sample-csv and --output-root"
+                    "aave requires --download or --build-dataset with --output-root"
                 )
         print(output)
         return 0
@@ -375,6 +342,16 @@ def main(argv: list[str] | None = None) -> int:
         config = RunConfig.from_yaml(args.config)
         report = run(config, run_dir=args.run_dir)
         print(json.dumps(report.to_dict(), indent=2, sort_keys=True))
+        return 0
+    if args.command == "metrics":
+        payload = collect_metric_report(args.spec)
+        print(json.dumps(payload, indent=2, sort_keys=True))
+        return 0
+    if args.command == "evaluate-landmarks":
+        payload = evaluate_rule_model_landmarks(
+            args.run_dir, args.baseline_config
+        )
+        print(json.dumps(payload, indent=2, sort_keys=True))
         return 0
     if args.command == "resume":
         config = RunConfig.from_yaml(args.run_dir / "config.yaml")

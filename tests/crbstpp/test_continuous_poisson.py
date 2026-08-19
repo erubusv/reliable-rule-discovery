@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
@@ -261,6 +262,32 @@ def test_interval_native_moments_match_materialized_block(tmp_path: Path) -> Non
     np.testing.assert_allclose(hessian[0], reference_hessian, atol=1.0e-13)
     np.testing.assert_allclose(cross[0], reference_cross, atol=1.0e-13)
 
+    # A lag band is lower-exclusive and upper-inclusive.  The only
+    # completion above has span zero, so it must not enter the (0, 1] band.
+    band_result = continuous_single_block_moments(
+        np.asarray([0], dtype=np.int32),
+        np.asarray([10], dtype=np.int64),
+        np.asarray([0], dtype=np.int64),
+        np.asarray([0], dtype=np.int64),
+        np.asarray([1], dtype=np.int64),
+        np.asarray([1], dtype=np.int64),
+        context.ends,
+        context.offsets,
+        context.row_times,
+        engine.continuous_edges,
+        dataset.ticks_per_unit / np.diff(engine.continuous_edges),
+        first,
+        second,
+        groups,
+        current_x,
+        columns,
+        candidate_minimum_spans=np.asarray([0], dtype=np.int64),
+        workers=1,
+    )
+    assert band_result is not None
+    for value in band_result:
+        np.testing.assert_array_equal(value, np.zeros_like(value))
+
     coefficients = np.asarray([[0.3, -0.2]], dtype=np.float64)
     profiles = continuous_single_block_profiles(
         np.asarray([0], dtype=np.int32),
@@ -348,6 +375,66 @@ def test_continuous_poisson_likelihood_matches_poisson() -> None:
     )
     for left, right in zip(actual, expected, strict=True):
         np.testing.assert_allclose(left, right)
+
+
+def test_continuous_dependency_code_preserves_exact_tpp_fit(tmp_path: Path) -> None:
+    dataset = _continuous_dataset(tmp_path / "continuous-dependency")
+    context = Context.make(dataset, np.asarray([0], dtype=np.int32))
+    ordinary_config = RunConfig(
+        dataset=str(dataset.root),
+        q_max=1,
+        impact_lag=2,
+        knot_count=2,
+        formation_windows=(0, 1),
+        effect_model="support_additive",
+        early_warning_horizon=1,
+        pricing_devices=(),
+        pricing_workers=1,
+        exact_workers=1,
+        cache_bytes=1 << 20,
+        history_marked_events=False,
+        dependency_aware_mdl=False,
+        frequency_effect_separation=False,
+        search_mode="atomic_rashomon_frontier",
+        terminal_add_audit="block_score",
+    )
+    ordinary = SupportOptimizer(context, ordinary_config)
+    dependency = SupportOptimizer(
+        context, replace(ordinary_config, dependency_aware_mdl=True)
+    )
+    support = Support.of((RuleIdentity((1,), 0, 1),))
+    try:
+        ordinary_record = ordinary.fit(support, ordinary.records[Support(())])
+        dependency_record = dependency.fit(
+            support, dependency.records[Support(())]
+        )
+        assert ordinary_record.fit.converged
+        assert dependency_record.fit.converged
+        np.testing.assert_allclose(
+            dependency_record.fit.coefficients,
+            ordinary_record.fit.coefficients,
+            rtol=1.0e-10,
+            atol=1.0e-10,
+        )
+        np.testing.assert_allclose(
+            dependency_record.fit.nll,
+            ordinary_record.fit.nll,
+            rtol=1.0e-12,
+            atol=1.0e-12,
+        )
+        assert dependency_record.penalty >= dependency.objective.structural_penalty(
+            support
+        )
+        assert dependency_record.dependency_diagnostics is not None
+        assert (
+            dependency_record.dependency_diagnostics["method"]
+            == "one_way_dependency_group_godambe_clbic"
+        )
+        assert dependency_record.dependency_diagnostics["calendar_clusters"] == 0
+        assert dependency_record.dependency_diagnostics["score_residual"] < 1.0e-7
+    finally:
+        ordinary.close()
+        dependency.close()
 
 
 def test_continuous_dictionary_keeps_pair_search_separate(tmp_path: Path) -> None:

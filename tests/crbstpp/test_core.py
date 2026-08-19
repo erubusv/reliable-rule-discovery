@@ -15,7 +15,10 @@ import pandas as pd
 from crbstpp.config import RunConfig
 from crbstpp.certification import _entity_losses_frozen, certify_family
 from crbstpp.data import Dataset, write_dataset
-from crbstpp.dependency import model_dependency_complexity
+from crbstpp.dependency import (
+    model_dependency_complexity,
+    prediction_opportunity_count,
+)
 from crbstpp.dual import dual_certificate
 from crbstpp.ensemble import (
     _components_from_profiles,
@@ -289,6 +292,52 @@ class GradientBundleBoundTests(unittest.TestCase):
 
 
 class DependencyAwareSelectionTests(unittest.TestCase):
+    def test_additive_rule_dependency_code_is_monotone(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            data = synthetic_dataset(Path(directory) / "data", 90)
+            config = RunConfig(
+                dataset=str(data.root),
+                q_max=1,
+                impact_lag=3,
+                knot_count=1,
+                formation_windows=(0,),
+                dependency_aware_mdl=True,
+                dependency_mdl_sample_size="prediction_opportunities",
+                dependency_mdl_dimension="additive_rule_godambe",
+                romano_wolf_resamples=1_000,
+                solver_tolerance=1.0e-8,
+                solver_max_iter=120,
+                cache_bytes=16 * 1024**2,
+                early_warning_horizon=3,
+                pricing_devices=(),
+                pricing_workers=1,
+                exact_workers=1,
+            )
+            fit_codes, _, _ = data.split(config.split_fractions, config.split_seed)
+            context = Context.make(data, fit_codes)
+            optimizer = SupportOptimizer(context, config)
+            try:
+                first = Support.of((RuleIdentity((0,), 0, 1),))
+                second = Support.of((RuleIdentity((1,), 0, 1),))
+                pair = Support.of((*first.rules, *second.rules))
+                first_record = optimizer.fit(first, optimizer.records[EMPTY_SUPPORT])
+                second_record = optimizer.fit(second, optimizer.records[EMPTY_SUPPORT])
+                pair_record = optimizer.fit(pair, first_record)
+                assert first_record.dependency_effective_dimension is not None
+                assert second_record.dependency_effective_dimension is not None
+                assert pair_record.dependency_effective_dimension is not None
+                self.assertAlmostEqual(
+                    pair_record.dependency_effective_dimension,
+                    first_record.dependency_effective_dimension
+                    + second_record.dependency_effective_dimension,
+                )
+                self.assertEqual(
+                    optimizer.objective.n_entities,
+                    prediction_opportunity_count(context, config.impact_lag),
+                )
+            finally:
+                optimizer.close()
+
     def test_cluster_accumulator_accepts_unobserved_trailing_clusters(self) -> None:
         design = np.asarray([[1.0, 2.0], [3.0, 4.0]], dtype=np.float64)
         groups = np.asarray([0, 1, 0], dtype=np.int32)

@@ -379,7 +379,7 @@ __device__ void fill_completion_design_knot(
     const std::int64_t* completion_times,
     const std::int64_t* completion_spans,
     int completion_mode, std::int64_t entity_count, int antecedent,
-    std::int64_t window,
+    std::int64_t minimum_span, std::int64_t window,
     std::int64_t entity, std::int64_t observation_start,
     std::int64_t observation_end, const double* basis, int knots, int lag,
     int dimension, int block, int knot, int tile_begin, int tile_end,
@@ -420,7 +420,7 @@ __device__ void fill_completion_design_knot(
         const std::int64_t span = completion_mode == 2
             ? (completion_spans[cursor] & 0xFFFFFFFFLL)
             : completion_spans[cursor];
-        if (span > window) continue;
+        if (span <= minimum_span || span > window) continue;
         const std::int64_t completion = completion_times[cursor];
         const std::int64_t remaining = observation_end - completion;
         const int maximum = static_cast<int>(
@@ -517,7 +517,9 @@ __global__ void completion_preconvolved_gradient_kernel(
     const std::int64_t* packed_entity_spans,
     const std::int64_t* starts, const std::int64_t* ends,
     const std::int64_t* grid_offsets, const double* future_score, int knots,
-    const int* block_predicates, const std::int64_t* block_windows,
+    const int* block_predicates,
+    const std::int64_t* block_minimum_spans,
+    const std::int64_t* block_windows,
     int candidates, double* gradient) {
     constexpr int kMaximumWindows = 8;
     constexpr int kMaximumKnots = 8;
@@ -549,19 +551,18 @@ __global__ void completion_preconvolved_gradient_kernel(
         const std::int64_t packed = packed_entity_spans[cursor];
         const std::int64_t entity = packed >> 32;
         const std::int64_t span = packed & 0xFFFFFFFFLL;
-        int first_window = 0;
-        while (first_window < window_count &&
-               span > block_windows[first_candidate + first_window])
-            ++first_window;
-        if (first_window == window_count) continue;
         const std::int64_t completion = completion_times[cursor];
         if (completion >= ends[entity]) continue;
         const std::int64_t row0 =
             grid_offsets[entity] + completion - starts[entity];
         for (int knot = 0; knot < knots; ++knot) {
             const double contribution = future_score[row0 * knots + knot];
-            for (int window = first_window; window < window_count; ++window)
-                local[window * kMaximumKnots + knot] += contribution;
+            for (int window = 0; window < window_count; ++window) {
+                const int metadata = first_candidate + window;
+                if (span > block_minimum_spans[metadata] &&
+                    span <= block_windows[metadata])
+                    local[window * kMaximumKnots + knot] += contribution;
+            }
         }
     }
     extern __shared__ double reduction[];
@@ -594,7 +595,8 @@ __global__ void implicit_direct_partials_kernel(
     std::int64_t entity_count, const std::int64_t* starts,
     const std::int64_t* ends, const std::int64_t* grid_offsets,
     const double* basis, int knots, int lag, const int* block_predicates,
-    const int* block_orders, const std::int64_t* block_windows,
+    const int* block_orders, const std::int64_t* block_minimum_spans,
+    const std::int64_t* block_windows,
     const int* block_counts, int candidates, int maximum_blocks,
     const std::int64_t* candidate_entity_offsets,
     const int* candidate_entities,
@@ -685,7 +687,8 @@ __global__ void implicit_direct_partials_kernel(
                         completion_mode, entity_count,
                         block_predicates[
                             metadata * kImplicitMaxSources],
-                        block_windows[metadata], entity, starts[entity],
+                        block_minimum_spans[metadata], block_windows[metadata],
+                        entity, starts[entity],
                         ends[entity], basis, knots, lag, dimension, local_block,
                         knot, tile_begin, tile_end, activation);
                 }
@@ -944,7 +947,8 @@ __global__ void implicit_objective_partials_kernel(
     std::int64_t entity_count, const std::int64_t* starts,
     const std::int64_t* ends, const std::int64_t* grid_offsets,
     const double* basis, int knots, int lag, const int* block_predicates,
-    const int* block_orders, const std::int64_t* block_windows,
+    const int* block_orders, const std::int64_t* block_minimum_spans,
+    const std::int64_t* block_windows,
     const int* block_counts, int candidates, int maximum_blocks,
     const std::int64_t* candidate_entity_offsets,
     const int* candidate_entities,
@@ -1007,7 +1011,8 @@ __global__ void implicit_objective_partials_kernel(
                         completion_mode, entity_count,
                         block_predicates[
                             metadata * kImplicitMaxSources],
-                        block_windows[metadata], entity, starts[entity],
+                        block_minimum_spans[metadata], block_windows[metadata],
+                        entity, starts[entity],
                         ends[entity], basis, knots, lag, dimension, local_block,
                         knot, tile_begin, tile_end, activation);
                 }
@@ -1247,6 +1252,7 @@ struct ImplicitWorkspace {
     double* basis = nullptr;
     int* block_predicates = nullptr;
     int* block_orders = nullptr;
+    std::int64_t* block_minimum_spans = nullptr;
     std::int64_t* block_windows = nullptr;
     int* block_counts = nullptr;
     std::int64_t* candidate_entity_offsets = nullptr;
@@ -1281,6 +1287,7 @@ struct ImplicitWorkspace {
     std::size_t basis_capacity = 0;
     std::size_t block_predicates_capacity = 0;
     std::size_t block_orders_capacity = 0;
+    std::size_t block_minimum_spans_capacity = 0;
     std::size_t block_windows_capacity = 0;
     std::size_t block_counts_capacity = 0;
     std::size_t candidate_entity_offsets_capacity = 0;
@@ -2076,6 +2083,7 @@ extern "C" int crbstpp_cuda_implicit_moments_batch(
     int lag,
     const int* host_block_predicates,
     const int* host_block_orders,
+    const std::int64_t* host_block_minimum_spans,
     const std::int64_t* host_block_windows,
     const int* host_block_counts,
     const std::int64_t* host_candidate_entity_offsets,
@@ -2142,6 +2150,12 @@ extern "C" int crbstpp_cuda_implicit_moments_batch(
           host_group_footprint_stats == nullptr)) ||
         host_grid_offsets[entity_count] != rows)
         return 1;
+    for (std::size_t index = 0;
+         index < static_cast<std::size_t>(candidates) * maximum_blocks;
+         ++index) {
+        if (host_block_minimum_spans[index] >= host_block_windows[index])
+            return 1;
+    }
     for (int index = 0; index < active_current_dimension; ++index) {
         if (host_active_current_columns[index] < 0 ||
             host_active_current_columns[index] >= current_dimension)
@@ -2290,6 +2304,8 @@ extern "C" int crbstpp_cuda_implicit_moments_batch(
                      &workspace.block_predicates_capacity, predicate_bytes) ||
         !reserve_int(&workspace.block_orders,
                      &workspace.block_orders_capacity, order_bytes) ||
+        !reserve_int64(&workspace.block_minimum_spans,
+                       &workspace.block_minimum_spans_capacity, window_bytes) ||
         !reserve_int64(&workspace.block_windows,
                        &workspace.block_windows_capacity, window_bytes) ||
         !reserve_int(&workspace.block_counts,
@@ -2461,6 +2477,8 @@ extern "C" int crbstpp_cuda_implicit_moments_batch(
                    predicate_bytes, cudaMemcpyHostToDevice) != cudaSuccess ||
         cudaMemcpy(workspace.block_orders, host_block_orders, order_bytes,
                    cudaMemcpyHostToDevice) != cudaSuccess ||
+        cudaMemcpy(workspace.block_minimum_spans, host_block_minimum_spans,
+                   window_bytes, cudaMemcpyHostToDevice) != cudaSuccess ||
         cudaMemcpy(workspace.block_windows, host_block_windows, window_bytes,
                    cudaMemcpyHostToDevice) != cudaSuccess ||
         cudaMemcpy(workspace.block_counts, host_block_counts, count_bytes,
@@ -2519,7 +2537,8 @@ extern "C" int crbstpp_cuda_implicit_moments_batch(
             workspace.source_offsets, workspace.source_times,
             workspace.source_spans, workspace.starts, workspace.ends,
             workspace.grid_offsets, workspace.future_score, knots,
-            workspace.block_predicates, workspace.block_windows, candidates,
+            workspace.block_predicates, workspace.block_minimum_spans,
+            workspace.block_windows, candidates,
             workspace.gradient);
         if (cudaGetLastError() != cudaSuccess ||
             cudaDeviceSynchronize() != cudaSuccess ||
@@ -2639,7 +2658,8 @@ extern "C" int crbstpp_cuda_implicit_moments_batch(
         workspace.source_spans, completion_mode, entity_count,
         workspace.starts, workspace.ends, workspace.grid_offsets,
         workspace.basis, knots, lag, workspace.block_predicates,
-        workspace.block_orders, workspace.block_windows,
+        workspace.block_orders, workspace.block_minimum_spans,
+        workspace.block_windows,
         workspace.block_counts, candidates, maximum_blocks,
         workspace.candidate_entity_offsets, workspace.candidate_entities,
         workspace.first,
@@ -2695,6 +2715,7 @@ extern "C" int crbstpp_cuda_implicit_objective_batch(
     int device, std::int64_t source_token, std::int64_t derivative_token,
     std::int64_t entity_count, int knots, int lag,
     const int* host_block_predicates, const int* host_block_orders,
+    const std::int64_t* host_block_minimum_spans,
     const std::int64_t* host_block_windows, const int* host_block_counts,
     const std::int64_t* host_candidate_entity_offsets,
     const int* host_candidate_entities,
@@ -2709,6 +2730,12 @@ extern "C" int crbstpp_cuda_implicit_objective_batch(
         (likelihood_mode == 2 && host_group_eta == nullptr) ||
         maximum_entity_rows < 1)
         return 1;
+    for (std::size_t index = 0;
+         index < static_cast<std::size_t>(candidates) * maximum_blocks;
+         ++index) {
+        if (host_block_minimum_spans[index] >= host_block_windows[index])
+            return 1;
+    }
     if (host_candidate_entity_offsets[0] != 0)
         return 1;
     const std::int64_t candidate_entity_count =
@@ -2763,6 +2790,8 @@ extern "C" int crbstpp_cuda_implicit_objective_batch(
                      &workspace.block_predicates_capacity, predicate_bytes) ||
         !reserve_int(&workspace.block_orders,
                      &workspace.block_orders_capacity, order_bytes) ||
+        !reserve_int64(&workspace.block_minimum_spans,
+                       &workspace.block_minimum_spans_capacity, window_bytes) ||
         !reserve_int64(&workspace.block_windows,
                        &workspace.block_windows_capacity, window_bytes) ||
         !reserve_int(&workspace.block_counts,
@@ -2785,6 +2814,8 @@ extern "C" int crbstpp_cuda_implicit_objective_batch(
                    predicate_bytes, cudaMemcpyHostToDevice) != cudaSuccess ||
         cudaMemcpy(workspace.block_orders, host_block_orders, order_bytes,
                    cudaMemcpyHostToDevice) != cudaSuccess ||
+        cudaMemcpy(workspace.block_minimum_spans, host_block_minimum_spans,
+                   window_bytes, cudaMemcpyHostToDevice) != cudaSuccess ||
         cudaMemcpy(workspace.block_windows, host_block_windows, window_bytes,
                    cudaMemcpyHostToDevice) != cudaSuccess ||
         cudaMemcpy(workspace.block_counts, host_block_counts, count_bytes,
@@ -2849,7 +2880,8 @@ extern "C" int crbstpp_cuda_implicit_objective_batch(
         entity_count,
         workspace.starts, workspace.ends, workspace.grid_offsets,
         workspace.basis, knots, lag, workspace.block_predicates,
-        workspace.block_orders, workspace.block_windows,
+        workspace.block_orders, workspace.block_minimum_spans,
+        workspace.block_windows,
         workspace.block_counts, candidates, maximum_blocks,
         workspace.candidate_entity_offsets, workspace.candidate_entities,
         workspace.hessian, workspace.first, workspace.group_eta,
@@ -3100,6 +3132,8 @@ extern "C" int crbstpp_cuda_release_workspace(int device) {
     release_buffer(&implicit.basis, &implicit.basis_capacity);
     release_buffer(&implicit.block_predicates, &implicit.block_predicates_capacity);
     release_buffer(&implicit.block_orders, &implicit.block_orders_capacity);
+    release_buffer(&implicit.block_minimum_spans,
+                   &implicit.block_minimum_spans_capacity);
     release_buffer(&implicit.block_windows, &implicit.block_windows_capacity);
     release_buffer(&implicit.block_counts, &implicit.block_counts_capacity);
     release_buffer(&implicit.candidate_entity_offsets,

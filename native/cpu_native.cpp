@@ -2741,16 +2741,18 @@ PyObject* response_min_spans(PyObject*, PyObject* args) {
 
 PyObject* continuous_single_block_moments(PyObject*, PyObject* args) {
     PyObject *entities_obj, *times_obj, *spans_obj, *candidate_starts_obj,
-        *candidate_ends_obj, *candidate_windows_obj, *entity_ends_obj,
+        *candidate_ends_obj, *candidate_windows_obj, *candidate_minimum_spans_obj,
+        *entity_ends_obj,
         *grid_offsets_obj, *row_times_obj, *knot_edges_obj, *knot_scales_obj,
         *prefix_first_obj, *prefix_second_obj, *group_run_starts_obj,
         *group_run_ids_obj, *current_x_obj, *current_columns_obj,
         *gradient_obj, *hessian_obj, *cross_obj;
     int requested_workers = 0, gradient_only = 0;
     if (!PyArg_ParseTuple(
-            args, "OOOOOOOOOOOOOOOOOOOOii", &entities_obj, &times_obj,
+            args, "OOOOOOOOOOOOOOOOOOOOOii", &entities_obj, &times_obj,
             &spans_obj, &candidate_starts_obj, &candidate_ends_obj,
-            &candidate_windows_obj, &entity_ends_obj, &grid_offsets_obj,
+            &candidate_windows_obj, &candidate_minimum_spans_obj,
+            &entity_ends_obj, &grid_offsets_obj,
             &row_times_obj, &knot_edges_obj, &knot_scales_obj,
             &prefix_first_obj, &prefix_second_obj, &group_run_starts_obj,
             &group_run_ids_obj, &current_x_obj, &current_columns_obj,
@@ -2759,26 +2761,28 @@ PyObject* continuous_single_block_moments(PyObject*, PyObject* args) {
         return nullptr;
     }
     Py_buffer entities{}, times{}, spans{}, candidate_starts{}, candidate_ends{},
-        candidate_windows{}, entity_ends{}, grid_offsets{}, row_times{},
+        candidate_windows{}, candidate_minimum_spans{}, entity_ends{},
+        grid_offsets{}, row_times{},
         knot_edges{}, knot_scales{}, prefix_first{}, prefix_second{},
         group_run_starts{}, group_run_ids{}, current_x{}, current_columns{},
         gradient{}, hessian{}, cross{};
     int acquired = 0;
     auto release = [&]() {
-        if (acquired >= 20) PyBuffer_Release(&cross);
-        if (acquired >= 19) PyBuffer_Release(&hessian);
-        if (acquired >= 18) PyBuffer_Release(&gradient);
-        if (acquired >= 17) PyBuffer_Release(&current_columns);
-        if (acquired >= 16) PyBuffer_Release(&current_x);
-        if (acquired >= 15) PyBuffer_Release(&group_run_ids);
-        if (acquired >= 14) PyBuffer_Release(&group_run_starts);
-        if (acquired >= 13) PyBuffer_Release(&prefix_second);
-        if (acquired >= 12) PyBuffer_Release(&prefix_first);
-        if (acquired >= 11) PyBuffer_Release(&knot_scales);
-        if (acquired >= 10) PyBuffer_Release(&knot_edges);
-        if (acquired >= 9) PyBuffer_Release(&row_times);
-        if (acquired >= 8) PyBuffer_Release(&grid_offsets);
-        if (acquired >= 7) PyBuffer_Release(&entity_ends);
+        if (acquired >= 21) PyBuffer_Release(&cross);
+        if (acquired >= 20) PyBuffer_Release(&hessian);
+        if (acquired >= 19) PyBuffer_Release(&gradient);
+        if (acquired >= 18) PyBuffer_Release(&current_columns);
+        if (acquired >= 17) PyBuffer_Release(&current_x);
+        if (acquired >= 16) PyBuffer_Release(&group_run_ids);
+        if (acquired >= 15) PyBuffer_Release(&group_run_starts);
+        if (acquired >= 14) PyBuffer_Release(&prefix_second);
+        if (acquired >= 13) PyBuffer_Release(&prefix_first);
+        if (acquired >= 12) PyBuffer_Release(&knot_scales);
+        if (acquired >= 11) PyBuffer_Release(&knot_edges);
+        if (acquired >= 10) PyBuffer_Release(&row_times);
+        if (acquired >= 9) PyBuffer_Release(&grid_offsets);
+        if (acquired >= 8) PyBuffer_Release(&entity_ends);
+        if (acquired >= 7) PyBuffer_Release(&candidate_minimum_spans);
         if (acquired >= 6) PyBuffer_Release(&candidate_windows);
         if (acquired >= 5) PyBuffer_Release(&candidate_ends);
         if (acquired >= 4) PyBuffer_Release(&candidate_starts);
@@ -2797,6 +2801,8 @@ PyObject* continuous_single_block_moments(PyObject*, PyObject* args) {
     if (!int64_buffer(candidate_ends_obj, &candidate_ends, 1, false)) { release(); return nullptr; }
     ++acquired;
     if (!int64_buffer(candidate_windows_obj, &candidate_windows, 1, false)) { release(); return nullptr; }
+    ++acquired;
+    if (!int64_buffer(candidate_minimum_spans_obj, &candidate_minimum_spans, 1, false)) { release(); return nullptr; }
     ++acquired;
     if (!int64_buffer(entity_ends_obj, &entity_ends, 1, false)) { release(); return nullptr; }
     ++acquired;
@@ -2838,6 +2844,7 @@ PyObject* continuous_single_block_moments(PyObject*, PyObject* args) {
                  spans.shape[0] == completion_count &&
                  candidate_ends.shape[0] == candidate_count &&
                  candidate_windows.shape[0] == candidate_count &&
+                 candidate_minimum_spans.shape[0] == candidate_count &&
                  grid_offsets.shape[0] == entity_count + 1 &&
                  knot_edges.shape[0] == knot_count + 1 && knot_count > 0 &&
                  prefix_first.shape[0] == row_count + 1 &&
@@ -2865,7 +2872,9 @@ PyObject* continuous_single_block_moments(PyObject*, PyObject* args) {
         const auto begin = static_cast<const std::int64_t*>(candidate_starts.buf)[index];
         const auto finish = static_cast<const std::int64_t*>(candidate_ends.buf)[index];
         valid = begin >= 0 && begin <= finish && finish <= completion_count &&
-                static_cast<const std::int64_t*>(candidate_windows.buf)[index] >= 0;
+                static_cast<const std::int64_t*>(candidate_windows.buf)[index] >= 0 &&
+                static_cast<const std::int64_t*>(candidate_minimum_spans.buf)[index] <
+                    static_cast<const std::int64_t*>(candidate_windows.buf)[index];
     }
     for (std::int64_t index = 0; valid && index < knot_count; ++index) {
         valid = edgep[index] < edgep[index + 1] &&
@@ -2891,6 +2900,8 @@ PyObject* continuous_single_block_moments(PyObject*, PyObject* args) {
     const auto* candidate_startp = static_cast<const std::int64_t*>(candidate_starts.buf);
     const auto* candidate_endp = static_cast<const std::int64_t*>(candidate_ends.buf);
     const auto* windowp = static_cast<const std::int64_t*>(candidate_windows.buf);
+    const auto* minimum_spanp =
+        static_cast<const std::int64_t*>(candidate_minimum_spans.buf);
     const auto* entity_endp = static_cast<const std::int64_t*>(entity_ends.buf);
     const auto* row_timep = static_cast<const std::int64_t*>(row_times.buf);
     const auto* scalep = static_cast<const double*>(knot_scales.buf);
@@ -3010,6 +3021,7 @@ PyObject* continuous_single_block_moments(PyObject*, PyObject* args) {
         const auto completion_begin = task.begin;
         const auto completion_end = task.end;
         const auto maximum_span = windowp[candidate];
+        const auto minimum_span = minimum_spanp[candidate];
         auto* local_gradient =
             task_gradient.data() + task_index * knot_count;
         auto* local_hessian =
@@ -3030,7 +3042,8 @@ PyObject* continuous_single_block_moments(PyObject*, PyObject* args) {
             admitted.clear();
             admitted.reserve(static_cast<std::size_t>(entity_finish - cursor));
             for (auto item = cursor; item < entity_finish; ++item) {
-                if (spanp[item] <= maximum_span && timep[item] < entity_endp[entity])
+                if (spanp[item] > minimum_span && spanp[item] <= maximum_span &&
+                    timep[item] < entity_endp[entity])
                     admitted.push_back(item);
             }
             cursor = entity_finish;

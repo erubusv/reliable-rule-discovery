@@ -1,0 +1,11 @@
+output_dir: runs/metrics/seed-111
+tex_output: paper/generated_prediction_rows_seed111.tex
+datasets:
+  - key: aave
+    label: Aave
+    baseline_seed_dir: runs/baselines_deadline/aave-v2-v3-deadline/seed-111
+    ours_run_dir: runs/crbstpp/aave_v54_opportunity_additive_dependency_seed111_full
+  - key: wselob
+    label: WSELOB
+    baseline_seed_dir: runs/baselines_deadline/wselob-three-stock-v65-deadline-ms/seed-111
+    ours_run_dir: runs/crbstpp/wselob_three_stock_market_state_volatility_v65_90stockdays_seed111_full

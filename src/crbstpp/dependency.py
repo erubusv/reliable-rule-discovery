@@ -20,10 +20,11 @@ class DependencyComplexity:
     hac_width: int
     raw_minimum_eigenvalue: float
     score_residual: float
+    method: str = "two_way_entity_calendar_godambe_clbic"
 
     def to_dict(self) -> dict[str, object]:
         return {
-            "method": "two_way_entity_calendar_godambe_clbic",
+            "method": self.method,
             "effective_dimension": self.effective_dimension,
             "parameter_rank": self.parameter_rank,
             "entity_clusters": self.entity_clusters,
@@ -33,6 +34,72 @@ class DependencyComplexity:
             "score_residual": self.score_residual,
             "psd_correction": "negative_eigenvalues_clipped_to_zero",
         }
+
+
+def _continuous_dependency_scores(
+    engine: ResponseEngine,
+    context: Context,
+    matrix: ModelMatrix,
+    coefficients: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return exact full-grid scores grouped by continuous sampling unit.
+
+    A raw continuous clock cannot be expanded into regular calendar ticks.
+    Instead, every likelihood row is assigned to its pre-registered
+    ``dependency_group`` (a trading day for WSELOB).  This changes only the
+    covariance used by the MDL code.  The TPP likelihood and its MLE are
+    untouched.
+    """
+
+    dimension = matrix.dimension
+    coefficients = np.asarray(coefficients, dtype=np.float64)
+    eta = engine.linear_predictor(context, matrix, coefficients)
+    exposure = context.all_row_weights()
+    event = np.zeros(context.n_grid, dtype=np.float64)
+    if len(context.target_rows):
+        event[context.target_rows] = context.target_counts
+    _, first, _ = loss_rows(
+        eta,
+        likelihood=context.dataset.likelihood,
+        exposure_weight=exposure,
+        noevent_weight=exposure,
+        event_weight=event,
+    )
+
+    entity_codes, entity_count = dependency_cluster_codes(context)
+    scores = np.zeros((entity_count, dimension), dtype=np.float64)
+
+    # Baseline columns are one-hot.  Accumulating one entity at a time avoids
+    # allocating an observation-by-parameter dense design.
+    for local in range(len(context.entity_codes)):
+        left = int(context.offsets[local])
+        right = int(context.offsets[local + 1])
+        if right <= left:
+            continue
+        rows = np.arange(left, right, dtype=np.int64)
+        groups = context.temporal_baseline_groups_at_rows(
+            rows, time_bins=engine.baseline_time_bins
+        )
+        np.add.at(scores[int(entity_codes[local])], groups, first[left:right])
+
+    # Controls, hierarchy nuisance and reportable rules use the same sparse
+    # signed blocks as the exact likelihood evaluator, including total-state
+    # masking.  Consequently this score cannot silently use a different rule
+    # representation from Add/Drop fitting.
+    for block, sign, coefficient_slice in engine._frozen_blocks(context, matrix):
+        if not len(block.rows):
+            continue
+        local = np.searchsorted(context.offsets, block.rows, side="right") - 1
+        clusters = entity_codes[local]
+        contribution = (
+            float(sign) * first[block.rows, None] * np.asarray(block.values)
+        )
+        for column, global_column in enumerate(
+            range(coefficient_slice.start, coefficient_slice.stop)
+        ):
+            np.add.at(scores[:, global_column], clusters, contribution[:, column])
+
+    return scores, first
 
 
 def dependency_cluster_codes(context: Context) -> tuple[np.ndarray, int]:
@@ -47,6 +114,31 @@ def dependency_cluster_codes(context: Context) -> tuple[np.ndarray, int]:
     _, inverse = np.unique(raw, return_inverse=True)
     codes = np.ascontiguousarray(inverse, dtype=np.int32)
     return codes, int(np.max(codes, initial=-1)) + 1
+
+
+def prediction_opportunity_count(context: Context, impact_lag: int) -> int:
+    """Return the target-blind number of independent prediction horizons.
+
+    A first-event likelihood has one prediction episode per population entity.
+    A recurrent likelihood can issue another prediction after one impact
+    horizon, so its opportunity count is total observed exposure divided by
+    that horizon.  Raw timestamp units are converted with ``ticks_per_unit``.
+    """
+
+    horizon = int(impact_lag)
+    if horizon < 1:
+        raise ValueError("impact_lag must be positive")
+    if context.dataset.likelihood == "first_event_cloglog":
+        return max(2, int(context.population_entities))
+    ticks = np.maximum(
+        0,
+        np.asarray(context.ends, dtype=np.int64)
+        - np.asarray(context.starts, dtype=np.int64),
+    )
+    exposure = float(np.sum(ticks, dtype=np.float64)) / float(
+        context.dataset.ticks_per_unit
+    )
+    return max(2, int(math.floor(exposure / float(horizon))))
 
 
 def _baseline_derivatives(
@@ -97,13 +189,12 @@ def model_dependency_complexity(
     dependence_horizon_ticks: int,
     require_converged: bool = True,
 ) -> DependencyComplexity:
-    """Exact two-way sandwich effective dimension at a fixed-support MLE.
+    """Exact sandwich effective dimension at a fixed-support MLE.
 
-    The model likelihood is not changed.  Scores are allocated to the
-    pre-registered financial sampling unit and calendar tick, with a Bartlett
-    window spanning the complete rule-formation plus impact horizon.  The
-    entity-time cell meat is subtracted once, as required by two-way cluster
-    inclusion--exclusion.
+    The model likelihood is not changed.  Regular-grid datasets use the
+    pre-registered financial sampling unit and calendar tick.  Continuous
+    datasets use their declared dependency group because raw timestamps do
+    not define a dense calendar grid.
     """
 
     if (require_converged and not fit.converged) or matrix.dimension != len(
@@ -117,6 +208,17 @@ def model_dependency_complexity(
     rule_start = matrix.baseline_dimension + matrix.closure_dimension
     if dimension <= rule_start:
         _, entity_count = dependency_cluster_codes(context)
+        if context.dataset.likelihood == "continuous_poisson":
+            return DependencyComplexity(
+                0.0,
+                0,
+                entity_count,
+                0,
+                0,
+                0.0,
+                0.0,
+                method="one_way_dependency_group_godambe_clbic",
+            )
         origin = int(np.min(context.starts)) if len(context.starts) else 0
         stop = int(np.max(context.ends)) + 1 if len(context.ends) else origin
         return DependencyComplexity(
@@ -155,8 +257,99 @@ def model_dependency_complexity(
     nuisance_indices = np.flatnonzero(nuisance_mask & (active | (np.arange(dimension) < free)))
     interest_indices = np.flatnonzero((~nuisance_mask) & active)
     if not len(interest_indices):
-        return DependencyComplexity(0.0, 0, 0, 0, 1, 0.0, 0.0)
+        # The rule can be inactive at its standalone optimum yet become
+        # conditionally useful in a larger rule set.  Report the actual
+        # registered sampling-unit count rather than the misleading value
+        # zero.  The caller already applies the structural-dimension floor,
+        # so this diagnostic correction cannot make such a rule free.
+        _, entity_count = dependency_cluster_codes(context)
+        return DependencyComplexity(
+            0.0,
+            0,
+            entity_count,
+            0,
+            0 if context.dataset.likelihood == "continuous_poisson" else 1,
+            0.0,
+            0.0,
+            method=(
+                "one_way_dependency_group_godambe_clbic"
+                if context.dataset.likelihood == "continuous_poisson"
+                else "two_way_entity_calendar_godambe_clbic"
+            ),
+        )
     indices = np.concatenate((nuisance_indices, interest_indices))
+
+    if context.dataset.likelihood == "continuous_poisson":
+        entity_scores, _ = _continuous_dependency_scores(
+            engine, context, matrix, beta
+        )
+        selected_entity = entity_scores[:, indices]
+        full_meat = selected_entity.T @ selected_entity
+        full_meat = 0.5 * (full_meat + full_meat.T)
+
+        selected_hessian = hessian[np.ix_(indices, indices)]
+        selected_hessian = 0.5 * (selected_hessian + selected_hessian.T)
+        nuisance_count = len(nuisance_indices)
+        interest_count = len(interest_indices)
+        if nuisance_count:
+            h_nn = selected_hessian[:nuisance_count, :nuisance_count]
+            h_rn = selected_hessian[nuisance_count:, :nuisance_count]
+            nuisance_inverse = np.linalg.pinv(
+                h_nn,
+                rcond=np.finfo(np.float64).eps * max(1, nuisance_count),
+                hermitian=True,
+            )
+            projection = h_rn @ nuisance_inverse
+            transform = np.concatenate(
+                (-projection, np.eye(interest_count, dtype=np.float64)), axis=1
+            )
+            efficient_hessian = (
+                selected_hessian[nuisance_count:, nuisance_count:]
+                - projection
+                @ selected_hessian[:nuisance_count, nuisance_count:]
+            )
+        else:
+            transform = np.eye(interest_count, dtype=np.float64)
+            efficient_hessian = selected_hessian
+        efficient_hessian = 0.5 * (efficient_hessian + efficient_hessian.T)
+        meat = transform @ full_meat @ transform.T
+        meat = 0.5 * (meat + meat.T)
+        eigenvalues, eigenvectors = np.linalg.eigh(meat)
+        minimum = float(np.min(eigenvalues, initial=0.0))
+        positive = np.maximum(eigenvalues, 0.0)
+        meat = (eigenvectors * positive[None, :]) @ eigenvectors.T
+        inverse = np.linalg.pinv(
+            efficient_hessian,
+            rcond=np.finfo(np.float64).eps * max(1, interest_count),
+            hermitian=True,
+        )
+        effective = float(np.trace(inverse @ meat))
+        if not math.isfinite(effective):
+            raise FloatingPointError("nonfinite dependency effective dimension")
+        effective = max(0.0, effective)
+        efficient_gradient = transform @ gradient[indices]
+        efficient_entity = selected_entity @ transform.T
+        gradient_scale = max(
+            1.0, float(np.linalg.norm(efficient_gradient, ord=np.inf))
+        )
+        score_residual = float(
+            np.linalg.norm(
+                np.sum(efficient_entity, axis=0) - efficient_gradient,
+                ord=np.inf,
+            )
+            / gradient_scale
+        )
+        _, entity_count = dependency_cluster_codes(context)
+        return DependencyComplexity(
+            effective_dimension=effective,
+            parameter_rank=int(np.linalg.matrix_rank(efficient_hessian)),
+            entity_clusters=entity_count,
+            calendar_clusters=0,
+            hac_width=0,
+            raw_minimum_eigenvalue=minimum,
+            score_residual=score_residual,
+            method="one_way_dependency_group_godambe_clbic",
+        )
 
     entity_codes, entity_count = dependency_cluster_codes(context)
     origin = int(np.min(context.starts)) if len(context.starts) else 0

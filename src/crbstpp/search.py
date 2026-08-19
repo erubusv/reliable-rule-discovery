@@ -25,11 +25,14 @@ from .atomic import (
 from .config import RunConfig
 from .ensemble import (
     _MixtureSufficientStatistics,
+    _RuleEffectStack,
     _SparseProfile,
     _components_from_profiles,
+    _fit_rule_effect_stack,
     _fit_simplex_statistics,
     _fit_sparse_profiles,
     _mixture_sufficient_statistics,
+    _rule_effect_design,
     _select_intensity_family,
     _sparse_profile,
     _subset_mixture_statistics,
@@ -40,7 +43,11 @@ from .dual import (
     natural_dual_certificate,
     offset_dual_certificate,
 )
-from .dependency import dependency_cluster_codes, model_dependency_complexity
+from .dependency import (
+    dependency_cluster_codes,
+    model_dependency_complexity,
+    prediction_opportunity_count,
+)
 from .evidence import (
     FrequencyEvidence,
     RiskSetDerivatives,
@@ -137,6 +144,31 @@ from .solver import (
 LOGGER = logging.getLogger(__name__)
 
 
+@dataclass(frozen=True)
+class _RuleEffectFamilyFit:
+    """Exact fixed-family score used throughout rule-effect discovery."""
+
+    records: tuple[SupportRecord, ...]
+    stack: _RuleEffectStack
+    score: float
+    penalty: float
+
+
+@dataclass(frozen=True)
+class _CachedRuleEffectColumns:
+    """Lossless fitted rule-effect columns for one exact rule set.
+
+    Family none/joint/separate/Drop comparisons repeatedly use the same
+    support-conditioned fitted effects.  Caching the sparse columns changes
+    no likelihood value; it only avoids reconstructing completion geometry
+    and multiplying the same full-M-knot blocks for every family subset.
+    """
+
+    signature: bytes
+    columns: tuple[tuple[int, RuleIdentity, np.ndarray, np.ndarray], ...]
+    nbytes: int
+
+
 def _pattern_payload(pattern: PatternKey) -> dict[str, object]:
     relation, antecedent = normalize_pattern(pattern)
     return {"relation": relation, "antecedent": list(antecedent)}
@@ -183,6 +215,25 @@ class _CertifiedAddScreen:
     nll_lower_bound: float
     iterations: int
     cuts: int
+
+
+@dataclass(frozen=True)
+class _LiftedFamilyAddScreen:
+    """Safe common-family endpoint for one not-yet-fitted Add.
+
+    The candidate's nonnegative kernel coefficients and its nonnegative
+    stacking weight are lifted into one nonnegative coefficient vector.  The
+    resulting convex model contains every exact joint child used by the
+    rule-effect family objective.  Its certified NLL lower bound therefore
+    gives an upper bound on that *family* score; it is never compared with a
+    support-local MDL value.
+    """
+
+    score_upper_bound: float
+    threshold: float
+    nll_lower_bound: float
+    cuts: int
+    certified_non_improving: bool
 
 
 def _gradient_bundle_lower_bound(
@@ -1413,6 +1464,30 @@ class SearchDiagnostics:
     route_family_prioritized_roots: int = 0
     route_family_objective_audits: int = 0
     route_family_objective_moves: int = 0
+    unified_family_score_fits: int = 0
+    unified_family_score_cache_hits: int = 0
+    family_effect_column_cache_hits: int = 0
+    family_effect_column_cache_misses: int = 0
+    family_effect_column_builds: int = 0
+    family_effect_column_cache_bytes: int = 0
+    family_effect_column_cache_peak_bytes: int = 0
+    family_stack_warm_starts: int = 0
+    family_stack_warm_kkt_skips: int = 0
+    family_stack_optimizer_iterations: int = 0
+    family_stack_inactive_refits_avoided: int = 0
+    family_stack_device_resident_fits: int = 0
+    family_replacement_shared_bases: int = 0
+    family_replacement_shared_candidates: int = 0
+    family_replacement_kkt_candidates: int = 0
+    family_replacement_kkt_screens: int = 0
+    family_replacement_kkt_fail_opens: int = 0
+    family_replacement_kkt_gpu_bypasses: int = 0
+    family_replacement_parallel_waves: int = 0
+    family_replacement_parallel_candidates: int = 0
+    family_replacement_gpu_seconds: float = 0.0
+    unified_family_joint_wins: int = 0
+    unified_family_separate_wins: int = 0
+    unified_family_none_wins: int = 0
     ensemble_residual_rounds: int = 0
     ensemble_residual_candidates: int = 0
     ensemble_residual_positive_columns: int = 0
@@ -1433,6 +1508,11 @@ class SearchDiagnostics:
     intermediate_frontier_rashomon_children: int = 0
     intermediate_frontier_equivalent_children: int = 0
     intermediate_frontier_dag_merges: int = 0
+    intermediate_family_quadratic_calls: int = 0
+    intermediate_family_quadratic_candidates: int = 0
+    intermediate_family_quadratic_failures: int = 0
+    intermediate_family_exact_validations: int = 0
+    intermediate_family_quadratic_seconds: float = 0.0
     branch_minimality_audits: int = 0
     branch_minimality_safe_rejections: int = 0
     branch_minimality_fail_open: int = 0
@@ -1542,6 +1622,13 @@ class SearchDiagnostics:
     safe_column_gradient_bundle_screens: int = 0
     safe_column_gradient_bundle_cuts: int = 0
     safe_column_gradient_bundle_iterations_avoided: int = 0
+    lifted_family_bound_audits: int = 0
+    lifted_family_bound_screens: int = 0
+    lifted_family_bound_fail_opens: int = 0
+    lifted_family_bound_cuts: int = 0
+    lifted_family_bound_seconds: float = 0.0
+    intermediate_family_cleanup_drop_audits: int = 0
+    intermediate_family_cleanup_drop_moves: int = 0
     terminal_progressive_add_early_exits: int = 0
     terminal_progressive_add_candidates_deferred: int = 0
     rashomon_atom_candidates: int = 0
@@ -2037,6 +2124,81 @@ def _nonnegative_quadratic_solution(
     return best, best_delta
 
 
+def _nonnegative_quadratic_minimum(
+    linear: np.ndarray,
+    hessian: np.ndarray,
+    initial: np.ndarray,
+    *,
+    tolerance: float,
+) -> tuple[float, np.ndarray, bool]:
+    """Minimize one small nonnegative quadratic deterministically.
+
+    This is used only to rank intermediate family moves.  The selected move
+    is still checked with the exact rule-effect stack before it is accepted.
+    Unlike :func:`_nonnegative_quadratic_solution`, the dimension here is the
+    number of active family effects and can exceed the M-knot block size, so
+    enumerating every active set would be exponential.
+    """
+
+    linear = np.ascontiguousarray(linear, dtype=np.float64)
+    hessian = np.ascontiguousarray(
+        0.5
+        * (
+            np.asarray(hessian, dtype=np.float64)
+            + np.asarray(hessian, dtype=np.float64).T
+        ),
+        dtype=np.float64,
+    )
+    initial = np.maximum(0.0, np.asarray(initial, dtype=np.float64))
+    if not len(linear):
+        return 0.0, np.zeros(0, dtype=np.float64), True
+    if hessian.shape != (len(linear), len(linear)) or initial.shape != linear.shape:
+        raise ValueError("family quadratic shape mismatch")
+
+    def objective(value: np.ndarray) -> tuple[float, np.ndarray]:
+        gradient = linear + hessian @ value
+        return (
+            float(linear @ value + 0.5 * value @ hessian @ value),
+            gradient,
+        )
+
+    result = minimize(
+        objective,
+        initial,
+        jac=True,
+        bounds=[(0.0, None)] * len(linear),
+        method="L-BFGS-B",
+        options={
+            "ftol": 1.0e-12,
+            "gtol": max(1.0e-9, float(tolerance)),
+            "maxiter": 200,
+            "maxls": 50,
+        },
+    )
+    weights = np.maximum(
+        0.0,
+        np.asarray(result.x if result.x is not None else initial, dtype=np.float64),
+    )
+    value, gradient = objective(weights)
+    active = weights > max(1.0e-10, 10.0 * tolerance)
+    active_residual = (
+        float(np.max(np.abs(gradient[active]))) if np.any(active) else 0.0
+    )
+    inactive_residual = (
+        float(np.max(np.maximum(-gradient[~active], 0.0)))
+        if np.any(~active)
+        else 0.0
+    )
+    scale = max(1.0, abs(value), float(np.max(np.abs(linear))))
+    converged = bool(
+        np.isfinite(value)
+        and np.all(np.isfinite(weights))
+        and max(active_residual, inactive_residual)
+        <= max(1.0e-7, 100.0 * tolerance * scale)
+    )
+    return value, weights, converged
+
+
 class SupportOptimizer:
     """Profiled search over total-state or additive hierarchical rules."""
 
@@ -2098,6 +2260,33 @@ class SupportOptimizer:
         return (
             getattr(getattr(self, "config", None), "search_mode", "fast_block_score")
             == "atomic_rashomon_frontier"
+        )
+
+    @property
+    def _uses_family_block_stationarity(self) -> bool:
+        """Whether one Family Block-MDL objective owns every route stage."""
+
+        config = getattr(self, "config", None)
+        return bool(
+            getattr(config, "rule_effect_stacking_search", False)
+            and getattr(config, "terminal_add_audit", "exact") == "block_score"
+            and self._uses_block_score_route
+        )
+
+    @property
+    def _uses_rule_set_block_stationarity(self) -> bool:
+        """Whether discovery and terminal audits use only rule-set Block-MDL.
+
+        Posthoc stacking is deliberately absent from every route decision. It
+        is fitted once, downstream of independent D_cert certification.
+        """
+
+        config = getattr(self, "config", None)
+        return bool(
+            getattr(config, "posthoc_rule_effect_stacking", False)
+            and not getattr(config, "rule_effect_stacking_search", False)
+            and getattr(config, "terminal_add_audit", "exact") == "block_score"
+            and self._uses_block_score_route
         )
 
     @property
@@ -2587,9 +2776,10 @@ class SupportOptimizer:
         identities = self._inactive_identities(
             current, set(self.patterns), frozen=False
         )
-        identities = self._structural_upper_survivors(
-            current, identities, threshold=0.0
-        )
+        if not getattr(self.config, "rule_effect_stacking_search", False):
+            identities = self._structural_upper_survivors(
+                current, identities, threshold=0.0
+            )
         if not identities:
             return ()
         ranked = self._rank_profiled_identities(current, identities)
@@ -2607,7 +2797,9 @@ class SupportOptimizer:
         # Apply the same exact-safe terminal certificates once to the complete
         # basin wave. This avoids rebuilding KKT, localized-footprint and
         # parent-plus-standalone thresholds separately for every branch.
-        if representatives:
+        if representatives and not getattr(
+            self.config, "rule_effect_stacking_search", False
+        ):
             candidate_rules = tuple(item[2] for item in representatives)
             kkt_rules = set(
                 self._gradient_only_zero_kkt_survivors(current, candidate_rules)
@@ -2615,8 +2807,17 @@ class SupportOptimizer:
             localized_upper = self._fused_localized_identity_upper_scores(
                 current, tuple(rule for rule in candidate_rules if rule in kkt_rules)
             )
-            separate_scores = self._separate_family_scores(
-                current, (rule.pattern_key for rule in candidate_rules)
+            # Posthoc stacking is not a discovery objective.  In that mode
+            # every exact Add is compared with this rule set's current J(S),
+            # while independently useful atoms are already retained as roots.
+            # Legacy support-mixture discovery keeps its stricter separate
+            # support threshold.
+            separate_scores = (
+                {}
+                if self._uses_rule_set_block_stationarity
+                else self._separate_family_scores(
+                    current, (rule.pattern_key for rule in candidate_rules)
+                )
             )
             tolerance = self.config.search_tolerance
             screened: list[tuple[float, float, RuleIdentity]] = []
@@ -2624,9 +2825,13 @@ class SupportOptimizer:
                 rule = item[2]
                 if rule not in kkt_rules:
                     continue
-                threshold = max(
-                    current.score,
-                    separate_scores.get(rule.pattern_key, current.score),
+                threshold = (
+                    current.score
+                    if self._uses_rule_set_block_stationarity
+                    else max(
+                        current.score,
+                        separate_scores.get(rule.pattern_key, current.score),
+                    )
                 )
                 upper = float(localized_upper.get(rule, math.inf))
                 if math.isfinite(upper) and upper <= threshold + tolerance:
@@ -2672,10 +2877,31 @@ class SupportOptimizer:
             if not child.fit.converged:
                 continue
             child = self._attach_rule_score(child)
-            if child.score <= current.score + self.config.search_tolerance:
+            if (
+                not getattr(self.config, "rule_effect_stacking_search", False)
+                and child.score <= current.score + self.config.search_tolerance
+            ):
                 continue
             incumbent = children.get(child.support)
-            if incumbent is None or child.score > incumbent.score:
+            child_rank = (
+                self._family_move_scores.get(
+                    (current.support, child.support),
+                    (-math.inf, -math.inf),
+                )[1]
+                if getattr(self.config, "rule_effect_stacking_search", False)
+                else child.score
+            )
+            incumbent_rank = (
+                -math.inf
+                if incumbent is None
+                else self._family_move_scores.get(
+                    (current.support, incumbent.support),
+                    (-math.inf, -math.inf),
+                )[1]
+                if getattr(self.config, "rule_effect_stacking_search", False)
+                else incumbent.score
+            )
+            if incumbent is None or child_rank > incumbent_rank:
                 children[child.support] = freeze_support_record(child)
         with self._state_lock:
             self.diagnostics.conditional_basin_frontier_children += len(children)
@@ -3260,11 +3486,31 @@ class SupportOptimizer:
         # Construction is single-threaded; ``_state_lock`` is initialized
         # below with the mutable caches.
         self.diagnostics.history_family_patterns = len(history_families)
-        dependency_cluster_count = (
-            dependency_cluster_codes(context)[1]
-            if config.dependency_aware_mdl
-            else context.population_entities
-        )
+        if config.dependency_aware_mdl:
+            independent_clusters = dependency_cluster_codes(context)[1]
+            prediction_opportunities = prediction_opportunity_count(
+                context, config.impact_lag
+            )
+            if config.dependency_mdl_sample_size == "prediction_opportunities":
+                dependency_cluster_count = prediction_opportunities
+            elif (
+                config.dependency_mdl_sample_size
+                == "geometric_cluster_opportunities"
+            ):
+                dependency_cluster_count = max(
+                    2,
+                    int(
+                        round(
+                            math.sqrt(
+                                independent_clusters * prediction_opportunities
+                            )
+                        )
+                    ),
+                )
+            else:
+                dependency_cluster_count = independent_clusters
+        else:
+            dependency_cluster_count = context.population_entities
         history_identity_counts: tuple[tuple[PatternKey, int], ...] = ()
         if config.history_marked_events:
             per_predicate = {
@@ -3322,6 +3568,13 @@ class SupportOptimizer:
         # causes a second wallet/calendar covariance pass.
         self._dependency_complexity_cache: dict[
             Support, tuple[float, float, float, float, dict[str, object]]
+        ] = {}
+        # In additive dependency MDL, a rule identity receives one immutable
+        # standalone Godambe cost.  Every larger rule set only sums these
+        # cached scalars.  This makes the code monotone and avoids rebuilding
+        # an observation-sized covariance matrix for every support.
+        self._fixed_rule_dependency_cache: dict[
+            RuleIdentity, tuple[float, dict[str, object]]
         ] = {}
         # Target-blind completion concentration is an inexpensive route-order
         # surrogate for the exact two-way Godambe code.  It never screens a
@@ -3442,6 +3695,13 @@ class SupportOptimizer:
         # records so a repeated lattice cell does not rebuild a multi-million
         # row matrix merely to recover an already known score.
         self._representation_stationary_records: dict[Support, SupportRecord] = {}
+        # Under the unified objective, identity stationarity depends on the
+        # other active family members as well as on this support.  Cache the
+        # finite audit by that small immutable context instead of incorrectly
+        # reusing a support-only certificate across different stacks.
+        self._family_representation_stationary: set[
+            tuple[Support, tuple[Support, ...]]
+        ] = set()
         self._pricing_state: OrderedDict[
             Support, tuple[np.ndarray, np.ndarray, np.ndarray]
         ] = OrderedDict()
@@ -3740,6 +4000,46 @@ class SupportOptimizer:
         self.family_ensemble_weights: dict[Support, float] = {}
         self._predictive_root_supports: frozenset[Support] = frozenset()
         self._route_predictive_records: dict[Support, SupportRecord] = {}
+        # Unified Family Block-MDL caches exact common-baseline rule-effect
+        # fits by immutable rule-set identity.  A cached entry contains only
+        # fitted coefficients and sparse effect metadata; observation-sized
+        # response matrices remain governed by the existing bounded LRUs.
+        self._rule_effect_family_fit_cache: OrderedDict[
+            tuple[Support, ...], _RuleEffectFamilyFit
+        ] = OrderedDict()
+        self._rule_effect_family_selection_cache: OrderedDict[
+            tuple[Support, ...], tuple[dict[Support, SupportRecord], float]
+        ] = OrderedDict()
+        self._rule_effect_family_cache_limit = 512
+        # One exact stacking-family residual is sufficient to price the whole
+        # inactive dictionary at a route node. Keep only the most recent pair
+        # of full-grid derivative vectors; retaining one pair per Rashomon root
+        # would otherwise defeat the bounded matrix/cache policy.
+        self._family_block_derivative_state: (
+            tuple[
+                Support,
+                tuple[Support, ...],
+                np.ndarray,
+                np.ndarray,
+                int,
+                _RuleEffectFamilyFit,
+            ]
+            | None
+        ) = None
+        self._rule_effect_column_cache: OrderedDict[
+            tuple[Support, bytes], _CachedRuleEffectColumns
+        ] = OrderedDict()
+        self._rule_effect_column_cache_bytes = 0
+        self._rule_effect_column_cache_limit = max(
+            64 * 1024**2,
+            min(1024**3, self.config.cache_bytes // 4),
+        )
+        self._family_move_scores: dict[
+            tuple[Support, Support], tuple[float, float]
+        ] = {}
+        self._lifted_family_add_cache: dict[
+            tuple[tuple[Support, ...], Support, Support], _LiftedFamilyAddScreen
+        ] = {}
         profile_limit = max(
             16 * 1024**2,
             min(256 * 1024**2, self.config.cache_bytes // 16),
@@ -3788,6 +4088,24 @@ class SupportOptimizer:
         self._intermediate_frontier_family_updates: dict[
             tuple[Support, Support], dict[Support, SupportRecord]
         ] = {}
+        # While a complete frontier is being constructed, joint/separate/none
+        # alternatives are ranked together by one quadratic approximation to
+        # the exact rule-effect family objective.  Per-child family checks are
+        # deliberately deferred; otherwise every candidate recursively runs
+        # the exact family Add/Drop selection before the shared ranking exists.
+        self._defer_intermediate_family_contract = False
+        # Fast routes must audit active W/sign/history/representation exactly
+        # once after the Add route stalls, not after every accepted Add.  The
+        # call sites already implemented this contract but the flag was never
+        # initialized, so getattr(..., False) silently ran the expensive
+        # terminal identity audit at every intermediate node.
+        self._defer_representation_until_add_stall = self._uses_block_score_route
+        # The raw-kernel lifted relaxation is mathematically safe but is only
+        # an accelerator.  On full WSELOB it failed open for every proposal
+        # and cost more than the canonical exact child fit.  Exact fitted
+        # effect columns below give the same family decision without this
+        # speculative pre-fit LP.
+        self._use_lifted_family_add_bound = False
         self._support_contract_add_decisions: dict[
             tuple[Support, Support], tuple[bool, float]
         ] = {}
@@ -3922,7 +4240,10 @@ class SupportOptimizer:
         self.baseline_nll = baseline_fit.nll
         self._baseline_dependency_effective_dimension = 0.0
         self._baseline_dependency_diagnostics: dict[str, object] | None = None
-        if self.config.dependency_aware_mdl:
+        if (
+            self.config.dependency_aware_mdl
+            and self.config.dependency_mdl_dimension == "support_godambe"
+        ):
             baseline_dependency = model_dependency_complexity(
                 self.engine,
                 self.context,
@@ -5453,6 +5774,141 @@ class SupportOptimizer:
             self._record_cache_bytes -= self._record_nbytes(removed)
         return record
 
+    def _fixed_rule_dependency_cost(
+        self,
+        rule: RuleIdentity,
+        source: SupportRecord | None = None,
+    ) -> tuple[float, dict[str, object]]:
+        """Return one immutable standalone Godambe cost for ``rule``.
+
+        The rule block is fitted against the common baseline once.  Its
+        dependency-effective dimension is then reused in every rule set.  A
+        fixed nonnegative cost is what prevents a later Add from lowering the
+        model code merely because a joint sandwich matrix changed.
+        """
+
+        with self._state_lock:
+            cached = self._fixed_rule_dependency_cache.get(rule)
+        if cached is not None:
+            with self._state_lock:
+                self.diagnostics.dependency_complexity_cache_hits += 1
+            return cached
+
+        singleton = Support.of((rule,))
+        candidate = source if source is not None and source.support == singleton else None
+        if candidate is None:
+            with self._state_lock:
+                stored = self._stored_records.get(singleton)
+            if stored is not None and stored.fit.converged:
+                matrix = self.engine.model_matrix(
+                    self.context,
+                    singleton,
+                    _allow_extension=False,
+                    _aggregate_rows=False,
+                )
+                fit = stored.fit
+                built_matrix = True
+            else:
+                matrix = self.engine.model_matrix(
+                    self.context,
+                    singleton,
+                    _allow_extension=False,
+                    _aggregate_rows=False,
+                )
+                warm = np.zeros(matrix.dimension, dtype=np.float64)
+                baseline = self.records[EMPTY_SUPPORT].fit.coefficients
+                warm[: self.baseline_dimension] = baseline[: self.baseline_dimension]
+                fit = self._fit_support_matrix(
+                    matrix,
+                    warm_start=warm,
+                    device=(self.config.pricing_devices or ("cpu",))[0],
+                )
+                built_matrix = True
+                with self._state_lock:
+                    self.diagnostics.exact_fits += 1
+        else:
+            fit = candidate.fit
+            matrix = candidate.matrix
+            built_matrix = matrix.x.shape[0] == 0
+            if built_matrix:
+                matrix = self.engine.model_matrix(
+                    self.context,
+                    singleton,
+                    _allow_extension=False,
+                    _aggregate_rows=False,
+                )
+
+        structural = float(rule.kernel_dimension(self.config.knot_count))
+        if fit.converged:
+            horizon_ticks = (
+                int(self.config.impact_lag) + int(rule.window)
+            ) * int(self.context.dataset.ticks_per_unit)
+            complexity = model_dependency_complexity(
+                self.engine,
+                self.context,
+                matrix,
+                fit,
+                dependence_horizon_ticks=max(1, horizon_ticks),
+            )
+            effective = max(structural, float(complexity.effective_dimension))
+            diagnostics = complexity.to_dict()
+        else:
+            # A conditionally useful rule can have an unattained standalone
+            # MLE.  Keep it testable with the ordinary structural code rather
+            # than changing its cost according to whichever parent found it.
+            effective = structural
+            diagnostics = {
+                "method": "additive_rule_godambe_structural_fallback",
+                "standalone_fit_message": fit.message,
+            }
+        diagnostics.update(
+            {
+                "rule": str(rule),
+                "standalone_structural_dimension": structural,
+                "fixed_rule_effective_dimension": effective,
+                "sampling_units": int(self.objective.n_entities),
+            }
+        )
+        result = (float(effective), dict(diagnostics))
+        with self._state_lock:
+            incumbent = self._fixed_rule_dependency_cache.setdefault(rule, result)
+            self.diagnostics.dependency_complexity_evaluations += 1
+            self.diagnostics.dependency_complexity_matrix_builds += int(built_matrix)
+            self.diagnostics.dependency_effective_dimension_max = max(
+                self.diagnostics.dependency_effective_dimension_max,
+                float(effective),
+            )
+        return incumbent
+
+    def _additive_dependency_dimension(
+        self, record: SupportRecord
+    ) -> tuple[float, dict[str, object]]:
+        """Sum immutable rule costs and any declared hierarchy coordinates."""
+
+        rule_costs: list[dict[str, object]] = []
+        total = 0.0
+        for rule in record.support.rules:
+            source = record if len(record.support.rules) == 1 else None
+            cost, diagnostics = self._fixed_rule_dependency_cost(rule, source)
+            total += cost
+            rule_costs.append(diagnostics)
+        rule_structural = sum(
+            rule.kernel_dimension(self.config.knot_count)
+            for rule in record.support.rules
+        )
+        hierarchy_dimension = max(
+            0,
+            self.objective.parameter_dimension(record.support) - rule_structural,
+        )
+        total += float(hierarchy_dimension)
+        return float(total), {
+            "method": "additive_standalone_rule_godambe_clbic",
+            "coded_incremental_effective_dimension": float(total),
+            "hierarchy_structural_dimension": int(hierarchy_dimension),
+            "sampling_units": int(self.objective.n_entities),
+            "rule_costs": rule_costs,
+        }
+
     def _dependency_rescore(self, record: SupportRecord) -> SupportRecord:
         """Apply the two-way dependency-aware model-selection code.
 
@@ -5491,6 +5947,37 @@ class SupportOptimizer:
                 ),
                 dependency_effective_dimension=effective_increment,
                 dependency_diagnostics=dict(diagnostics),
+            )
+        elif self.config.dependency_mdl_dimension == "additive_rule_godambe":
+            effective_increment, diagnostics = self._additive_dependency_dimension(
+                record
+            )
+            penalty = self.objective.penalty_for_effective_dimension(
+                record.support,
+                effective_increment,
+            )
+            score = support_score(
+                baseline_nll=self.baseline_nll,
+                fit_nll=record.fit.nll,
+                penalty=penalty,
+            )
+            self._dependency_complexity_cache[record.support] = (
+                float(record.fit.nll),
+                effective_increment,
+                penalty,
+                score,
+                dict(diagnostics),
+            )
+            enriched = replace(
+                record,
+                penalty=penalty,
+                score=score,
+                rule_score=(score if record.rule_score is not None else None),
+                rule_score_upper=(
+                    score if record.rule_score_upper is not None else None
+                ),
+                dependency_effective_dimension=effective_increment,
+                dependency_diagnostics=diagnostics,
             )
         else:
             live_matrix = record.matrix
@@ -5600,6 +6087,29 @@ class SupportOptimizer:
             or record.fit.converged
         ):
             return record
+        if self.config.dependency_mdl_dimension == "additive_rule_godambe":
+            effective_increment, diagnostics = self._additive_dependency_dimension(
+                record
+            )
+            penalty = self.objective.penalty_for_effective_dimension(
+                record.support,
+                effective_increment,
+            )
+            score = support_score(
+                baseline_nll=self.baseline_nll,
+                fit_nll=record.fit.nll,
+                penalty=penalty,
+            )
+            diagnostics = dict(diagnostics)
+            diagnostics["route_only"] = True
+            return replace(
+                record,
+                penalty=penalty,
+                score=score,
+                rule_score=(score if record.rule_score is not None else None),
+                dependency_effective_dimension=effective_increment,
+                dependency_diagnostics=diagnostics,
+            )
         horizon_ticks = (
             int(self.config.impact_lag)
             + max((int(rule.window) for rule in record.support.rules), default=0)
@@ -5651,7 +6161,7 @@ class SupportOptimizer:
         )
 
     def _route_dependency_fraction(self, rule: RuleIdentity) -> float:
-        """Return the two-way effective fraction of a rule's completions.
+        """Return the dependency-effective fraction of rule completions.
 
         A market update copied to many wallets at one tick has many nominal
         completions but few calendar-independent pieces of information.  A
@@ -5662,9 +6172,11 @@ class SupportOptimizer:
             sum_e p_e^2 + sum_t p_t^2 - sum_(e,t) p_(e,t)^2.
 
         Completions are unique per entity/tick, so the last term is ``1/n``.
-        Its reciprocal is a target-blind effective completion count.  The
-        returned ``n_eff / n`` rescales only route priority; it cannot reject
-        a rule or replace the exact dependency-aware MDL.
+        Continuous event streams have no meaningful dense calendar tick and
+        use only their pre-registered dependency group (a trading day in
+        WSELOB).  The reciprocal concentration is a target-blind effective
+        completion count.  It only ranks Block-MDL routes; selected children
+        and reportable terminals receive the exact Godambe code.
         """
 
         if not self.config.dependency_aware_mdl:
@@ -5690,28 +6202,96 @@ class SupportOptimizer:
         if count <= 1:
             fraction = 1.0
         else:
-            entity_counts = np.bincount(
-                np.asarray(entities, dtype=np.int64),
-                minlength=len(self.context.entity_codes),
-            ).astype(np.float64, copy=False)
-            _, time_counts = np.unique(times, return_counts=True)
             inverse_count = 1.0 / float(count)
-            concentration = (
-                (
-                    float(entity_counts @ entity_counts)
-                    + float(
-                        time_counts.astype(np.float64) @ time_counts.astype(np.float64)
-                    )
-                    - float(count)
-                )
-                * inverse_count
-                * inverse_count
+            dependency_codes, dependency_count = dependency_cluster_codes(
+                self.context
             )
+            completion_groups = dependency_codes[
+                np.asarray(entities, dtype=np.int64)
+            ]
+            entity_counts = np.bincount(
+                completion_groups, minlength=dependency_count
+            ).astype(np.float64, copy=False)
+            if self.context.dataset.likelihood == "continuous_poisson":
+                concentration = (
+                    float(entity_counts @ entity_counts)
+                    * inverse_count
+                    * inverse_count
+                )
+            else:
+                _, time_counts = np.unique(times, return_counts=True)
+                concentration = (
+                    (
+                        float(entity_counts @ entity_counts)
+                        + float(
+                            time_counts.astype(np.float64)
+                            @ time_counts.astype(np.float64)
+                        )
+                        - float(count)
+                    )
+                    * inverse_count
+                    * inverse_count
+                )
             concentration = max(inverse_count, concentration)
             effective = min(float(count), 1.0 / concentration)
             fraction = max(inverse_count, min(1.0, effective * inverse_count))
         self._route_dependency_fraction_cache[key] = float(fraction)
         return float(fraction)
+
+    def _route_dependency_child_penalty(
+        self,
+        current: SupportRecord,
+        trial: Support,
+        rule: RuleIdentity,
+    ) -> float:
+        """Approximate the child CL-BIC code on the conditional block scale.
+
+        A common market update copied across many wallets contributes little
+        independent information.  Charging only the child's ordinary BIC code
+        while the parent already carries its exact two-way code makes an Add
+        appear to *reduce* complexity and creates hundreds of false-positive
+        blocks.  Keep the parent's fitted effective dimension and charge the
+        new structural coordinates by ``1 / effective_fraction``.  This is the
+        target-blind two-way analogue of the Fisher likelihood approximation.
+        The selected child is still exact-fitted and receives the full Godambe
+        score before an edge is accepted.
+        """
+
+        if (
+            not self.config.dependency_aware_mdl
+            or current.support == EMPTY_SUPPORT
+            or not self._uses_rule_set_block_stationarity
+        ):
+            return self.objective.structural_penalty(trial)
+        parent_dimension = (
+            float(current.dependency_effective_dimension)
+            if current.dependency_effective_dimension is not None
+            else float(self.objective.parameter_dimension(current.support))
+        )
+        if self.config.dependency_mdl_dimension == "additive_rule_godambe":
+            with self._state_lock:
+                cached_rule = self._fixed_rule_dependency_cache.get(rule)
+            if cached_rule is not None:
+                return self.objective.penalty_for_effective_dimension(
+                    trial,
+                    parent_dimension + float(cached_rule[0]),
+                )
+        added_dimension = max(
+            0.0,
+            float(
+                self.objective.parameter_dimension(trial)
+                - self.objective.parameter_dimension(current.support)
+            ),
+        )
+        fraction = max(
+            1.0 / float(max(1, self.objective.n_entities)),
+            self._route_dependency_fraction(rule),
+        )
+        effective_dimension = parent_dimension + added_dimension / fraction
+        return self.objective.penalty_for_effective_dimension(
+            trial,
+            effective_dimension,
+        )
 
     def _drop_cached_model_matrices(
         self, keep: frozenset[Support] = frozenset((EMPTY_SUPPORT,))
@@ -5765,6 +6345,7 @@ class SupportOptimizer:
             self._implicit_poisson_event_state = None
             self._implicit_compact_derivative_state = None
             self._implicit_compact_cloglog_derivative_state = None
+            self._family_block_derivative_state = None
             self._conditional_add_proposals.clear()
             self._identity_proposals.clear()
             self._matched_add_null_workspaces.clear()
@@ -8793,6 +9374,13 @@ class SupportOptimizer:
         support is safely non-minimal.  Unresolved or non-projectable branches
         fail open to independent D_cert F2.
         """
+        # Unified rule-effect discovery owns minimality through the exact
+        # family replacement objective.  Applying this legacy support-level
+        # branch score as an additional gate can reject a rule set whose
+        # fitted effects improve the common stack.  F2 remains the independent
+        # held-out rule-level guard.
+        if getattr(self.config, "rule_effect_stacking_search", False):
+            return True
         if len(record.support.rules) <= 1:
             return True
         if not record.fit.converged or record.matrix.x.shape[0] == 0:
@@ -13371,6 +13959,12 @@ class SupportOptimizer:
         """
         workspace_key = (parent.support, child.support)
         matched_workspace = self._matched_add_null_workspaces.pop(workspace_key, None)
+        # With the unified family objective, D_fit robustness is diagnostic,
+        # not a second discovery objective.  Reliability is tested exactly
+        # once on frozen D_cert through F1--F3.  Keeping this gate here made
+        # Add use a different criterion from standalone/Drop/W-sign moves.
+        if getattr(self.config, "rule_effect_stacking_search", False):
+            return True
         if not self.config.reliability_aware_search:
             return True
         # Exact fixed-support fits are canonical, so the entity-block robust
@@ -13471,22 +14065,99 @@ class SupportOptimizer:
         overlap heuristic.  A non-standalone pair/triplet remains eligible as
         a genuinely conditional or suppressor Add.
         """
-        if getattr(self.config, "rule_effect_stacking_search", False):
-            # The prediction layer combines certified rule effects, not
-            # independently refitted support intensities.  Keep the support
-            # search on its declared Block-MDL objective.
-            return True
         if parent.support == EMPTY_SUPPORT:
-            return True
+            if not getattr(self.config, "rule_effect_stacking_search", False):
+                return True
+            # Empty is still a real state of the unified family objective.
+            # Treating its first Add as an unconditional exception left no
+            # finite base/joint family scores.  If subsequent exact cleanup
+            # removed that rule, the outer route received an ``empty ->
+            # empty`` identity move with an infinite displayed family gain
+            # and repeated it forever.  Compare joint against none here just
+            # as every later edge is compared; the separate representation is
+            # identical to the one-rule joint model at an empty parent.
+            base_records = dict(self._route_predictive_records)
+            base_records.pop(child.support, None)
+            base_state = self._rule_effect_family_fit(base_records.values())
+            joint_records = dict(base_records)
+            joint_records[child.support] = freeze_support_record(child)
+            joint_state = self._rule_effect_family_fit(joint_records.values())
+            joint_selected = {
+                record.support: record for record in joint_state.records
+            }
+            base_score = float(base_state.score)
+            joint_score = float(joint_state.score)
+            passed = bool(
+                child.support in joint_selected
+                and math.isfinite(base_score)
+                and math.isfinite(joint_score)
+                and joint_score > base_score + self.config.search_tolerance
+            )
+            with self._state_lock:
+                self.diagnostics.support_contract_add_audits += 1
+                self._support_contract_add_decisions[
+                    (parent.support, child.support)
+                ] = (passed, base_score)
+                self._family_move_scores[(parent.support, child.support)] = (
+                    base_score,
+                    joint_score,
+                )
+                if passed:
+                    self.diagnostics.unified_family_joint_wins += 1
+                    self._intermediate_frontier_family_updates[
+                        (parent.support, child.support)
+                    ] = joint_selected
+                else:
+                    self.diagnostics.unified_family_none_wins += 1
+                    self.diagnostics.support_contract_add_rejections += 1
+            return passed
         key = (parent.support, child.support)
         with self._state_lock:
             cached = self._support_contract_add_decisions.get(key)
         if cached is not None:
             return cached[0]
+        if getattr(self.config, "posthoc_rule_effect_stacking", False):
+            # Rashomon discovery asks only whether the joint rule set improves
+            # its own Block-MDL. A separately useful atom is retained through
+            # its independent root; it is not a higher hurdle for this Add.
+            # Consequently no standalone fit, simplex fit, or stacking-weight
+            # optimization is performed on an intermediate edge.
+            passed = bool(
+                child.fit.converged
+                and child.score
+                > parent.score + self.config.search_tolerance
+            )
+            with self._state_lock:
+                self.diagnostics.support_contract_add_audits += 1
+                self._support_contract_add_decisions[key] = (
+                    passed,
+                    float(parent.score),
+                )
+                if not passed:
+                    self.diagnostics.support_contract_add_rejections += 1
+            return passed
+        if (
+            getattr(self.config, "rule_effect_stacking_search", False)
+            and self._defer_intermediate_family_contract
+        ):
+            # A complete frontier is about to compare every joint, separate
+            # and no-add alternative with one shared residual/Fisher system.
+            # Running the exact family selector here would repeat that work
+            # once per child before the common ranking even exists.
+            return True
 
         with self._state_lock:
             self.diagnostics.support_contract_add_audits += 1
         atom_frozen = self._positive_atom_by_antecedent.get(rule.pattern_key)
+        if (
+            getattr(self.config, "rule_effect_stacking_search", False)
+            and atom_frozen is not None
+            and atom_frozen.support != Support.of((rule,))
+        ):
+            # Joint and separate alternatives must use the same W/sign/history
+            # identity.  A stronger standalone representative of the same
+            # skeleton is a different model, not a valid substitute.
+            atom_frozen = None
         if atom_frozen is None:
             # Baseline one-amplitude profiling chooses route roots, not the
             # semantics of a later exact family Add.  A W/sign identity can be
@@ -13508,6 +14179,21 @@ class SupportOptimizer:
                 and standalone.discovery_score > self.config.search_tolerance
                 and self._standalone_total_direction_aligned(standalone)
             ):
+                standalone_family_positive = True
+                if getattr(self.config, "rule_effect_stacking_search", False):
+                    standalone_state = self._rule_effect_family_fit((standalone,))
+                    standalone_family_positive = bool(
+                        standalone_state.score > self.config.search_tolerance
+                        and any(
+                            member.support == standalone.support
+                            for member in standalone_state.records
+                        )
+                    )
+                if not standalone_family_positive:
+                    standalone = None
+            else:
+                standalone = None
+            if isinstance(standalone, SupportRecord):
                 # Preserve the exact one-row intensity statistic before the
                 # observation-sized matrix is frozen below.  If this identity
                 # becomes the dictionary incumbent it can be spliced into the
@@ -13533,13 +14219,68 @@ class SupportOptimizer:
                         )
                         incumbent_changed = True
                     else:
-                        atom_frozen = incumbent
+                        if not getattr(
+                            self.config, "rule_effect_stacking_search", False
+                        ):
+                            atom_frozen = incumbent
                     self.diagnostics.on_demand_standalone_positive += 1
                 if incumbent_changed:
                     self._update_standalone_mixture_statistics(
                         rule.pattern_key,
                         standalone_statistic_record,
                     )
+        if getattr(self.config, "rule_effect_stacking_search", False):
+            # Compare the three scientific alternatives on the *same* exact
+            # common-baseline rule-effect objective used by the route and the
+            # final family: retain the current family, refit the rule jointly
+            # inside the parent, or retain it as a standalone rule set.
+            base_records = dict(self._route_predictive_records)
+            # A support reached on another Rashomon path may already be a
+            # cached predictive-family member.  It is the *trial* endpoint of
+            # this edge, not part of the no-Add state.
+            base_records.pop(child.support, None)
+            base_records[parent.support] = freeze_support_record(parent)
+            base_state = self._rule_effect_family_fit(base_records.values())
+            base_score = float(base_state.score)
+            joint_records = dict(base_records)
+            joint_records.pop(parent.support, None)
+            joint_records[child.support] = freeze_support_record(child)
+            joint_state = self._rule_effect_family_fit(joint_records.values())
+            joint_selected = {
+                record.support: record for record in joint_state.records
+            }
+            joint_score = float(joint_state.score)
+            separate_score = base_score
+            if atom_frozen is not None:
+                separate_records = dict(base_records)
+                separate_records[atom_frozen.support] = atom_frozen
+                separate_score = float(
+                    self._rule_effect_family_fit(separate_records.values()).score
+                )
+            threshold = max(base_score, separate_score)
+            passed = bool(
+                child.support in joint_selected
+                and joint_score > threshold + self.config.search_tolerance
+            )
+            with self._state_lock:
+                if passed:
+                    self.diagnostics.unified_family_joint_wins += 1
+                    self._intermediate_frontier_family_updates[
+                        (parent.support, child.support)
+                    ] = joint_selected
+                    self._family_move_scores[(parent.support, child.support)] = (
+                        base_score,
+                        joint_score,
+                    )
+                elif separate_score > base_score + self.config.search_tolerance:
+                    self.diagnostics.unified_family_separate_wins += 1
+                    self.diagnostics.support_contract_add_rejections += 1
+                else:
+                    self.diagnostics.unified_family_none_wins += 1
+                    self.diagnostics.support_contract_add_rejections += 1
+                self._support_contract_add_decisions[key] = (passed, threshold)
+            return passed
+
         if atom_frozen is None:
             passed = self._add_respects_support_contract(parent.support, rule)
             with self._state_lock:
@@ -13587,6 +14328,46 @@ class SupportOptimizer:
         """
         if parent.support == EMPTY_SUPPORT:
             return candidate
+        if getattr(self.config, "rule_effect_stacking_search", False):
+            exact = candidate
+            if not exact.fit.converged and self._use_lifted_family_add_bound:
+                family_screen = self._lifted_family_add_upper_score(
+                    parent,
+                    exact,
+                    rule,
+                )
+                if family_screen.certified_non_improving:
+                    self._conditional_parent_forbidden.add(
+                        (parent.support, exact.support)
+                    )
+                    return None
+            if not exact.fit.converged:
+                exact = self._exactify_path_state(exact, reason="dag")
+            if not exact.fit.converged:
+                return None
+            exact = self._attach_rule_score(exact)
+            if not self._add_is_indecomposable(parent, exact, rule):
+                return None
+            self._frequency_evidence_for_move(parent, exact, rule)
+            return exact
+        if getattr(self.config, "posthoc_rule_effect_stacking", False):
+            # The selected block-score edge is promoted to the exact
+            # fixed-support endpoint, then judged only by the same J(S) used
+            # for roots, Drop and terminal stationarity. Separate standalone
+            # routes already exist and stacking is a downstream prediction
+            # step, so neither is recomputed here.
+            exact = candidate
+            if not exact.fit.converged:
+                exact = self._exactify_path_state(exact, reason="dag")
+            if not exact.fit.converged:
+                return None
+            exact = self._attach_rule_score(exact)
+            if not self._add_is_indecomposable(parent, exact, rule):
+                self._conditional_parent_forbidden.add(
+                    (parent.support, exact.support)
+                )
+                return None
+            return exact
         atom = self._positive_atom_by_antecedent.get(rule.pattern_key)
         if atom is None:
             atom = self._positive_atom_by_antecedent.get(rule.antecedent)
@@ -15651,9 +16432,15 @@ class SupportOptimizer:
                 )
                 for baseline_group in range(baseline_count):
                     matches = pure_rows[one_hot & (one_positions == baseline_group)]
-                    if len(matches) > 1:
-                        raise AssertionError("duplicate pure baseline design group")
-                    if len(matches) == 1:
+                    if len(matches):
+                        # Unaggregated projected Drop states may contain the
+                        # same pure one-hot baseline row more than once with
+                        # different sufficient-statistic weights.  The
+                        # implicit grid needs only the design value here; all
+                        # matches are bit-identical and active rows below keep
+                        # their original weighted group assignments.  Choosing
+                        # the first representative is therefore algebraically
+                        # exact and avoids a reporting-only row aggregation.
                         baseline_to_design[baseline_group] = int(matches[0])
             missing: list[np.ndarray] = []
             for baseline_group in range(baseline_count):
@@ -15921,13 +16708,6 @@ class SupportOptimizer:
         """Price a same-shape candidate batch from compact event streams."""
         if not specifications:
             return None
-        # The native compact operator receives cumulative upper windows.  A
-        # lag-band rule is an exact completion subset, not the difference of
-        # two Fisher matrices, so reusing that operator would give an
-        # incorrect Hessian.  Fail open to the exact sparse batched backend;
-        # this affects execution only and keeps every candidate.
-        if self.engine.has_window_bands:
-            return None
         # The observation-mask compact path is exact for likelihood moments,
         # but footprint relaxations also require explicit opportunity counts.
         # Until those optional audit statistics have a mask-aware native
@@ -15947,6 +16727,11 @@ class SupportOptimizer:
                 ),
             )
             for antecedent, window, closure, keys in specifications
+        )
+        band_lowers = tuple(
+            self.engine.window_band_lower(pattern[1], window, pattern[0])
+            for specification in specifications
+            for pattern, window in specification[3]
         )
         if self.context.dataset.likelihood == "continuous_poisson" and (
             first is None or second is None
@@ -15993,6 +16778,14 @@ class SupportOptimizer:
                 [
                     int(specification[3][0][1]) * self.context.dataset.ticks_per_unit
                     for specification in specifications
+                ],
+                dtype=np.int64,
+            )
+            candidate_minimum_spans = np.ascontiguousarray(
+                [
+                    int(lower if lower is not None else -1)
+                    * self.context.dataset.ticks_per_unit
+                    for lower in band_lowers
                 ],
                 dtype=np.int64,
             )
@@ -16053,6 +16846,7 @@ class SupportOptimizer:
                 current_groups,
                 current_x,
                 current_columns,
+                candidate_minimum_spans=candidate_minimum_spans,
                 workers=max(1, self.config.pricing_workers // 2),
                 gradient_only=gradient_only,
                 prefix_first=state[3],
@@ -16080,6 +16874,9 @@ class SupportOptimizer:
         predicates = np.full((candidate_count, maximum_blocks, 3), -1, dtype=np.int32)
         orders = np.zeros((candidate_count, maximum_blocks), dtype=np.int32)
         windows = np.zeros((candidate_count, maximum_blocks), dtype=np.int64)
+        minimum_spans = np.full(
+            (candidate_count, maximum_blocks), -1, dtype=np.int64
+        )
         counts = np.full(candidate_count, maximum_blocks, dtype=np.int32)
         source_offsets, source_times = self._implicit_sources()
         completion_spans: np.ndarray | None = None
@@ -16155,6 +16952,13 @@ class SupportOptimizer:
                 windows[candidate, block] = (
                     int(window) * self.context.dataset.ticks_per_unit
                 )
+                lower = self.engine.window_band_lower(
+                    pattern[1], window, pattern[0]
+                )
+                minimum_spans[candidate, block] = (
+                    int(lower if lower is not None else -1)
+                    * self.context.dataset.ticks_per_unit
+                )
         direct_completion_gradient = bool(
             gradient_only
             and completion_mode == 2
@@ -16204,7 +17008,13 @@ class SupportOptimizer:
             if collect_group_footprint_stats
             else None
         )
-        compact = self._compact_poisson_derivatives(current)
+        # Explicit derivatives are used by unified Family Block-MDL pricing.
+        # They are evaluated at the exact stacking-family predictor rather
+        # than at the fixed-support predictor. Compact support derivatives are
+        # an execution representation of the latter and must not overwrite an
+        # explicitly supplied family residual.
+        explicit_derivatives = first is not None and second is not None
+        compact = None if explicit_derivatives else self._compact_poisson_derivatives(current)
         compact_events: np.ndarray | None = None
         compact_cloglog_deltas: tuple[np.ndarray, np.ndarray] | None = None
         effective_derivative_token = (
@@ -16216,7 +17026,7 @@ class SupportOptimizer:
             group_derivative, compact_events, effective_derivative_token = compact
             first = group_derivative
             second = group_derivative
-        else:
+        elif not explicit_derivatives:
             cloglog = self._compact_cloglog_derivatives(current)
             if cloglog is not None:
                 (
@@ -16259,6 +17069,7 @@ class SupportOptimizer:
             compact_poisson_events=compact_events,
             compact_cloglog_event_deltas=compact_cloglog_deltas,
             completion_mode=completion_mode,
+            block_minimum_spans=minimum_spans,
             current_columns=current_columns,
             validated_source_offsets=True,
             gradient_only=gradient_only,
@@ -18582,11 +19393,21 @@ class SupportOptimizer:
                     raw_hessian = hessians[position]
                     if implicit_used:
                         current_cross = current_crosses[position]
+                        # The implicit operator receives ``indices`` and
+                        # returns the already projected current-design rows.
+                        active_cross = current_cross
                     else:
                         current_cross = self._sparse_current_cross(
                             current, blocks, dense_second, keys
                         )
-                    active_cross = current_cross
+                        # The exact sparse fail-open returns the complete
+                        # current design.  Match the Fisher inverse built by
+                        # ``_pricing_components`` by selecting the same active
+                        # rows before taking the Schur complement.  Omitting
+                        # this selection only surfaced when a fitted support
+                        # contained an inactive coefficient and window bands
+                        # disabled the implicit operator.
+                        active_cross = current_cross[indices]
                     hessian = raw_hessian - active_cross.T @ inverse @ active_cross
                     profiled_gradient = gradient - active_cross.T @ parent_correction
                     closure_dimension = len(additions) * self.config.knot_count
@@ -19001,10 +19822,21 @@ class SupportOptimizer:
             # Use one full-M-knot Block-MDL objective for proposal pricing,
             # route admission and terminal auditing. The structural child
             # code is a lower bound on its final dependency-aware code.
+            structural_child_penalty = self.objective.structural_penalty(trial)
+            structural_total_net = block_mdl_delta(
+                likelihood_gain=gain,
+                parent_penalty=current.penalty,
+                child_penalty=structural_child_penalty,
+            )
+            child_penalty = (
+                self._route_dependency_child_penalty(current, trial, rule)
+                if structural_total_net > self.config.search_tolerance
+                else structural_child_penalty
+            )
             total_net = block_mdl_delta(
                 likelihood_gain=gain,
                 parent_penalty=current.penalty,
-                child_penalty=self.objective.structural_penalty(trial),
+                child_penalty=child_penalty,
             )
             current_branch_code = self.objective.reported_branch_penalty(
                 current.support,
@@ -19021,10 +19853,18 @@ class SupportOptimizer:
             )
             common_net = min(total_net, rule_net)
             if state_splice:
-                splice_net = (
-                    self._state_splice_safe_upper_score(current, rule) - current.score
-                )
-                net = min(splice_net, rule_net)
+                if getattr(self.config, "rule_effect_stacking_search", False):
+                    # A support-score upper endpoint has no family-objective
+                    # interpretation.  Unified mode uses the conditioned
+                    # Fisher endpoint for ordering and leaves rejection to the
+                    # lifted family certificate after geometry is built.
+                    net = common_net
+                else:
+                    splice_net = (
+                        self._state_splice_safe_upper_score(current, rule)
+                        - current.score
+                    )
+                    net = min(splice_net, rule_net)
             elif not nested:
                 # Missing/incompatible geometry fails open to exact bounds.
                 net = math.inf
@@ -19123,17 +19963,40 @@ class SupportOptimizer:
                 # both contain every target total-state fit and therefore give
                 # a valid non-improvement screen before any candidate matrix
                 # is built.
-                upper_gain = (
-                    self._state_splice_safe_upper_score(current, rule) - current.score
-                )
-                scored.append((upper_gain, gain, rule))
+                if getattr(self.config, "rule_effect_stacking_search", False):
+                    parent_code = self.objective.reported_branch_penalty(
+                        current.support,
+                        self.objective.parameter_dimension(current.support),
+                    )
+                    child_code = self.objective.reported_branch_penalty(
+                        trial,
+                        self.objective.parameter_dimension(trial),
+                    )
+                    ordering = block_mdl_delta(
+                        likelihood_gain=gain,
+                        parent_penalty=parent_code,
+                        child_penalty=child_code,
+                    )
+                    scored.append((ordering, gain, rule))
+                else:
+                    upper_gain = (
+                        self._state_splice_safe_upper_score(current, rule)
+                        - current.score
+                    )
+                    scored.append((upper_gain, gain, rule))
                 continue
-            parent_code = self.objective.reported_branch_penalty(
-                current.support,
-                self.objective.parameter_dimension(current.support),
+            parent_code = (
+                current.penalty
+                if self._uses_rule_set_block_stationarity
+                else self.objective.reported_branch_penalty(
+                    current.support,
+                    self.objective.parameter_dimension(current.support),
+                )
             )
-            child_code = self.objective.reported_branch_penalty(
-                trial, self.objective.parameter_dimension(trial)
+            child_code = self._route_dependency_child_penalty(
+                current,
+                trial,
+                rule,
             )
             net = block_mdl_delta(
                 likelihood_gain=gain,
@@ -19182,6 +20045,57 @@ class SupportOptimizer:
         if not ranked:
             return [], {}
         raw = {rule: float(net) for net, _, rule in ranked}
+        if self._uses_rule_set_block_stationarity:
+            # The incoming score already approximates
+            # J(S + r) - J(S).  Posthoc prediction stacking must not add a
+            # separate-support or mixture hurdle to this discovery ordering.
+            # Preserve the deterministic full-dictionary order verbatim.
+            return list(ranked), raw
+        if (
+            getattr(self.config, "rule_effect_stacking_search", False)
+            and current.fit.converged
+        ):
+            # Translate every support-conditioned Fisher endpoint to the same
+            # Family Block-MDL scale used by exact acceptance.  ``block_delta``
+            # estimates the joint replacement's likelihood/MDL change; the
+            # exact current-family and separate-family scores supply the two
+            # competing actions.  The result orders work only.  No candidate
+            # is accepted without the exact family comparison.
+            base_records = dict(self._route_predictive_records)
+            if current.support != EMPTY_SUPPORT:
+                base_records[current.support] = freeze_support_record(current)
+            base_state = self._rule_effect_family_fit(base_records.values())
+            base_score = float(base_state.score)
+            separate_by_rule: dict[RuleIdentity, float] = {}
+            for _, _, rule in ranked:
+                atom = self._positive_atom_by_antecedent.get(rule.pattern_key)
+                if atom is None or atom.support != Support.of((rule,)):
+                    separate_by_rule[rule] = base_score
+                else:
+                    separate_records = dict(base_records)
+                    separate_records[atom.support] = atom
+                    separate_by_rule[rule] = float(
+                        self._rule_effect_family_fit(separate_records.values()).score
+                    )
+            adjusted = [
+                (
+                    base_score
+                    + float(block_delta)
+                    - max(base_score, separate_by_rule[rule]),
+                    gain,
+                    rule,
+                )
+                for block_delta, gain, rule in ranked
+            ]
+            adjusted.sort(key=lambda item: (-item[0], item[2]))
+            positive = sum(
+                item[0] > self.config.search_tolerance for item in adjusted
+            )
+            with self._state_lock:
+                self.diagnostics.block_score_evaluations += len(adjusted)
+                self.diagnostics.block_score_admissible += positive
+                self.diagnostics.block_score_screens += len(adjusted) - positive
+            return adjusted, raw
         separate_scores: dict[PatternKey, float] = {}
         if current.support != EMPTY_SUPPORT and current.fit.converged:
             separate_scores = self._separate_family_scores(
@@ -19204,6 +20118,279 @@ class SupportOptimizer:
             self.diagnostics.block_score_admissible += positive
             self.diagnostics.block_score_screens += len(adjusted) - positive
         return adjusted, raw
+
+    def _family_block_derivatives(
+        self,
+        current: SupportRecord,
+    ) -> tuple[np.ndarray, np.ndarray, int, _RuleEffectFamilyFit]:
+        """Return derivatives at the exact current rule-stacking family.
+
+        The fixed-support residual and the stacking-family residual coincide
+        only for a one-rule family with unit weight. Pricing later Adds at the
+        former was the main reason that many apparently positive candidates
+        failed their exact joint/separate/none comparison. This routine builds
+        the exact family predictor once, then exposes its NLL gradient and
+        Fisher diagonal to the existing fused dictionary scorer.
+        """
+
+        base_records = dict(self._route_predictive_records)
+        if current.support != EMPTY_SUPPORT:
+            base_records[current.support] = freeze_support_record(current)
+        state = self._rule_effect_family_fit(base_records.values())
+        family_key = tuple(record.support for record in state.records)
+        cached = self._family_block_derivative_state
+        if (
+            cached is not None
+            and cached[0] == current.support
+            and cached[1] == family_key
+            and cached[5] is state
+        ):
+            return cached[2], cached[3], cached[4], state
+
+        baseline = self.records[EMPTY_SUPPORT]
+        baseline_first, baseline_second = self._baseline_grid_derivatives(baseline)
+        first = baseline_first.copy()
+        second = baseline_second.copy()
+        if state.records and len(state.stack.weights):
+            _, _, source_indices, rows, design = self._cached_rule_effect_design(
+                state.records
+            )
+            if design.shape[1] != len(state.stack.weights):
+                raise AssertionError("family derivative design/weight mismatch")
+            # ``_rule_effect_family_fit`` consumes this exact cached design, so
+            # its source order and the fitted weight order must agree.
+            if tuple(source_indices) != tuple(state.stack.source_indices):
+                raise AssertionError("family derivative source order mismatch")
+            eta0 = self.engine.frozen_linear_predictor_at_rows(
+                self.context,
+                baseline.matrix,
+                baseline.fit.coefficients,
+                rows,
+            )
+            effect = np.asarray(design @ state.stack.weights, dtype=np.float64).reshape(
+                -1
+            )
+            row_weight = self.context.weights_at_rows(rows)
+            event_weight = self.context.target_counts_at_sorted_rows(rows)
+            noevent_weight = (
+                row_weight - event_weight
+                if self.context.dataset.likelihood == "first_event_cloglog"
+                else row_weight
+            )
+            _, active_first, active_second = loss_rows(
+                eta0 + effect,
+                likelihood=self.context.dataset.likelihood,
+                exposure_weight=self.engine.tick_exposure * row_weight,
+                noevent_weight=noevent_weight,
+                event_weight=event_weight,
+            )
+            first[rows] = active_first
+            second[rows] = active_second
+        token = new_derivative_token()
+        retained = (
+            current.support,
+            family_key,
+            np.ascontiguousarray(first),
+            np.ascontiguousarray(second),
+            token,
+            state,
+        )
+        self._family_block_derivative_state = retained
+        return retained[2], retained[3], retained[4], state
+
+    def _rank_family_block_identities(
+        self,
+        current: SupportRecord,
+        identities: tuple[RuleIdentity, ...],
+    ) -> list[tuple[float, float, RuleIdentity]]:
+        """Rank joint Adds by a quadratic of the exact family objective.
+
+        ``none`` has zero change. A matching standalone atom supplies the
+        exact ``separate`` hurdle. The joint score is the full-M-knot Fisher
+        gain at the exact current stack minus the incremental rule-set and
+        stacking-weight code. Thus standalone, joint Add, separate and none
+        are expressed on one Family Block-MDL scale throughout the search.
+        """
+
+        if not identities:
+            return []
+        # The fused operator below prices the reportable branch directly.
+        # Other effect models can introduce automatic closure columns and keep
+        # their existing hierarchy-aware scorer.
+        if self.config.effect_model != "support_additive":
+            ranked = self._rank_profiled_identities(current, identities)
+            return self._family_adjusted_block_ranking(current, ranked)[0]
+
+        first, second, derivative_token, base_state = (
+            self._family_block_derivatives(current)
+        )
+        base_score = float(base_state.score)
+        base_supports = {record.support for record in base_state.records}
+        grouped: dict[PatternKey, set[int]] = {}
+        plain: list[RuleIdentity] = []
+        marked: list[RuleIdentity] = []
+        for rule in identities:
+            if rule.history_marks:
+                marked.append(rule)
+            else:
+                plain.append(rule)
+                grouped.setdefault(rule.pattern_key, set()).add(int(rule.window))
+
+        moments: dict[tuple[PatternKey, int], tuple[np.ndarray, np.ndarray]] = {}
+        groups = [
+            (pattern, tuple(sorted(windows)))
+            for pattern, windows in sorted(grouped.items())
+        ]
+        devices = self.config.pricing_devices or ("cpu",)
+        chunks = [
+            tuple(groups[left : left + 1024])
+            for left in range(0, len(groups), 1024)
+        ]
+
+        def price_chunk(assigned):
+            chunk, device = assigned
+            specifications = tuple(
+                (
+                    pattern[1],
+                    int(window),
+                    (),
+                    ((pattern, int(window)),),
+                )
+                for pattern, windows in chunk
+                for window in windows
+            )
+            implicit = self._implicit_hierarchy_moments(
+                current,
+                specifications,
+                first,
+                second,
+                device=device,
+                derivative_token=derivative_token,
+                # ``None`` asks the native operator to return its ordinary
+                # cross block. Family pricing deliberately ignores that block
+                # because the exact stack is already KKT-optimal in its own
+                # coordinates. The native ABI rejects a length-zero selector.
+                current_columns=None,
+            )
+            return specifications, implicit
+
+        assignments = [
+            (chunk, devices[index % len(devices)])
+            for index, chunk in enumerate(chunks)
+        ]
+        queues = [[] for _ in devices]
+        for index, assigned in enumerate(assignments):
+            queues[index % len(devices)].append(assigned)
+
+        def price_queue(queue):
+            return [price_chunk(assigned) for assigned in queue]
+
+        active_queues = [queue for queue in queues if queue]
+        if len(active_queues) <= 1:
+            priced = price_queue(active_queues[0]) if active_queues else []
+        else:
+            priced = [
+                item
+                for part in self._worker_pool.map(price_queue, active_queues)
+                for item in part
+            ]
+        for specifications, implicit in priced:
+            if implicit is None:
+                # CPU-only fail-open uses the identical explicit derivatives.
+                for specification in specifications:
+                    pattern, window = specification[3][0]
+                    block = self.engine.block(
+                        self.context, pattern[1], window, pattern[0]
+                    )
+                    if len(block.rows):
+                        values = np.asarray(block.values, dtype=np.float64)
+                        moments[(pattern, window)] = (
+                            values.T @ first[block.rows],
+                            values.T @ (second[block.rows, None] * values),
+                        )
+                    else:
+                        moments[(pattern, window)] = (
+                            np.zeros(self.config.knot_count, dtype=np.float64),
+                            np.zeros(
+                                (self.config.knot_count, self.config.knot_count),
+                                dtype=np.float64,
+                            ),
+                        )
+                continue
+            gradients, hessians, _ = implicit
+            for position, specification in enumerate(specifications):
+                pattern, window = specification[3][0]
+                moments[(pattern, window)] = (
+                    np.ascontiguousarray(gradients[position]),
+                    np.ascontiguousarray(hessians[position]),
+                )
+
+        # History-marked blocks are much fewer and do not share the ordinary
+        # completion representation, so reduce them against the same family
+        # residual directly.
+        marked_moments: dict[RuleIdentity, tuple[np.ndarray, np.ndarray]] = {}
+        unsigned_marked: dict[tuple, SparseBlock] = {}
+        for rule in marked:
+            key = (
+                rule.pattern_key,
+                int(rule.window),
+                int(rule.kernel_rank),
+                rule.history_marks,
+            )
+            block = unsigned_marked.get(key)
+            if block is None:
+                block = self.engine.rule_block(self.context, rule)
+                unsigned_marked[key] = block
+            values = np.asarray(block.values, dtype=np.float64)
+            marked_moments[rule] = (
+                values.T @ first[block.rows],
+                values.T @ (second[block.rows, None] * values),
+            )
+
+        separate_scores: dict[RuleIdentity, float] = {}
+        base_records = {record.support: record for record in base_state.records}
+        for rule in identities:
+            atom = self._positive_atom_by_antecedent.get(rule.pattern_key)
+            if atom is None or atom.support != Support.of((rule,)):
+                separate_scores[rule] = base_score
+                continue
+            family = dict(base_records)
+            family[atom.support] = atom
+            separate_scores[rule] = float(
+                self._rule_effect_family_fit(family.values()).score
+            )
+
+        log_n = math.log(max(2, self.objective.n_entities))
+        current_structural = self.objective.structural_penalty(current.support)
+        current_is_active = current.support in base_supports
+        ranked: list[tuple[float, float, RuleIdentity]] = []
+        for rule in identities:
+            if rule.history_marks:
+                unsigned_gradient, hessian = marked_moments[rule]
+            else:
+                unsigned_gradient, hessian = moments[
+                    (rule.pattern_key, int(rule.window))
+                ]
+            gain = _nonnegative_quadratic_gain(
+                float(rule.sign) * unsigned_gradient, hessian
+            )
+            trial = current.support.add(rule)
+            structural_increment = self.objective.structural_penalty(trial)
+            if current_is_active:
+                structural_increment -= current_structural
+            # One newly active rule effect receives one BIC coefficient code,
+            # matching ``_rule_effect_family_state_from_stack``.
+            joint_delta = 2.0 * float(gain) - structural_increment - log_n
+            separate_hurdle = max(0.0, separate_scores[rule] - base_score)
+            family_delta = joint_delta - separate_hurdle
+            ranked.append((float(family_delta), float(gain), rule))
+        ranked.sort(key=lambda item: (-item[0], item[2]))
+        positive = sum(item[0] > self.config.search_tolerance for item in ranked)
+        with self._state_lock:
+            self.diagnostics.block_score_evaluations += len(ranked)
+            self.diagnostics.block_score_admissible += positive
+            self.diagnostics.block_score_screens += len(ranked) - positive
+        return ranked
 
     def _rank_profiled_identities(
         self, current: SupportRecord, identities: tuple[RuleIdentity, ...]
@@ -19746,11 +20933,14 @@ class SupportOptimizer:
         # fits.
         self.prepare_compact_completion_store()
         self.prepare_compact_completion_profiles()
-        direct = [
-            (net, gain, rule)
-            for net, gain, rule, _ in self._rank_block_identities(empty, identities)
-        ]
-        direct, _ = self._family_adjusted_block_ranking(empty, direct)
+        if self._uses_family_block_stationarity:
+            direct = self._rank_family_block_identities(empty, identities)
+        else:
+            direct = [
+                (net, gain, rule)
+                for net, gain, rule, _ in self._rank_block_identities(empty, identities)
+            ]
+            direct, _ = self._family_adjusted_block_ranking(empty, direct)
         self.prepare_compact_completion_store()
         self.prepare_compact_completion_profiles()
         direct_by_antecedent: dict[
@@ -20306,7 +21496,13 @@ class SupportOptimizer:
         # comparing its upper bound with the incumbent total MDL could discard
         # a Q-improving support.  A candidate is safely impossible only when
         # its best total MDL cannot be positive.
-        safe = set(self._safe_identity_survivors(current, audit_identities, 0.0))
+        safe = (
+            set(audit_identities)
+            if getattr(self.config, "rule_effect_stacking_search", False)
+            else set(
+                self._safe_identity_survivors(current, audit_identities, 0.0)
+            )
+        )
         with self._state_lock:
             self.diagnostics.lazy_skeleton_bound_audits += len(
                 {rule.pattern_key for rule in audit_identities}
@@ -21515,6 +22711,16 @@ class SupportOptimizer:
         is unchanged, while intermediate states no longer exact-fit every
         competitor merely to select the globally best one-step Add.
         """
+        if getattr(self.config, "rule_effect_stacking_search", False):
+            # The endpoints implemented below are support-MDL certificates.
+            # They are not bounds on a common rule-effect stack, so unified
+            # discovery uses the lifted family certificate and its exact
+            # joint/separate/none validator instead.
+            return self._first_validated_block_score_add(
+                current,
+                viable,
+                composite_cleanup=True,
+            )
         if not current.fit.converged:
             current = self._exactify_path_state(current, reason="dag")
             if not current.fit.converged:
@@ -22487,6 +23693,17 @@ class SupportOptimizer:
         support-key caching deduplicates children reached from another route.
         """
 
+        if getattr(self.config, "rule_effect_stacking_search", False):
+            # Despite the historical method name, the certificates below are
+            # expressed on an individual support score.  Keep this defensive
+            # dispatch so no direct caller can compare them with a stacking
+            # family threshold.
+            return self._first_validated_block_score_add(
+                current,
+                viable,
+                composite_cleanup=True,
+            )
+
         tolerance = self.config.search_tolerance
         terminal_identities = tuple(item[2] for item in viable)
         # One fused support-conditioned derivative pass gives an exact KKT
@@ -22805,9 +24022,15 @@ class SupportOptimizer:
             current, antecedents, frozen=frozen_identities
         )
         log_route_stage("inactive-identities", len(identities))
-        identities = self._structural_upper_survivors(
-            current, identities, threshold=total_threshold
-        )
+        # A support-local saturated endpoint is not an upper bound on the
+        # common stacking-family objective.  Unified discovery therefore
+        # retains the dictionary here and applies the lifted family bound only
+        # after candidate geometry exists.  Legacy support objectives keep
+        # their original exact-safe structural screen.
+        if not getattr(self.config, "rule_effect_stacking_search", False):
+            identities = self._structural_upper_survivors(
+                current, identities, threshold=total_threshold
+            )
         log_route_stage("structural-survivors", len(identities))
         if not identities:
             return None
@@ -22838,10 +24061,16 @@ class SupportOptimizer:
             # its required closure has been fitted. That score is not an upper
             # bound on the closure-matched conditional score and can remove
             # suppressor structures.
-            ranked = self._rank_profiled_identities(current, identities)
-            ranked, raw_block_delta_by_rule = self._family_adjusted_block_ranking(
-                current, ranked
-            )
+            if self._uses_family_block_stationarity:
+                ranked = self._rank_family_block_identities(current, identities)
+                raw_block_delta_by_rule = {
+                    rule: float(net) for net, _, rule in ranked
+                }
+            else:
+                ranked = self._rank_profiled_identities(current, identities)
+                ranked, raw_block_delta_by_rule = self._family_adjusted_block_ranking(
+                    current, ranked
+                )
             if self._uses_block_score_route and not self._terminal_add_audit_active:
                 # Intermediate routing needs one support-conditioned W/sign
                 # representative per skeleton.  Choosing it from the current
@@ -22850,7 +24079,10 @@ class SupportOptimizer:
                 # This is ordering/route compression only: the exact terminal
                 # audit above reopens every W/sign identity, so the reported
                 # Add/Drop/W-sign stationarity guarantee is unchanged.
-                ranked = self._w_profile_representatives(current, ranked)
+                if not bool(
+                    getattr(self, "_block_score_terminal_audit_active", False)
+                ):
+                    ranked = self._w_profile_representatives(current, ranked)
                 # Recompute the map at every support and follow one local
                 # maximum per high-order residual basin.  Singletons remain
                 # separate.  This changes only provisional route scheduling;
@@ -22893,12 +24125,16 @@ class SupportOptimizer:
             admissible = [
                 item
                 for item in ranked
-                if raw_block_delta_by_rule.get(item[2], -math.inf)
+                if (
+                    item[0]
+                    if self._uses_family_block_stationarity
+                    else raw_block_delta_by_rule.get(item[2], -math.inf)
+                )
                 > self.config.search_tolerance
             ]
         if not admissible:
             return None
-        if not exact_atomic_terminal:
+        if not exact_atomic_terminal and not self._uses_family_block_stationarity:
             admissible = self._online_predicate_pareto_order(current, admissible)
             if not admissible:
                 return None
@@ -22954,7 +24190,13 @@ class SupportOptimizer:
                     self.diagnostics.conditional_add_exact_cache_hits += 1
                 # Total MDL is not the search objective.  It can reject only a
                 # support that fails the positive-total admissibility gate.
-                if stored.score <= total_threshold + self.config.search_tolerance:
+                if (
+                    not getattr(
+                        self.config, "rule_effect_stacking_search", False
+                    )
+                    and stored.score
+                    <= total_threshold + self.config.search_tolerance
+                ):
                     continue
             # In fast mode the conditional-Fisher score is an ordering score,
             # not a safe upper bound.  Acceptance still uses the exactly
@@ -22995,11 +24237,30 @@ class SupportOptimizer:
                     item[2],
                 )
             )
+        if exact_atomic_terminal and getattr(
+            self.config, "rule_effect_stacking_search", False
+        ):
+            # The legacy exact-safe oracle compares support-local NLL bounds
+            # with support-local MDL thresholds.  In unified mode that scale
+            # is invalid.  The common validator below uses the same complete
+            # ordered dictionary, but rejects only through a lifted family
+            # certificate or the exact joint/separate/none comparison.
+            return self._first_validated_block_score_add(
+                current,
+                viable,
+                composite_cleanup=True,
+            )
         if exact_atomic_terminal:
             return self._best_batched_exact_family_addition(current, viable)
         if self._uses_safe_column_oracle and not (
             self._uses_atomic_rashomon_frontier and self.config.adaptive_gradient_racing
         ):
+            if getattr(self.config, "rule_effect_stacking_search", False):
+                return self._first_validated_block_score_add(
+                    current,
+                    viable,
+                    composite_cleanup=True,
+                )
             # Tighten the exact child oracle with the same parent-plus-atom
             # family score that _add_is_indecomposable verifies after a child
             # fit.  Computing this threshold before the fit cannot change an
@@ -23563,6 +24824,9 @@ class SupportOptimizer:
             predicates = np.full((len(chunk), maximum_blocks, 3), -1, dtype=np.int32)
             orders = np.zeros((len(chunk), maximum_blocks), dtype=np.int32)
             windows = np.zeros((len(chunk), maximum_blocks), dtype=np.int64)
+            minimum_spans = np.full(
+                (len(chunk), maximum_blocks), -1, dtype=np.int64
+            )
             counts = np.empty(len(chunk), dtype=np.int32)
             coefficients = np.zeros(
                 (
@@ -23585,6 +24849,13 @@ class SupportOptimizer:
                         orders[candidate, block] = len(antecedent)
                     windows[candidate, block] = (
                         int(window) * self.context.dataset.ticks_per_unit
+                    )
+                    lower = self.engine.window_band_lower(
+                        pattern[1], window, pattern[0]
+                    )
+                    minimum_spans[candidate, block] = (
+                        int(lower if lower is not None else -1)
+                        * self.context.dataset.ticks_per_unit
                     )
             active_specifications = tuple(((), 0, (), item[1]) for item in chunk)
             candidate_entity_offsets, candidate_entities = (
@@ -23625,6 +24896,7 @@ class SupportOptimizer:
                     compact_poisson_events=compact_events,
                     compact_cloglog_event_deltas=compact_cloglog_deltas,
                     completion_mode=completion_mode,
+                    block_minimum_spans=minimum_spans[:1],
                     current_columns=np.asarray([0], dtype=np.int32),
                     validated_source_offsets=True,
                 )
@@ -23641,6 +24913,7 @@ class SupportOptimizer:
                 candidate_entities,
                 coefficients,
                 group_eta,
+                block_minimum_spans=minimum_spans,
                 likelihood=likelihood,
                 source_token=source_token,
                 derivative_token=derivative_token,
@@ -23876,6 +25149,36 @@ class SupportOptimizer:
         """
 
         tolerance = self.config.search_tolerance
+        if getattr(self.config, "rule_effect_stacking_search", False):
+            if forced_cleanup_drop:
+                return True
+            edge = (current.support, candidate.support)
+            cached_scores = self._family_move_scores.get(edge)
+            cached_update = self._intermediate_frontier_family_updates.get(edge)
+            if cached_scores is not None and cached_update is not None:
+                return bool(cached_scores[1] > cached_scores[0] + tolerance)
+            added_rules = tuple(
+                rule
+                for rule in candidate.support.rules
+                if rule not in current.support.rules
+            )
+            removed_rules = tuple(
+                rule
+                for rule in current.support.rules
+                if rule not in candidate.support.rules
+            )
+            if len(added_rules) == 1 and not removed_rules:
+                # The exact joint-vs-separate-vs-none contract also records
+                # the accepted family update.  It is intentionally evaluated
+                # only for a route edge selected from the shared quadratic
+                # frontier, not for every generated child.
+                return self._add_is_indecomposable(
+                    current, candidate, added_rules[0]
+                )
+            improves, _ = self._rule_effect_family_replacement_improves(
+                current, candidate
+            )
+            return improves
         gain = candidate.score - current.score
         if gain <= tolerance and not forced_cleanup_drop:
             return False
@@ -23986,7 +25289,12 @@ class SupportOptimizer:
         # path, while an infinite separate score is the same deterministic
         # rejection made later by ``_add_is_indecomposable``.
         family_thresholds: dict[PatternKey, float] = {}
-        if current.fit.converged and current.support != EMPTY_SUPPORT:
+        if (
+            current.fit.converged
+            and current.support != EMPTY_SUPPORT
+            and not getattr(self.config, "rule_effect_stacking_search", False)
+            and not getattr(self.config, "posthoc_rule_effect_stacking", False)
+        ):
             # Joint-vs-separate is a route objective, not terminal cleanup.
             # Build the candidate-specific threshold for every skeleton now.
             # Exact standalone-positive atoms use their parent-plus-atom
@@ -24215,6 +25523,13 @@ class SupportOptimizer:
             wave = viable[start : start + 128]
             if not wave:
                 return
+            if getattr(self.config, "rule_effect_stacking_search", False):
+                # The parent-frozen endpoint is a lower bound for the
+                # individual child rule set, not for the common stacking
+                # family objective.  It remains useful inside the quadratic
+                # family ranking, but cannot safely reject a family move.
+                parent_frozen_decided.update(item[2] for item in wave)
+                return
             marked_rules = {item[2] for item in wave if item[2].history_marks}
             plain_wave = [item for item in wave if not item[2].history_marks]
             # The fused ordinary dictionary has no history-mark coordinate.
@@ -24411,9 +25726,12 @@ class SupportOptimizer:
                     * np.finfo(np.float64).eps
                     * max(1.0, abs(nll), abs(current.fit.nll)),
                 )
-                materialize = not (
-                    score
-                    <= current.score + self.config.search_tolerance - numerical_slack
+                materialize = bool(
+                    getattr(self.config, "rule_effect_stacking_search", False)
+                    or score
+                    > current.score
+                    + self.config.search_tolerance
+                    - numerical_slack
                 )
                 return trial, materialize, float(score), evaluator.nbytes
 
@@ -24593,7 +25911,10 @@ class SupportOptimizer:
                             time.perf_counter() - candidate_started,
                         )
                     if (
-                        ordinary.lower_score
+                        not getattr(
+                            self.config, "rule_effect_stacking_search", False
+                        )
+                        and ordinary.lower_score
                         <= current.score + self.config.search_tolerance
                     ):
                         remember_feasible_rejection(trial)
@@ -24610,7 +25931,10 @@ class SupportOptimizer:
                     # identity.  Complete its derivative certificate only if
                     # its cheap feasible objective can pass the total-MDL gate.
                     if (
-                        proposal.lower_score
+                        not getattr(
+                            self.config, "rule_effect_stacking_search", False
+                        )
+                        and proposal.lower_score
                         <= current.score + self.config.search_tolerance
                     ):
                         self._record_factorized_add_proposal(current, proposal)
@@ -24644,7 +25968,10 @@ class SupportOptimizer:
                     else:
                         self._record_factorized_add_proposal(current, proposal)
                     if (
-                        proposal.lower_score
+                        not getattr(
+                            self.config, "rule_effect_stacking_search", False
+                        )
+                        and proposal.lower_score
                         <= current.score + self.config.search_tolerance
                     ):
                         remember_feasible_rejection(trial)
@@ -24658,6 +25985,77 @@ class SupportOptimizer:
                 self.config.adaptive_gradient_racing
                 or self._uses_successor_rashomon_path
             ):
+                if (
+                    self._uses_rule_set_block_stationarity
+                    and composite_cleanup
+                    and bool(
+                        getattr(
+                            self,
+                            "_block_score_terminal_audit_active",
+                            False,
+                        )
+                    )
+                ):
+                    # This mode promises Block-MDL one-step stationarity, not
+                    # exact-neighbour stationarity.  The candidate above is the
+                    # feasible conditional Newton/Fisher step for this block.
+                    # Its likelihood term is the conditional Fisher/Newton
+                    # approximation and its dependency code is the target-blind
+                    # two-way effective-information approximation.  A positive
+                    # point reopens the route and is exact-fitted once by the
+                    # outer DAG loop, where the full J decides acceptance.
+                    #
+                    # Do not canonicalize or normalize every sibling here.
+                    # Those calls full-refit the whole child and silently turn
+                    # a block audit into an exact one-exchange audit.  Besides
+                    # being a stronger, different guarantee, that was the
+                    # dominant runtime in the posthoc-stacking configuration.
+                    # ``block_net`` already contains the target-blind two-way
+                    # effective-dimension approximation from the fused ranking.
+                    # Validate ranked positive blocks in this one cached table.
+                    # Returning each provisional child to the outer loop made a
+                    # rejection rebuild/rerank all ~39k identities even though
+                    # both the ordering and parent coefficients were unchanged.
+                    # Exact-fit only this selected child, apply the full J once,
+                    # and advance inside the table on rejection.  The first
+                    # exact improvement returns immediately.
+                    exact = self._exactify_path_state(candidate, reason="dag")
+                    if not exact.fit.converged:
+                        self._conditional_parent_forbidden.add(
+                            (current.support, trial)
+                        )
+                        self.diagnostics.nonattained_exact_rejections += 1
+                        continue
+                    exact = self._dependency_rescore(exact)
+                    exact = self._attach_rule_score(exact)
+                    if exact.score <= current.score + self.config.search_tolerance:
+                        self._conditional_parent_forbidden.add(
+                            (current.support, trial)
+                        )
+                        continue
+                    self._conditional_parent_forbidden.add(
+                        (exact.support, current.support)
+                    )
+                    unmaterialized = max(0, len(viable) - audited)
+                    with self._state_lock:
+                        self.diagnostics.adaptive_gradient_route_moves += 1
+                        self.diagnostics.conditional_add_audits += audited
+                        self.diagnostics.conditional_full_refits_avoided += (
+                            unmaterialized
+                        )
+                        self.diagnostics.lazy_exact_refits_avoided += unmaterialized
+                        self.diagnostics.reverse_drop_screens += 1
+                    LOGGER.info(
+                        "terminal rule-set Block-MDL Add accepted support=%s "
+                        "rule=%s one_step_gain=%.9g exact_gain=%.9g audited=%d",
+                        support_key(current.support),
+                        rule,
+                        block_net,
+                        exact.score - current.score,
+                        audited,
+                    )
+                    trim_host_allocator()
+                    return exact
                 adaptive_started = time.perf_counter()
                 candidate = self._adaptive_gradient_route_record(
                     current,
@@ -24708,7 +26106,10 @@ class SupportOptimizer:
                             time.perf_counter() - candidate_started,
                         )
                     if (
-                        candidate.score
+                        not getattr(
+                            self.config, "rule_effect_stacking_search", False
+                        )
+                        and candidate.score
                         <= matched_parent_score + self.config.search_tolerance
                     ):
                         remember_feasible_rejection(trial)
@@ -25422,6 +26823,8 @@ class SupportOptimizer:
                 if record is not None and record.fit.converged:
                     record = self._attach_rule_score(record)
                     if (
+                        not self._uses_family_block_stationarity
+                        and
                         record.discovery_score
                         <= current.discovery_score + self.config.search_tolerance
                     ):
@@ -25676,6 +27079,8 @@ class SupportOptimizer:
                 if record is not None and record.fit.converged:
                     record = self._attach_rule_score(record)
                     if (
+                        not self._uses_family_block_stationarity
+                        and
                         record.discovery_score
                         <= current.discovery_score + self.config.search_tolerance
                     ):
@@ -25718,7 +27123,10 @@ class SupportOptimizer:
                         if proposal.projection_only
                         else self._materialize_factorized_add(base, proposal)
                     )
-            if record.score <= self.config.search_tolerance:
+            if (
+                not self._uses_family_block_stationarity
+                and record.score <= self.config.search_tolerance
+            ):
                 self._conditional_parent_forbidden.add(
                     (current.support, candidate.trial)
                 )
@@ -25726,6 +27134,8 @@ class SupportOptimizer:
             if record.fit.converged:
                 record = self._attach_rule_score(record)
                 if (
+                    not self._uses_family_block_stationarity
+                    and
                     record.discovery_score
                     <= current.discovery_score + self.config.search_tolerance
                 ):
@@ -25916,6 +27326,21 @@ class SupportOptimizer:
                     self.context, rules[0]
                 )
                 candidate_count = len(rules)
+                minimum_spans = np.asarray(
+                    [
+                        int(lower if lower is not None else -1)
+                        * self.context.dataset.ticks_per_unit
+                        for rule in rules
+                        for lower in (
+                            self.engine.window_band_lower(
+                                rule.antecedent,
+                                rule.window,
+                                rule.relation,
+                            ),
+                        )
+                    ],
+                    dtype=np.int64,
+                )
                 moments = continuous_single_block_moments(
                     entities,
                     times,
@@ -25939,6 +27364,7 @@ class SupportOptimizer:
                     group_by_row,
                     current_x,
                     empty_columns,
+                    candidate_minimum_spans=minimum_spans,
                     workers=self.config.pricing_workers,
                     gradient_only=True,
                     prefix_first=prefix_first,
@@ -26455,6 +27881,8 @@ class SupportOptimizer:
                 self._profiled_by_antecedent.get(old_rule.pattern_key) == old_rule,
             )
             if (
+                not getattr(self.config, "rule_effect_stacking_search", False)
+                and
                 old_rule.pattern_key in self._standalone_identity_audited
                 and self._profiled_by_antecedent.get(old_rule.pattern_key) == old_rule
                 and len(
@@ -26487,11 +27915,42 @@ class SupportOptimizer:
                 rules, self.records[EMPTY_SUPPORT]
             )
             best = current
+            best_family_score = -math.inf
+            family_base_score = -math.inf
+            family_trials: dict[
+                Support, tuple[float, dict[Support, SupportRecord], bool]
+            ] = {}
+            if getattr(self.config, "rule_effect_stacking_search", False):
+                family_base_score, family_trials = (
+                    self._rule_effect_family_replacements_shared(current, records)
+                )
             for record in records:
                 with self._state_lock:
                     self.diagnostics.safe_column_exact_audits += 1
                     self.diagnostics.conditional_identity_audits += 1
-                if record.fit.converged and record.score > best.score + tolerance:
+                if not record.fit.converged:
+                    continue
+                if getattr(self.config, "rule_effect_stacking_search", False):
+                    family_score, selected, active = family_trials.get(
+                        record.support, (-math.inf, {}, False)
+                    )
+                    improves = bool(
+                        active
+                        and family_score
+                        > family_base_score + self.config.search_tolerance
+                    )
+                    edge = (current.support, record.support)
+                    with self._state_lock:
+                        self._family_move_scores[edge] = (
+                            family_base_score,
+                            family_score,
+                        )
+                        if improves:
+                            self._intermediate_frontier_family_updates[edge] = selected
+                    if improves and family_score > best_family_score + tolerance:
+                        best = record
+                        best_family_score = family_score
+                elif record.score > best.score + tolerance:
                     best = record
             if best.support == current.support:
                 return None
@@ -26527,8 +27986,10 @@ class SupportOptimizer:
         # Remove it only when its exact zero-block MDL cannot beat the current
         # support; every unresolved or boundary case retains the former exact
         # refit. This changes execution only, not the finite identity audit.
-        zero_kkt_screened = self._screen_identity_zero_kkt_trials(
-            current, specifications
+        zero_kkt_screened = (
+            set()
+            if getattr(self.config, "rule_effect_stacking_search", False)
+            else self._screen_identity_zero_kkt_trials(current, specifications)
         )
         if zero_kkt_screened:
             LOGGER.info(
@@ -26567,6 +28028,22 @@ class SupportOptimizer:
                 next(fallback) if record is None else record for record in exact_records
             ]
         best = current
+        best_family_score = -math.inf
+        family_base_score = -math.inf
+        family_trials: dict[
+            Support, tuple[float, dict[Support, SupportRecord], bool]
+        ] = {}
+        if getattr(self.config, "rule_effect_stacking_search", False):
+            family_base_score, family_trials = (
+                self._rule_effect_family_replacements_shared(
+                    current,
+                    tuple(
+                        record
+                        for record in exact_records
+                        if record is not None and record.fit.converged
+                    ),
+                )
+            )
         for record in exact_records:
             if record is None:
                 # Both exact sparse and canonical fallbacks are fail-open: an
@@ -26575,7 +28052,29 @@ class SupportOptimizer:
             with self._state_lock:
                 self.diagnostics.safe_column_exact_audits += 1
                 self.diagnostics.conditional_identity_audits += 1
-            if record.fit.converged and record.score > best.score + tolerance:
+            if not record.fit.converged:
+                continue
+            if getattr(self.config, "rule_effect_stacking_search", False):
+                family_score, selected, active = family_trials.get(
+                    record.support, (-math.inf, {}, False)
+                )
+                improves = bool(
+                    active
+                    and family_score
+                    > family_base_score + self.config.search_tolerance
+                )
+                edge = (current.support, record.support)
+                with self._state_lock:
+                    self._family_move_scores[edge] = (
+                        family_base_score,
+                        family_score,
+                    )
+                    if improves:
+                        self._intermediate_frontier_family_updates[edge] = selected
+                if improves and family_score > best_family_score + tolerance:
+                    best = record
+                    best_family_score = family_score
+            elif record.score > best.score + tolerance:
                 best = record
         if best.support == current.support:
             return None
@@ -26599,7 +28098,27 @@ class SupportOptimizer:
         every intermediate Add node.
         """
 
-        cached = self._representation_stationary_records.get(current.support)
+        unified = bool(
+            getattr(self.config, "rule_effect_stacking_search", False)
+        )
+        family_context = (
+            current.support,
+            tuple(
+                sorted(
+                    getattr(self, "_route_predictive_records", {}),
+                    key=lambda item: item.rules,
+                )
+            ),
+        )
+        if unified and family_context in self._family_representation_stationary:
+            with self._state_lock:
+                self.diagnostics.representation_stationary_cache_hits += 1
+            return None
+        cached = (
+            None
+            if unified
+            else self._representation_stationary_records.get(current.support)
+        )
         if (
             cached is not None
             and cached.support == current.support
@@ -26608,14 +28127,30 @@ class SupportOptimizer:
             with self._state_lock:
                 self.diagnostics.representation_stationary_cache_hits += 1
             return None
-        if self.config.adaptive_gradient_racing:
+        if (
+            self._uses_family_block_stationarity
+            or self._uses_rule_set_block_stationarity
+        ):
+            # Terminal identity coordinates use the same conditional
+            # gradient/Fisher route as Add. Only the best positive coordinate
+            # is promoted to the exact family comparison; a rejection reopens
+            # the next coordinate. Exhaustively exact-fitting every inactive
+            # W/sign/history representation belongs to exact-neighbour mode,
+            # not to the declared Family Block-MDL one-step certificate.
+            replacement = self._best_conditional_identity_change(
+                current,
+                drop_proposals={},
+            )
+        elif self.config.adaptive_gradient_racing:
             replacement = self._best_safe_identity_change(current)
         else:
             replacement = self._best_conditional_identity_change(
                 current,
                 drop_proposals={},
             )
-        if replacement is None:
+        if replacement is None and unified:
+            self._family_representation_stationary.add(family_context)
+        elif replacement is None:
             # A fixed support has a unique fitted objective and a finite exact
             # W/sign neighborhood.  Once that complete coordinate audit finds
             # no improvement, revisiting the same canonical DAG node cannot
@@ -26688,6 +28223,12 @@ class SupportOptimizer:
                 and enriched.discovery_score > self.config.search_tolerance
                 and self._standalone_total_direction_aligned(enriched)
             )
+            objective_score = self._standalone_objective_score(enriched)
+            if self.config.rule_effect_stacking_search:
+                admissible = bool(
+                    admissible
+                    and objective_score > self.config.search_tolerance
+                )
             if admissible:
                 # Record a deterministic D_fit robustness priority, but never
                 # turn it into an adaptive reliability rejection.  The exact
@@ -26714,10 +28255,14 @@ class SupportOptimizer:
                 if incumbent is None:
                     positives[record.support] = enriched
                 elif (
-                    enriched.discovery_score
-                    > incumbent.discovery_score + self.config.search_tolerance
+                    objective_score
+                    > self._standalone_objective_score(incumbent)
+                    + self.config.search_tolerance
                     or (
-                        abs(enriched.discovery_score - incumbent.discovery_score)
+                        abs(
+                            objective_score
+                            - self._standalone_objective_score(incumbent)
+                        )
                         <= self.config.search_tolerance
                         and enriched.support.rules < incumbent.support.rules
                     )
@@ -27599,12 +29144,18 @@ class SupportOptimizer:
                     (best_by_sign, (rule.pattern_key, rule.sign)),
                 ):
                     incumbent = mapping.get(key)
+                    record_objective = self._standalone_objective_score(record)
+                    incumbent_objective = (
+                        -math.inf
+                        if incumbent is None
+                        else self._standalone_objective_score(incumbent)
+                    )
                     if (
                         incumbent is None
-                        or record.discovery_score
-                        > incumbent.discovery_score + self.config.search_tolerance
+                        or record_objective
+                        > incumbent_objective + self.config.search_tolerance
                         or (
-                            abs(record.discovery_score - incumbent.discovery_score)
+                            abs(record_objective - incumbent_objective)
                             <= self.config.search_tolerance
                             and record.support.rules < incumbent.support.rules
                         )
@@ -27624,7 +29175,9 @@ class SupportOptimizer:
         )
         self._standalone_identity_audited.update(best_by_antecedent)
         for antecedent, record in best_by_antecedent.items():
-            self._baseline_identity_priority[antecedent] = float(record.discovery_score)
+            self._baseline_identity_priority[antecedent] = (
+                self._standalone_objective_score(record)
+            )
         for record in best_by_sign.values():
             frozen = freeze_support_record(record)
             self._representation_stationary_records[record.support] = frozen
@@ -27946,6 +29499,71 @@ class SupportOptimizer:
         finally:
             if evaluator is not None:
                 evaluator.close()
+        if getattr(self.config, "rule_effect_stacking_search", False):
+            # Every exact Drop endpoint is compared as a replacement inside
+            # the same optimized rule-effect family used by standalone, Add,
+            # W/sign and the final stack.  The former implementation first
+            # required J(S-r)>J(S), which could hide a family-improving Drop.
+            candidates: dict[Support, SupportRecord] = {
+                record.support: record
+                for record in records
+                if record.fit.converged
+            }
+            for trial, stored in compact_exact.items():
+                if not stored.fit.converged or trial in candidates:
+                    continue
+                if trial == EMPTY_SUPPORT:
+                    candidates[trial] = self.records[EMPTY_SUPPORT]
+                else:
+                    candidates[trial] = SupportRecord(
+                        trial,
+                        self.engine.model_metadata(trial),
+                        stored.fit,
+                        stored.penalty,
+                        stored.score,
+                        stored.rule_score,
+                        stored.closure_null_nll,
+                    )
+            ranked_family: list[tuple[float, Support, SupportRecord]] = []
+            improving_supports: set[Support] = set()
+            for trial in trials:
+                record = candidates.get(trial)
+                if record is None:
+                    continue
+                improves, family_score = (
+                    self._rule_effect_family_replacement_improves(
+                        current, record
+                    )
+                )
+                if improves:
+                    improving_supports.add(trial)
+                    ranked_family.append((family_score, trial, record))
+            with self._state_lock:
+                self._conditional_parent_forbidden.update(
+                    (current.support, trial)
+                    for trial in trials
+                    if trial not in improving_supports
+                )
+                self.diagnostics.projected_view_drop_matrix_builds_avoided += len(
+                    projected_exact_supports | sparse_exact_supports
+                )
+            if not ranked_family:
+                return None
+            _, selected_support, selected_metadata = min(
+                ranked_family,
+                key=lambda item: (-item[0], item[1].rules),
+            )
+            selected = (
+                selected_metadata
+                if selected_metadata.matrix.x.shape[0] > 0
+                else self.fit(selected_support, current)
+            )
+            if not selected.fit.converged:
+                return None
+            selected = self._attach_rule_score(selected)
+            with self._state_lock:
+                self.diagnostics.rule_objective_drop_moves += 1
+            return selected
         improving: list[
             tuple[float, Support, SupportRecord | None, _StoredRecord | None]
         ] = [
@@ -28071,7 +29689,10 @@ class SupportOptimizer:
         time and released before the two-component mixture is formed.  Peak
         memory is consequently one support matrix rather than the sum of both.
         """
-        if self.config.rule_effect_stacking_search:
+        if (
+            self.config.rule_effect_stacking_search
+            or self.config.posthoc_rule_effect_stacking
+        ):
             return records
         if not records or not positive_atoms:
             return records
@@ -28595,6 +30216,8 @@ class SupportOptimizer:
                     continue
                 upper = self.safe_upper_score(trial)
                 if (
+                    self.config.rule_effect_stacking_search
+                    or
                     not math.isfinite(upper)
                     or upper > current.score + self.config.search_tolerance
                 ):
@@ -28607,15 +30230,28 @@ class SupportOptimizer:
         ordered = sorted(candidates, key=lambda item: (-candidates[item], item.rules))
         records = self._fit_representation_supports_shared(ordered, current)
         best = current
+        best_family_score = -math.inf
         for record in records:
             with self._state_lock:
                 self.diagnostics.safe_column_exact_audits += 1
                 self.diagnostics.conditional_identity_audits += 1
             record = self._attach_rule_score(record)
-            if (
-                record.fit.converged
-                and record.score > best.score + self.config.search_tolerance
-            ):
+            if not record.fit.converged:
+                continue
+            if getattr(self.config, "rule_effect_stacking_search", False):
+                improves, family_score = (
+                    self._rule_effect_family_replacement_improves(
+                        current, record
+                    )
+                )
+                if (
+                    improves
+                    and family_score
+                    > best_family_score + self.config.search_tolerance
+                ):
+                    best = record
+                    best_family_score = family_score
+            elif record.score > best.score + self.config.search_tolerance:
                 best = record
         if best.support == current.support:
             return None
@@ -28743,7 +30379,28 @@ class SupportOptimizer:
         def preferred(
             candidate: SupportRecord,
             incumbent: SupportRecord,
+            *,
+            anchor: SupportRecord | None = None,
         ) -> bool:
+            if getattr(self.config, "rule_effect_stacking_search", False):
+                fixed_anchor = incumbent if anchor is None else anchor
+                candidate_score = self._rule_effect_representation_score(
+                    fixed_anchor, candidate
+                )
+                incumbent_score = self._rule_effect_representation_score(
+                    fixed_anchor, incumbent
+                )
+                if (
+                    candidate_score
+                    > incumbent_score + self.config.search_tolerance
+                ):
+                    return True
+                return bool(
+                    math.isfinite(candidate_score)
+                    and abs(candidate_score - incumbent_score)
+                    <= self.config.search_tolerance
+                    and candidate.support.rules < incumbent.support.rules
+                )
             if candidate.score > incumbent.score + self.config.search_tolerance:
                 return True
             return bool(
@@ -28883,11 +30540,17 @@ class SupportOptimizer:
             starts: dict[Support, SupportRecord] = {}
             for record in input_records:
                 incumbent = starts.get(record.support)
-                if incumbent is None or preferred(record, incumbent):
+                if incumbent is None or record.score > incumbent.score:
                     starts[record.support] = freeze_support_record(record)
             current = dict(starts)
             lineages = {support: {support} for support in starts}
             settled: dict[Support, SupportRecord] = {}
+            contextual_stationary: dict[
+                tuple[Support, Support], SupportRecord
+            ] = {}
+            unified = bool(
+                getattr(self.config, "rule_effect_stacking_search", False)
+            )
             while len(settled) < len(starts):
                 trials_by_origin: dict[Support, tuple[Support, ...]] = {}
                 missing: set[Support] = set()
@@ -28895,11 +30558,19 @@ class SupportOptimizer:
                     if origin in settled:
                         continue
                     state = current[origin]
-                    cached = self._representation_stationary_records.get(state.support)
+                    cached = (
+                        contextual_stationary.get((origin, state.support))
+                        if unified
+                        else self._representation_stationary_records.get(
+                            state.support
+                        )
+                    )
                     if cached is not None and cached.fit.converged:
                         settled[origin] = cached
                         continue
                     standalone_exact = bool(
+                        not self.config.rule_effect_stacking_search
+                        and
                         not self.config.history_marked_events
                         and len(state.support.rules) == 1
                         and state.support.rules[0].pattern_key
@@ -28935,7 +30606,7 @@ class SupportOptimizer:
                     screened = 0
                     for trial in raw_trials:
                         upper = self.safe_upper_score(trial)
-                        if (
+                        if self.config.rule_effect_stacking_search or (
                             not math.isfinite(upper)
                             or upper > state.score + self.config.search_tolerance
                         ):
@@ -28950,7 +30621,8 @@ class SupportOptimizer:
                     missing.update(
                         trial
                         for trial in trials
-                        if trial not in self._representation_stationary_records
+                        if unified
+                        or trial not in self._representation_stationary_records
                     )
                 fitted = fit_representation_batch(missing) if missing else {}
                 moved = False
@@ -28959,14 +30631,18 @@ class SupportOptimizer:
                     best = state
                     for trial in trials_by_origin[origin]:
                         candidate = fitted.get(trial)
-                        if candidate is None:
+                        if candidate is None and not unified:
                             candidate = self._representation_stationary_records.get(
                                 trial
                             )
                         if (
                             candidate is not None
                             and candidate.fit.converged
-                            and preferred(candidate, best)
+                            and preferred(
+                                candidate,
+                                best,
+                                anchor=starts[origin],
+                            )
                         ):
                             best = candidate
                     with self._state_lock:
@@ -28979,8 +30655,15 @@ class SupportOptimizer:
                     if best.support == state.support:
                         settled[origin] = state
                         for visited in lineages[origin]:
-                            self._representation_stationary_records[visited] = state
+                            if unified:
+                                contextual_stationary[(origin, visited)] = state
+                            else:
+                                self._representation_stationary_records[visited] = state
                     else:
+                        if best.support in lineages[origin]:
+                            raise RuntimeError(
+                                "fixed-slot identity representation cycle"
+                            )
                         current[origin] = best
                         lineages[origin].add(best.support)
                         moved = True
@@ -28995,10 +30678,16 @@ class SupportOptimizer:
                             settled[origin] = current[origin]
             for origin, record in settled.items():
                 frozen = freeze_support_record(record)
-                self._representation_stationary_records[origin] = frozen
-                self._representation_stationary_records.setdefault(
-                    frozen.support, frozen
-                )
+                if unified:
+                    contextual_stationary[(origin, origin)] = frozen
+                    contextual_stationary.setdefault(
+                        (origin, frozen.support), frozen
+                    )
+                else:
+                    self._representation_stationary_records[origin] = frozen
+                    self._representation_stationary_records.setdefault(
+                        frozen.support, frozen
+                    )
             return settled
 
         # Route shards already persist exact terminal coefficients and NLLs.
@@ -29013,7 +30702,7 @@ class SupportOptimizer:
                 continue
             frozen = freeze_support_record(record)
             incumbent = live_origins.get(frozen.support)
-            if incumbent is None or preferred(frozen, incumbent):
+            if incumbent is None or frozen.score > incumbent.score:
                 live_origins[frozen.support] = frozen
             with self._state_lock:
                 self._stored_records[frozen.support] = _StoredRecord(
@@ -29068,14 +30757,28 @@ class SupportOptimizer:
             lower_candidates: dict[Support, SupportRecord] = {}
             for record in lower_polished.values():
                 enriched = self._attach_rule_score(record)
+                family_positive = True
                 if (
                     enriched.fit.converged
+                    and self.config.rule_effect_stacking_search
+                ):
+                    singleton_state = self._rule_effect_family_fit((enriched,))
+                    family_positive = bool(
+                        singleton_state.score > self.config.search_tolerance
+                        and any(
+                            member.support == enriched.support
+                            for member in singleton_state.records
+                        )
+                    )
+                if (
+                    enriched.fit.converged
+                    and family_positive
                     and enriched.score > self.config.search_tolerance
                     and enriched.discovery_score > self.config.search_tolerance
                     and self._support_semantics_coherent(enriched)
                 ):
                     incumbent = lower_candidates.get(enriched.support)
-                    if incumbent is None or preferred(enriched, incumbent):
+                    if incumbent is None or enriched.score > incumbent.score:
                         lower_candidates[enriched.support] = freeze_support_record(
                             enriched
                         )
@@ -29121,6 +30824,7 @@ class SupportOptimizer:
                     "origin": current,
                     "current": current,
                     "roots": roots,
+                    "seen": {current.support},
                     "done": False,
                 }
             )
@@ -29157,7 +30861,7 @@ class SupportOptimizer:
                 screened = 0
                 for candidate in sorted(candidates, key=lambda item: item.rules):
                     upper = self._representation_structure_upper_score(candidate)
-                    if (
+                    if self.config.rule_effect_stacking_search or (
                         not math.isfinite(upper)
                         or upper > current.score + self.config.search_tolerance
                     ):
@@ -29215,7 +30919,11 @@ class SupportOptimizer:
                     if (
                         proposal is not None
                         and proposal.fit.converged
-                        and preferred(proposal, best)
+                        and preferred(
+                            proposal,
+                            best,
+                            anchor=state["origin"],
+                        )
                     ):
                         best = proposal
                     if proposal is not None:
@@ -29224,6 +30932,12 @@ class SupportOptimizer:
                 if best.support == current.support:
                     state["done"] = True
                     continue
+                seen = state["seen"]
+                if not isinstance(seen, set):
+                    raise AssertionError("representation state lost its lineage")
+                if best.support in seen:
+                    raise RuntimeError("fixed-slot structural representation cycle")
+                seen.add(best.support)
                 state["current"] = best
                 roots = state["roots"]
                 if not isinstance(roots, set):
@@ -29268,7 +30982,14 @@ class SupportOptimizer:
                 preserve_origin = bool(
                     margin is not None
                     and margin > self.config.search_tolerance
-                    and origin.score > self.config.search_tolerance
+                    and (
+                        (
+                            self._rule_effect_family_fit((origin,)).score
+                            > self.config.search_tolerance
+                        )
+                        if self.config.rule_effect_stacking_search
+                        else origin.score > self.config.search_tolerance
+                    )
                     and self._support_semantics_coherent(origin)
                 )
                 with self._state_lock:
@@ -29314,6 +31035,7 @@ class SupportOptimizer:
             self.diagnostics.adaptive_kernel_supports += 1
             while True:
                 best = current
+                best_family_score = -math.inf
                 for rule in current.support.rules:
                     replacement = rule.with_kernel_rank(
                         0 if rule.kernel_rank == 1 else 1
@@ -29323,8 +31045,23 @@ class SupportOptimizer:
                     self.diagnostics.adaptive_kernel_exact_audits += 1
                     if not candidate.fit.converged:
                         continue
-                    if candidate.score > best.score + self.config.search_tolerance or (
-                        abs(candidate.score - best.score)
+                    candidate_score = candidate.score
+                    candidate_improves = bool(
+                        candidate.score
+                        > best.score + self.config.search_tolerance
+                    )
+                    if self.config.rule_effect_stacking_search:
+                        candidate_improves, candidate_score = (
+                            self._rule_effect_family_replacement_improves(
+                                current, candidate, record_update=False
+                            )
+                        )
+                    if candidate_improves and (
+                        candidate_score
+                        > best_family_score + self.config.search_tolerance
+                    ) or (
+                        candidate_improves
+                        and abs(candidate_score - best_family_score)
                         <= self.config.search_tolerance
                         and sum(
                             item.kernel_dimension(self.config.knot_count)
@@ -29336,6 +31073,7 @@ class SupportOptimizer:
                         )
                     ):
                         best = candidate
+                        best_family_score = candidate_score
                 if best.support == current.support:
                     break
                 current = best
@@ -29388,6 +31126,33 @@ class SupportOptimizer:
         # HT-weighted component mixture.
         if not np.all(self.context.entity_weights == 1.0):
             return records
+        if self.config.rule_effect_stacking_search:
+            selected_map, final_score = self._rule_effect_family_selection(records)
+            selected = tuple(
+                selected_map[support]
+                for support in sorted(selected_map, key=lambda item: item.rules)
+            )
+            state = self._rule_effect_family_fit(selected)
+            grouped = {record.support: 0.0 for record in state.records}
+            for weight, (source_index, _) in zip(
+                state.stack.weights, state.stack.source_indices, strict=True
+            ):
+                grouped[state.records[source_index].support] += float(weight)
+            total = sum(grouped.values())
+            if total > 0.0:
+                grouped = {support: value / total for support, value in grouped.items()}
+            with self._state_lock:
+                if route_stage:
+                    self.diagnostics.route_family_candidates = len(records)
+                    self.diagnostics.route_family_prioritized_roots = len(selected)
+                else:
+                    self.diagnostics.family_ensemble_candidates_removed += (
+                        len(records) - len(selected)
+                    )
+                    self.diagnostics.family_ensemble_active_supports = len(selected)
+                    self.diagnostics.family_ensemble_final_score = float(final_score)
+                    self.family_ensemble_weights = grouped
+            return selected
         empty = self.records[EMPTY_SUPPORT]
         ordered = tuple(sorted(records, key=lambda record: record.support.rules))
         profiles = []
@@ -29572,9 +31337,9 @@ class SupportOptimizer:
         Each route root contributes only its fitted rule block, not its own
         baseline intensity.  A nonnegative quadratic stack is optimized in
         the exact empty-model Fisher geometry and inactive columns are priced
-        by their KKT gain.  This changes route order only: every exact-positive
-        root is returned and every support Add/Drop still uses the unchanged
-        Block-MDL objective.
+        by their KKT gain.  The quadratic model changes route order only.
+        Exact family membership and every accepted route move use the unified
+        Family Block-MDL objective below.
         """
 
         ordered = tuple(sorted(records, key=lambda item: item.support.rules))
@@ -29582,9 +31347,7 @@ class SupportOptimizer:
             self._predictive_root_supports = frozenset(
                 record.support for record in ordered
             )
-            self._route_predictive_records = {
-                record.support: freeze_support_record(record) for record in ordered
-            }
+            self._install_route_predictive_family(ordered)
             return ordered
         if any(len(record.support.rules) != 1 for record in ordered):
             # Dictionary repricing may receive multi-rule terminals.  Their
@@ -29720,17 +31483,14 @@ class SupportOptimizer:
                 ),
             )
 
-        active = [
+        approximate_active = [
             index
             for index, value in zip(selected, coefficients, strict=True)
             if value > numerical
         ]
-        self._predictive_root_supports = frozenset(
-            live[index].support for index in active
-        )
-        self._route_predictive_records = {
-            live[index].support: live[index] for index in active
-        }
+        exact_family, _ = self._route_family_selection(live)
+        self._predictive_root_supports = frozenset(exact_family)
+        self._install_route_predictive_family(exact_family)
         residual = gradient.copy()
         if selected:
             residual += fisher[:, selected] @ coefficients
@@ -29747,7 +31507,23 @@ class SupportOptimizer:
 
         # After predictive columns, choose the most Fisher-distinct remaining
         # direction.  This is still ordering only and preserves all roots.
-        route_order = list(active)
+        route_order = [
+            index
+            for index, record in enumerate(live)
+            if record.support in self._predictive_root_supports
+        ]
+        predictive_count = len(route_order)
+        # Preserve the quadratic pricing result as the deterministic ordering
+        # inside the exact-positive head.  It never determines membership.
+        approximate_rank = {
+            index: rank for rank, index in enumerate(approximate_active)
+        }
+        route_order.sort(
+            key=lambda index: (
+                approximate_rank.get(index, len(live)),
+                live[index].support.rules,
+            )
+        )
         unscheduled = set(range(len(live))).difference(route_order)
         while unscheduled:
             basis = route_order
@@ -29777,9 +31553,11 @@ class SupportOptimizer:
 
         values = tuple(reduced_costs.values())
         with self._state_lock:
-            self.diagnostics.ensemble_residual_rounds += len(active)
+            self.diagnostics.ensemble_residual_rounds += predictive_count
             self.diagnostics.ensemble_residual_candidates += len(live)
-            self.diagnostics.ensemble_residual_positive_columns += len(active)
+            self.diagnostics.ensemble_residual_positive_columns += len(
+                self._predictive_root_supports
+            )
             self.diagnostics.ensemble_residual_min_reduced_cost = float(min(values))
             self.diagnostics.ensemble_residual_max_reduced_cost = float(max(values))
         return tuple(live[index] for index in route_order)
@@ -29817,9 +31595,7 @@ class SupportOptimizer:
             self._predictive_root_supports = frozenset(
                 record.support for record in records
             )
-            self._route_predictive_records = {
-                record.support: freeze_support_record(record) for record in records
-            }
+            self._install_route_predictive_family(records)
             return records
         ordered = tuple(sorted(records, key=lambda item: item.support.rules))
         live: list[SupportRecord] = []
@@ -29844,7 +31620,7 @@ class SupportOptimizer:
             self._predictive_root_supports = frozenset(
                 record.support for record in live
             )
-            self._route_predictive_records = {record.support: record for record in live}
+            self._install_route_predictive_family(live)
             return tuple(live)
         components = _components_from_profiles(self.engine, self.context, profiles)
         statistics = _mixture_sufficient_statistics(components)
@@ -29916,9 +31692,7 @@ class SupportOptimizer:
         self._predictive_root_supports = frozenset(
             live[index].support for index in selected
         )
-        self._route_predictive_records = {
-            live[index].support: live[index] for index in selected
-        }
+        self._install_route_predictive_family(live[index] for index in selected)
         values = tuple(reduced_costs.values())
         with self._state_lock:
             self.diagnostics.ensemble_residual_rounds += len(selected)
@@ -30163,6 +31937,1510 @@ class SupportOptimizer:
         self._fisher_effect_profile_bytes = 0
         return tuple(by_support[record.support] for record in route_roots)
 
+    @staticmethod
+    def _rule_effect_record_signature(record: SupportRecord) -> bytes:
+        """Identify the exact fitted effect represented by one metadata record."""
+
+        digest = hashlib.sha256()
+        digest.update(
+            np.ascontiguousarray(
+                record.fit.coefficients, dtype=np.float64
+            ).tobytes()
+        )
+        digest.update(
+            repr(
+                (
+                    record.matrix.free_dimension,
+                    record.matrix.closure,
+                    record.matrix.closure_signs,
+                    record.matrix.rule_slices,
+                )
+            ).encode("utf-8")
+        )
+        return digest.digest()[:16]
+
+    def _cached_rule_effect_columns(
+        self,
+        record: SupportRecord,
+    ) -> _CachedRuleEffectColumns:
+        """Return exact sparse fitted-effect columns without rebuilding them."""
+
+        signature = self._rule_effect_record_signature(record)
+        key = (record.support, signature)
+        with self._state_lock:
+            cached = self._rule_effect_column_cache.get(key)
+            if cached is not None:
+                self._rule_effect_column_cache.move_to_end(key)
+                self.diagnostics.family_effect_column_cache_hits += 1
+                return cached
+
+        blocks = self.engine.total_state_rule_blocks(
+            self.context, record.support
+        )
+        if len(blocks) != len(record.support.rules):
+            raise AssertionError("rule-effect block count changed")
+        columns: list[tuple[int, RuleIdentity, np.ndarray, np.ndarray]] = []
+        nbytes = 0
+        coefficients = np.asarray(record.fit.coefficients, dtype=np.float64)
+        for rule_index, (rule, block) in enumerate(
+            zip(record.support.rules, blocks, strict=True)
+        ):
+            rows = np.ascontiguousarray(block.rows, dtype=np.int64)
+            if not len(rows):
+                continue
+            values = np.ascontiguousarray(
+                float(rule.sign)
+                * (
+                    self.engine.rule_design_values(block, rule)
+                    @ coefficients[record.matrix.rule_slices[rule_index]]
+                ),
+                dtype=np.float64,
+            )
+            if not np.any(np.abs(values) > 0.0):
+                continue
+            # Own the row array independently of the response-block LRU.  The
+            # bounded family cache can then evict deterministically without
+            # relying on another cache's lifetime.
+            rows = rows.copy()
+            columns.append((rule_index, rule, rows, values))
+            nbytes += int(rows.nbytes + values.nbytes)
+        result = _CachedRuleEffectColumns(signature, tuple(columns), nbytes)
+        with self._state_lock:
+            incumbent = self._rule_effect_column_cache.get(key)
+            if incumbent is not None:
+                self._rule_effect_column_cache.move_to_end(key)
+                self.diagnostics.family_effect_column_cache_hits += 1
+                return incumbent
+            self._rule_effect_column_cache[key] = result
+            self._rule_effect_column_cache.move_to_end(key)
+            self._rule_effect_column_cache_bytes += nbytes
+            while (
+                self._rule_effect_column_cache
+                and self._rule_effect_column_cache_bytes
+                > self._rule_effect_column_cache_limit
+            ):
+                _, evicted = self._rule_effect_column_cache.popitem(last=False)
+                self._rule_effect_column_cache_bytes -= evicted.nbytes
+            self.diagnostics.family_effect_column_cache_misses += 1
+            self.diagnostics.family_effect_column_builds += len(columns)
+            self.diagnostics.family_effect_column_cache_bytes = int(
+                self._rule_effect_column_cache_bytes
+            )
+            self.diagnostics.family_effect_column_cache_peak_bytes = max(
+                self.diagnostics.family_effect_column_cache_peak_bytes,
+                int(self._rule_effect_column_cache_bytes),
+            )
+        return result
+
+    def _cached_rule_effect_design(
+        self,
+        ordered: tuple[SupportRecord, ...],
+    ) -> tuple[
+        tuple[RuleIdentity, ...],
+        tuple[Support, ...],
+        tuple[tuple[int, int], ...],
+        np.ndarray,
+        csc_matrix,
+    ]:
+        """Assemble one family design from immutable cached effect columns."""
+
+        described: list[
+            tuple[int, int, RuleIdentity, Support, np.ndarray, np.ndarray]
+        ] = []
+        for support_index, record in enumerate(ordered):
+            cached = self._cached_rule_effect_columns(record)
+            for rule_index, rule, rows, values in cached.columns:
+                described.append(
+                    (
+                        support_index,
+                        rule_index,
+                        rule,
+                        record.support,
+                        rows,
+                        values,
+                    )
+                )
+        if not described:
+            return (), (), (), np.zeros(0, dtype=np.int64), csc_matrix((0, 0))
+
+        union = sorted_unique_union([item[4] for item in described])
+        if union is None:
+            union = np.unique(np.concatenate([item[4] for item in described]))
+        rows = np.ascontiguousarray(union, dtype=np.int64)
+        positions = [np.searchsorted(rows, item[4]) for item in described]
+        row_index = np.concatenate(positions)
+        column_index = np.concatenate(
+            [
+                np.full(len(item[4]), index, dtype=np.int32)
+                for index, item in enumerate(described)
+            ]
+        )
+        values = np.concatenate([item[5] for item in described])
+        design = csc_matrix(
+            (values, (row_index, column_index)),
+            shape=(len(rows), len(described)),
+        )
+        return (
+            tuple(item[2] for item in described),
+            tuple(item[3] for item in described),
+            tuple((item[0], item[1]) for item in described),
+            rows,
+            design,
+        )
+
+    def _rule_effect_family_fit(
+        self,
+        records: Iterable[SupportRecord],
+        *,
+        warm_state: _RuleEffectFamilyFit | None = None,
+        warm_support_aliases: dict[Support, Support] | None = None,
+        evaluation_device: str | None = None,
+    ) -> _RuleEffectFamilyFit:
+        """Fit one exact support-conditioned rule-effect family.
+
+        The common baseline is fixed at the empty-model optimum.  Every
+        ``(rule set, rule)`` pair contributes its own signed fitted effect and
+        receives a nonnegative stacking coefficient.  Consequently a rule
+        fitted jointly with another rule is not silently identified with its
+        standalone version.  The code charges every active rule set plus one
+        BIC degree of freedom for every active stacking coefficient.
+        """
+
+        # Family scoring is used by standalone selection, every intermediate
+        # Add/Drop/separate decision, and the terminal representation audit.
+        # Keep all of those callers on the resident evaluator rather than
+        # accelerating only terminal W/sign replacements.  This changes only
+        # execution: the device path evaluates the same float64 likelihood,
+        # gradient, cone KKT condition and tolerance, and fails open to the
+        # original CPU formulas if CUDA is unavailable.
+        if evaluation_device is None:
+            evaluation_device = next(
+                (
+                    str(device)
+                    for device in self.config.pricing_devices
+                    if str(device).startswith("cuda")
+                ),
+                None,
+            )
+
+        unique = {
+            record.support: freeze_support_record(record)
+            for record in records
+            if record.fit.converged and record.support != EMPTY_SUPPORT
+        }
+        ordered = tuple(
+            unique[support] for support in sorted(unique, key=lambda item: item.rules)
+        )
+        key = tuple(record.support for record in ordered)
+        with self._state_lock:
+            cached = self._rule_effect_family_fit_cache.get(key)
+            if cached is not None:
+                self._rule_effect_family_fit_cache.move_to_end(key)
+                self.diagnostics.unified_family_score_cache_hits += 1
+                return cached
+            if warm_state is None and self._rule_effect_family_fit_cache:
+                # Family calls are locally ordered: a base fit is normally
+                # followed by a one-record Add, Drop, or identity replacement.
+                # The most recently used exact state is therefore a lossless warm
+                # start for all unchanged rule-effect columns.
+                warm_state = next(
+                    reversed(self._rule_effect_family_fit_cache.values())
+                )
+        baseline = self.records[EMPTY_SUPPORT]
+        if not ordered:
+            state = _RuleEffectFamilyFit(
+                (),
+                _RuleEffectStack(
+                    (), (), (), np.zeros(0, dtype=np.float64), baseline.fit.nll, True
+                ),
+                0.0,
+                0.0,
+            )
+        else:
+            precomputed_design = self._cached_rule_effect_design(ordered)
+            initial_weights: np.ndarray | None = None
+            if warm_state is not None and warm_state.stack.converged:
+                warm_by_column: dict[tuple[Support, int], float] = {}
+                for weight, (support_index, rule_index) in zip(
+                    warm_state.stack.weights,
+                    warm_state.stack.source_indices,
+                    strict=True,
+                ):
+                    if support_index >= len(warm_state.records):
+                        raise AssertionError("warm family source index is invalid")
+                    warm_by_column[
+                        (
+                            warm_state.records[support_index].support,
+                            int(rule_index),
+                        )
+                    ] = float(weight)
+                initial_weights = np.zeros(
+                    len(precomputed_design[0]), dtype=np.float64
+                )
+                matched_columns = 0
+                for column, (support_index, rule_index) in enumerate(
+                    precomputed_design[2]
+                ):
+                    key_column = (
+                        (
+                            warm_support_aliases.get(
+                                ordered[support_index].support,
+                                ordered[support_index].support,
+                            )
+                            if warm_support_aliases is not None
+                            else ordered[support_index].support
+                        ),
+                        int(rule_index),
+                    )
+                    if key_column in warm_by_column:
+                        initial_weights[column] = warm_by_column[key_column]
+                        matched_columns += 1
+                if matched_columns:
+                    with self._state_lock:
+                        self.diagnostics.family_stack_warm_starts += 1
+                else:
+                    initial_weights = None
+            stack = _fit_rule_effect_stack(
+                self.engine,
+                self.context,
+                baseline.matrix,
+                baseline.fit,
+                [record.matrix for record in ordered],
+                [record.fit for record in ordered],
+                tolerance=self.config.solver_tolerance,
+                deduplicate_rules=False,
+                precomputed_design=precomputed_design,
+                initial_weights=initial_weights,
+                # Sparse rule-effect designs make one exact Hessian pass more
+                # expensive than several gradient passes.  Transferred slot
+                # weights remain the useful warm start; L-BFGS is faster than
+                # Newton here and reaches the same final cone-KKT tolerance.
+                prefer_warm_newton=False,
+                evaluation_device=evaluation_device,
+            )
+            with self._state_lock:
+                self.diagnostics.family_stack_warm_kkt_skips += int(
+                    stack.warm_start_stationary
+                )
+                self.diagnostics.family_stack_optimizer_iterations += int(
+                    stack.iterations
+                )
+                self.diagnostics.family_stack_device_resident_fits += int(
+                    stack.device_resident
+                )
+            state = self._rule_effect_family_state_from_stack(ordered, stack)
+        with self._state_lock:
+            incumbent = self._rule_effect_family_fit_cache.get(key)
+            if incumbent is not None:
+                self._rule_effect_family_fit_cache.move_to_end(key)
+                self.diagnostics.unified_family_score_cache_hits += 1
+                return incumbent
+            self._rule_effect_family_fit_cache[key] = state
+            self._rule_effect_family_fit_cache.move_to_end(key)
+            while (
+                len(self._rule_effect_family_fit_cache)
+                > self._rule_effect_family_cache_limit
+            ):
+                self._rule_effect_family_fit_cache.popitem(last=False)
+            self.diagnostics.unified_family_score_fits += 1
+        return state
+
+    def _rule_effect_family_state_from_stack(
+        self,
+        ordered: tuple[SupportRecord, ...],
+        stack: _RuleEffectStack,
+    ) -> _RuleEffectFamilyFit:
+        """Apply the exact active-family code to a converged stacking fit."""
+
+        if not stack.converged or not math.isfinite(stack.nll):
+            return _RuleEffectFamilyFit(ordered, stack, -math.inf, math.inf)
+        numerical = max(1.0e-10, 10.0 * self.config.solver_tolerance)
+        active_columns = np.flatnonzero(stack.weights > numerical)
+        active_indices = {
+            stack.source_indices[index][0] for index in active_columns
+        }
+        active_records = tuple(
+            record
+            for index, record in enumerate(ordered)
+            if index in active_indices
+        )
+        if len(active_records) < len(ordered):
+            retained_support_indices = sorted(active_indices)
+            support_remap = {
+                old: new for new, old in enumerate(retained_support_indices)
+            }
+            retained_columns = np.asarray(
+                [
+                    column
+                    for column, (support_index, _) in enumerate(
+                        stack.source_indices
+                    )
+                    if support_index in support_remap
+                ],
+                dtype=np.int64,
+            )
+            restricted_stack = _RuleEffectStack(
+                tuple(stack.rules[index] for index in retained_columns),
+                tuple(stack.sources[index] for index in retained_columns),
+                tuple(
+                    (
+                        support_remap[stack.source_indices[index][0]],
+                        stack.source_indices[index][1],
+                    )
+                    for index in retained_columns
+                ),
+                np.ascontiguousarray(
+                    stack.weights[retained_columns], dtype=np.float64
+                ),
+                stack.nll,
+                stack.converged,
+                stack.iterations,
+                stack.warm_start_stationary,
+                stack.device_resident,
+            )
+            active_columns = np.flatnonzero(
+                restricted_stack.weights > numerical
+            )
+            stack = restricted_stack
+            with self._state_lock:
+                self.diagnostics.family_stack_inactive_refits_avoided += 1
+        weight_code = len(active_columns) * math.log(
+            max(2, self.objective.n_entities)
+        )
+        penalty = float(
+            sum(record.penalty for record in active_records) + weight_code
+        )
+        score = support_score(
+            baseline_nll=self.baseline_nll,
+            fit_nll=stack.nll,
+            penalty=penalty,
+        )
+        return _RuleEffectFamilyFit(active_records, stack, score, penalty)
+
+    def _rule_effect_family_one_step_score(
+        self,
+        records: Iterable[SupportRecord],
+        *,
+        warm_state: _RuleEffectFamilyFit,
+        warm_support_aliases: dict[Support, Support] | None = None,
+    ) -> float:
+        """Evaluate one feasible projected step of the exact family objective.
+
+        The neighbour's fitted rule-effect columns are fixed by its exact
+        support fit.  Unchanged family columns inherit their exact weights;
+        when a child replaces its parent, matching rule identities inherit the
+        parent's weights even if sorted rule indices changed.  One damped
+        Newton step with exact likelihood line search then answers the declared
+        Family Block-MDL one-step question without solving a rejected family
+        to convergence.
+        """
+
+        unique = {
+            record.support: freeze_support_record(record)
+            for record in records
+            if record.fit.converged and record.support != EMPTY_SUPPORT
+        }
+        ordered = tuple(
+            unique[support] for support in sorted(unique, key=lambda item: item.rules)
+        )
+        if not ordered:
+            return 0.0
+        design = self._cached_rule_effect_design(ordered)
+        rules, _, source_indices, _, _ = design
+        warm_by_identity: dict[tuple[Support, RuleIdentity], float] = {}
+        for column, (support_index, _) in enumerate(
+            warm_state.stack.source_indices
+        ):
+            if support_index >= len(warm_state.records):
+                return -math.inf
+            warm_by_identity[
+                (
+                    warm_state.records[support_index].support,
+                    warm_state.stack.rules[column],
+                )
+            ] = float(warm_state.stack.weights[column])
+        initial = np.zeros(len(rules), dtype=np.float64)
+        for column, ((support_index, _), rule) in enumerate(
+            zip(source_indices, rules, strict=True)
+        ):
+            support = ordered[support_index].support
+            source_support = (
+                warm_support_aliases.get(support, support)
+                if warm_support_aliases is not None
+                else support
+            )
+            initial[column] = warm_by_identity.get((source_support, rule), 0.0)
+        baseline = self.records[EMPTY_SUPPORT]
+        stack = _fit_rule_effect_stack(
+            self.engine,
+            self.context,
+            baseline.matrix,
+            baseline.fit,
+            [record.matrix for record in ordered],
+            [record.fit for record in ordered],
+            tolerance=self.config.solver_tolerance,
+            deduplicate_rules=False,
+            precomputed_design=design,
+            initial_weights=initial,
+            one_step_only=True,
+            # Only the current family plus one child is present here, so the
+            # dense device workspace has very few columns. Reuse the compiled
+            # float64 GPU evaluator for the single likelihood/gradient/Hessian
+            # pass; this changes no objective or candidate order.
+            evaluation_device=next(
+                (
+                    str(device)
+                    for device in self.config.pricing_devices
+                    if str(device).startswith("cuda")
+                ),
+                None,
+            ),
+        )
+        if not math.isfinite(stack.nll):
+            return -math.inf
+        numerical = max(1.0e-10, 10.0 * self.config.solver_tolerance)
+        active_columns = np.flatnonzero(stack.weights > numerical)
+        active_support_indices = {
+            stack.source_indices[column][0] for column in active_columns
+        }
+        penalty = float(
+            sum(
+                ordered[index].penalty for index in active_support_indices
+            )
+            + len(active_columns) * math.log(max(2, self.objective.n_entities))
+        )
+        return float(
+            support_score(
+                baseline_nll=self.baseline_nll,
+                fit_nll=stack.nll,
+                penalty=penalty,
+            )
+        )
+
+    def _cache_rule_effect_family_state(
+        self,
+        key: tuple[Support, ...],
+        state: _RuleEffectFamilyFit,
+    ) -> _RuleEffectFamilyFit:
+        """Install an exact externally batched family fit in the ordinary LRU."""
+
+        with self._state_lock:
+            incumbent = self._rule_effect_family_fit_cache.get(key)
+            if incumbent is not None:
+                self._rule_effect_family_fit_cache.move_to_end(key)
+                self.diagnostics.unified_family_score_cache_hits += 1
+                return incumbent
+            self._rule_effect_family_fit_cache[key] = state
+            self._rule_effect_family_fit_cache.move_to_end(key)
+            while (
+                len(self._rule_effect_family_fit_cache)
+                > self._rule_effect_family_cache_limit
+            ):
+                self._rule_effect_family_fit_cache.popitem(last=False)
+            self.diagnostics.unified_family_score_fits += 1
+        return state
+
+    def _family_add_base_and_threshold(
+        self,
+        current: SupportRecord,
+        rule: RuleIdentity,
+    ) -> tuple[_RuleEffectFamilyFit, float]:
+        """Return the exact none/separate hurdle for one family Add.
+
+        A standalone alternative is comparable only when it has the exact
+        W/sign/history identity being proposed.  Reusing the strongest atom
+        of the same skeleton gives a different scientific action and made the
+        quadratic ranking disagree with the later exact family decision.
+        """
+
+        trial = current.support.add(rule)
+        base_records = dict(self._route_predictive_records)
+        base_records.pop(trial, None)
+        if current.support != EMPTY_SUPPORT:
+            base_records[current.support] = freeze_support_record(current)
+        base_state = self._rule_effect_family_fit(base_records.values())
+        threshold = float(base_state.score)
+        atom = self._positive_atom_by_antecedent.get(rule.pattern_key)
+        if atom is not None and atom.support == Support.of((rule,)):
+            separate = dict(base_records)
+            separate[atom.support] = atom
+            threshold = max(
+                threshold,
+                float(self._rule_effect_family_fit(separate.values()).score),
+            )
+        return base_state, threshold
+
+    def _lifted_family_add_upper_score(
+        self,
+        current: SupportRecord,
+        proposal: SupportRecord,
+        rule: RuleIdentity,
+    ) -> _LiftedFamilyAddScreen:
+        r"""Bound a joint Add on the exact rule-effect family scale.
+
+        Let ``beta`` be the child's nonnegative signed-kernel coefficients and
+        ``w`` its nonnegative stacking coefficient.  Every exact joint child
+        contributes ``X beta w = X gamma`` with ``gamma >= 0``.  We relax the
+        product and optimize ``gamma`` directly together with all other
+        resident family columns.  We also allow those resident columns for
+        free and charge only the minimum unavoidable child-support code plus
+        one active stacking coefficient.  The relaxed model and undercharged
+        code contain the exact joint family, so a certified upper endpoint
+        below the exact none/separate hurdle safely rejects the Add.
+
+        The convex lower envelope is certified by the same gradient-bundle LP
+        used by the matrix-free exact Add oracle.  Any unsupported geometry,
+        optimizer issue or dual infeasibility returns ``+inf`` and therefore
+        fails open to the canonical exact fit.
+        """
+
+        started = time.perf_counter()
+        family_key = tuple(
+            sorted(self._route_predictive_records, key=lambda item: item.rules)
+        )
+        cache_key = (family_key, current.support, proposal.support)
+        cached = self._lifted_family_add_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        base_state, threshold = self._family_add_base_and_threshold(current, rule)
+
+        def fail_open() -> _LiftedFamilyAddScreen:
+            result = _LiftedFamilyAddScreen(
+                math.inf,
+                float(threshold),
+                -math.inf,
+                0,
+                False,
+            )
+            with self._state_lock:
+                self.diagnostics.lifted_family_bound_audits += 1
+                self.diagnostics.lifted_family_bound_fail_opens += 1
+                self.diagnostics.lifted_family_bound_seconds += (
+                    time.perf_counter() - started
+                )
+            return result
+
+        matrix = proposal.matrix
+        if (
+            proposal.support != current.support.add(rule)
+            or matrix.x.shape[0] == 0
+            or len(matrix.active_rows) != len(matrix.active_design_groups)
+            or len(matrix.rule_slices) != len(proposal.support.rules)
+        ):
+            return fail_open()
+
+        # Existing family members except the replaced parent retain their
+        # exact fitted effect columns.  They are deliberately unpenalized in
+        # this relaxation, which can only make the resulting score upper bound
+        # larger and hence safer.
+        fixed_records = tuple(
+            record
+            for record in base_state.records
+            if record.support not in {current.support, proposal.support}
+        )
+        if fixed_records:
+            _, _, _, fixed_rows, fixed_design = _rule_effect_design(
+                self.engine,
+                self.context,
+                [record.matrix for record in fixed_records],
+                [record.fit for record in fixed_records],
+                deduplicate_rules=False,
+            )
+        else:
+            fixed_rows = np.zeros(0, dtype=np.int64)
+            fixed_design = csc_matrix((0, 0), dtype=np.float64)
+
+        blocks: list[tuple[np.ndarray, np.ndarray]] = []
+        fixed_csc = fixed_design.tocsc()
+        for column in range(fixed_csc.shape[1]):
+            left = int(fixed_csc.indptr[column])
+            right = int(fixed_csc.indptr[column + 1])
+            positions = fixed_csc.indices[left:right]
+            values = fixed_csc.data[left:right]
+            active = np.isfinite(values) & (np.abs(values) > 0.0)
+            blocks.append(
+                (
+                    np.ascontiguousarray(fixed_rows[positions[active]], dtype=np.int64),
+                    np.ascontiguousarray(values[active], dtype=np.float64),
+                )
+            )
+
+        candidate_rows = np.ascontiguousarray(matrix.active_rows, dtype=np.int64)
+        design_groups = np.asarray(matrix.active_design_groups, dtype=np.int64)
+        for block in matrix.rule_slices:
+            for column in range(int(block.start), int(block.stop)):
+                values = np.asarray(
+                    matrix.x[design_groups, column], dtype=np.float64
+                ).reshape(-1)
+                active = np.isfinite(values) & (np.abs(values) > 0.0)
+                blocks.append(
+                    (
+                        np.ascontiguousarray(candidate_rows[active], dtype=np.int64),
+                        np.ascontiguousarray(values[active], dtype=np.float64),
+                    )
+                )
+        if not blocks or not any(len(rows) for rows, _ in blocks):
+            return fail_open()
+
+        nonempty_rows = [rows for rows, _ in blocks if len(rows)]
+        rows = sorted_unique_union(nonempty_rows)
+        if rows is None:
+            rows = np.unique(np.concatenate(nonempty_rows))
+        rows = np.ascontiguousarray(rows, dtype=np.int64)
+        row_indices: list[np.ndarray] = []
+        column_indices: list[np.ndarray] = []
+        values_parts: list[np.ndarray] = []
+        for column, (block_rows, values) in enumerate(blocks):
+            if not len(block_rows):
+                continue
+            row_indices.append(np.searchsorted(rows, block_rows))
+            column_indices.append(
+                np.full(len(block_rows), column, dtype=np.int32)
+            )
+            values_parts.append(values)
+        if not values_parts:
+            return fail_open()
+        design = csc_matrix(
+            (
+                np.concatenate(values_parts),
+                (np.concatenate(row_indices), np.concatenate(column_indices)),
+            ),
+            shape=(len(rows), len(blocks)),
+        )
+
+        baseline = self.records[EMPTY_SUPPORT]
+        eta0 = self.engine.frozen_linear_predictor_at_rows(
+            self.context,
+            baseline.matrix,
+            baseline.fit.coefficients,
+            rows,
+        )
+        row_weight = self.context.weights_at_rows(rows)
+        event_weight = self.context.target_counts_at_sorted_rows(rows)
+        noevent_weight = (
+            row_weight - event_weight
+            if self.context.dataset.likelihood == "first_event_cloglog"
+            else row_weight
+        )
+        exposure_weight = self.engine.tick_exposure * row_weight
+        baseline_rows = float(
+            np.sum(
+                loss_value_rows(
+                    eta0,
+                    likelihood=self.context.dataset.likelihood,
+                    exposure_weight=exposure_weight,
+                    noevent_weight=noevent_weight,
+                    event_weight=event_weight,
+                ),
+                dtype=np.float64,
+            )
+        )
+
+        values_seen: list[float] = []
+        coefficients_seen: list[np.ndarray] = []
+        gradients_seen: list[np.ndarray] = []
+
+        def evaluate(value: np.ndarray) -> tuple[float, np.ndarray]:
+            eta = eta0 + np.asarray(design @ value, dtype=np.float64).reshape(-1)
+            losses, first, _ = loss_rows(
+                eta,
+                likelihood=self.context.dataset.likelihood,
+                exposure_weight=exposure_weight,
+                noevent_weight=noevent_weight,
+                event_weight=event_weight,
+            )
+            full_nll = float(
+                baseline.fit.nll
+                + np.sum(losses, dtype=np.float64)
+                - baseline_rows
+            )
+            gradient = np.asarray(design.T @ first, dtype=np.float64).reshape(-1)
+            return full_nll, np.ascontiguousarray(gradient, dtype=np.float64)
+
+        def retain_cut(value: np.ndarray) -> tuple[float, np.ndarray]:
+            nll, gradient = evaluate(value)
+            if (
+                math.isfinite(nll)
+                and np.all(np.isfinite(value))
+                and np.all(np.isfinite(gradient))
+            ):
+                values_seen.append(float(nll))
+                coefficients_seen.append(
+                    np.ascontiguousarray(value, dtype=np.float64).copy()
+                )
+                gradients_seen.append(gradient.copy())
+                # More than 64 cuts gives negligible tightening but makes the
+                # tiny certification LP needlessly expensive.
+                if len(values_seen) > 64:
+                    del values_seen[1]
+                    del coefficients_seen[1]
+                    del gradients_seen[1]
+            return nll, gradient
+
+        initial = np.zeros(design.shape[1], dtype=np.float64)
+        retain_cut(initial)
+
+        def objective(value: np.ndarray) -> tuple[float, np.ndarray]:
+            return evaluate(value)
+
+        def callback(value: np.ndarray) -> None:
+            retain_cut(np.maximum(0.0, np.asarray(value, dtype=np.float64)))
+
+        try:
+            optimized = minimize(
+                objective,
+                initial,
+                jac=True,
+                bounds=[(0.0, None)] * len(initial),
+                method="L-BFGS-B",
+                callback=callback,
+                options={
+                    "ftol": 1.0e-15,
+                    "gtol": max(1.0e-10, self.config.solver_tolerance),
+                    "maxiter": min(256, self.config.solver_max_iter),
+                    "maxls": 50,
+                },
+            )
+            endpoint = np.maximum(
+                0.0,
+                np.asarray(
+                    optimized.x if optimized.x is not None else initial,
+                    dtype=np.float64,
+                ),
+            )
+            retain_cut(endpoint)
+            nll_lower = _gradient_bundle_lower_bound(
+                values_seen,
+                coefficients_seen,
+                gradients_seen,
+                free_dimension=0,
+            )
+        except (ArithmeticError, MemoryError, ValueError):
+            return fail_open()
+        if not math.isfinite(nll_lower):
+            return fail_open()
+
+        minimum_penalty = float(
+            self.objective.structural_penalty(proposal.support)
+            + math.log(max(2, self.objective.n_entities))
+        )
+        upper = support_score(
+            baseline_nll=self.baseline_nll,
+            fit_nll=float(nll_lower),
+            penalty=minimum_penalty,
+        )
+        screened = bool(
+            math.isfinite(upper)
+            and upper <= threshold + self.config.search_tolerance
+        )
+        result = _LiftedFamilyAddScreen(
+            float(upper),
+            float(threshold),
+            float(nll_lower),
+            len(values_seen),
+            screened,
+        )
+        self._lifted_family_add_cache[cache_key] = result
+        with self._state_lock:
+            self.diagnostics.lifted_family_bound_audits += 1
+            self.diagnostics.lifted_family_bound_screens += int(screened)
+            self.diagnostics.lifted_family_bound_cuts += len(values_seen)
+            self.diagnostics.lifted_family_bound_seconds += (
+                time.perf_counter() - started
+            )
+        return result
+
+    def _install_route_predictive_family(
+        self,
+        records: Iterable[SupportRecord] | dict[Support, SupportRecord],
+    ) -> None:
+        """Install one exact family state and invalidate contextual decisions.
+
+        Add/Drop/W-sign decisions depend on the other rule sets active in the
+        common stack.  A support edge rejected for one family is therefore not
+        a reusable rejection after the family changes.  Exact fixed-support
+        fits and exact family-score caches remain reusable; only directed move
+        decisions are reset.
+        """
+
+        values = records.values() if isinstance(records, dict) else records
+        installed = {
+            record.support: freeze_support_record(record)
+            for record in values
+            if record.fit.converged and record.support != EMPTY_SUPPORT
+        }
+        old_key = tuple(
+            sorted(self._route_predictive_records, key=lambda item: item.rules)
+        )
+        new_key = tuple(sorted(installed, key=lambda item: item.rules))
+        self._route_predictive_records = installed
+        if (
+            getattr(self.config, "rule_effect_stacking_search", False)
+            and new_key != old_key
+        ):
+            self._conditional_parent_forbidden.clear()
+            self._support_contract_add_decisions.clear()
+            self._family_move_scores.clear()
+            self._intermediate_frontier_family_updates.clear()
+            self._lifted_family_add_cache.clear()
+
+    def _rule_effect_family_replacement(
+        self,
+        current: SupportRecord,
+        candidate: SupportRecord,
+    ) -> tuple[float, float, dict[Support, SupportRecord], bool]:
+        """Evaluate one route replacement on the unified exact objective.
+
+        ``current -> candidate`` covers Drop, W/sign/history replacement and
+        a direct support replacement.  Add has an additional separate-support
+        alternative and is handled by :meth:`_add_is_indecomposable`, but it
+        uses the same base/joint construction.  The candidate must remain an
+        active member of the optimized stack; otherwise a zero-weight column
+        cannot masquerade as an improving route move.
+        """
+
+        if not current.fit.converged or (
+            candidate.support != EMPTY_SUPPORT and not candidate.fit.converged
+        ):
+            return -math.inf, -math.inf, {}, False
+        base_records = dict(getattr(self, "_route_predictive_records", {}))
+        if candidate.support != current.support:
+            base_records.pop(candidate.support, None)
+        if current.support != EMPTY_SUPPORT:
+            base_records[current.support] = freeze_support_record(current)
+        base_state = self._rule_effect_family_fit(base_records.values())
+
+        trial_records = dict(base_records)
+        trial_records.pop(current.support, None)
+        if candidate.support != EMPTY_SUPPORT:
+            trial_records[candidate.support] = freeze_support_record(candidate)
+        trial_state = self._rule_effect_family_fit(
+            trial_records.values(), warm_state=base_state
+        )
+        selected = {
+            record.support: record for record in trial_state.records
+        }
+        candidate_active = bool(
+            candidate.support == EMPTY_SUPPORT
+            or candidate.support in selected
+        )
+        return (
+            float(base_state.score),
+            float(trial_state.score),
+            selected,
+            candidate_active,
+        )
+
+    def _rule_effect_family_replacements_shared(
+        self,
+        current: SupportRecord,
+        candidates: Iterable[SupportRecord],
+    ) -> tuple[
+        float,
+        dict[Support, tuple[float, dict[Support, SupportRecord], bool]],
+    ]:
+        """Evaluate fixed-slot replacements from one exact leave-one-out fit.
+
+        Every W/sign/history neighbour replaces the same current rule set in
+        the predictive family.  Solving that leave-one-out family once makes
+        each candidate an ordinary nonnegative block Add.  The mapped exact
+        leave-one-out weights are then either already KKT-stationary for the
+        augmented family or are an exact warm start for the unchanged convex
+        stacking problem.
+        """
+
+        ordered_candidates = tuple(
+            candidate
+            for candidate in candidates
+            if candidate.fit.converged
+            and candidate.support != EMPTY_SUPPORT
+        )
+        if not current.fit.converged or not ordered_candidates:
+            return -math.inf, {}
+        devices = tuple(self.config.pricing_devices) or ("cpu",)
+        route = dict(getattr(self, "_route_predictive_records", {}))
+        route[current.support] = freeze_support_record(current)
+        base_state = self._rule_effect_family_fit(
+            route.values(), evaluation_device=devices[0]
+        )
+        leave = dict(route)
+        leave.pop(current.support, None)
+        leave_state = self._rule_effect_family_fit(
+            leave.values(),
+            warm_state=base_state,
+            evaluation_device=devices[min(1, len(devices) - 1)],
+        )
+        results: dict[
+            Support, tuple[float, dict[Support, SupportRecord], bool]
+        ] = {}
+        chunk_size = 8
+        for left in range(0, len(ordered_candidates), chunk_size):
+            chunk = ordered_candidates[left : left + chunk_size]
+            ordinary = tuple(
+                candidate for candidate in chunk if candidate.support not in leave
+            )
+            if any(
+                str(device).startswith("cuda")
+                for device in self.config.pricing_devices
+            ):
+                # On WSELOB the combined CPU KKT design was slower than exact
+                # two-GPU family fitting and screened no candidates.  Skipping
+                # an optional rejection certificate is a strict fail-open: all
+                # candidates continue to the identical exact objective.
+                screened = set()
+                with self._state_lock:
+                    self.diagnostics.family_replacement_kkt_gpu_bypasses += len(
+                        ordinary
+                    )
+            else:
+                screened = self._rule_effect_family_kkt_inactive_candidates(
+                    tuple(leave.values()), leave_state, ordinary
+                )
+            pending: list[SupportRecord] = []
+            for candidate in chunk:
+                # An already resident identical support is not a fixed-slot
+                # replacement. Preserve the canonical individual comparison
+                # for this structurally exceptional case.
+                if candidate.support in leave:
+                    _, score, selected, active = (
+                        self._rule_effect_family_replacement(current, candidate)
+                    )
+                    results[candidate.support] = (score, selected, active)
+                    continue
+                if candidate.support in screened:
+                    results[candidate.support] = (
+                        float(leave_state.score),
+                        {
+                            record.support: record
+                            for record in leave_state.records
+                        },
+                        False,
+                    )
+                    continue
+                pending.append(candidate)
+
+            fitted_states = self._rule_effect_family_replacement_gpu_fit(
+                current,
+                leave,
+                base_state,
+                tuple(pending),
+            )
+            for candidate, trial_state in zip(
+                pending, fitted_states, strict=True
+            ):
+                selected = {
+                    record.support: record for record in trial_state.records
+                }
+                results[candidate.support] = (
+                    float(trial_state.score),
+                    selected,
+                    candidate.support in selected,
+                )
+        with self._state_lock:
+            self.diagnostics.family_replacement_shared_bases += 1
+            self.diagnostics.family_replacement_shared_candidates += len(
+                ordered_candidates
+            )
+        return float(base_state.score), results
+
+    def _rule_effect_family_replacement_gpu_fit(
+        self,
+        current: SupportRecord,
+        leave: dict[Support, SupportRecord],
+        warm_state: _RuleEffectFamilyFit,
+        candidates: tuple[SupportRecord, ...],
+    ) -> tuple[_RuleEffectFamilyFit, ...]:
+        """Solve exact fixed-slot alternatives on the resident CUDA evaluator."""
+
+        if not candidates:
+            return ()
+        started = time.perf_counter()
+        devices = tuple(self.config.pricing_devices) or ("cpu",)
+        wave_size = min(2, len(devices))
+
+        def solve(item: tuple[SupportRecord, str]) -> _RuleEffectFamilyFit:
+            candidate, device = item
+            trial = dict(leave)
+            trial[candidate.support] = freeze_support_record(candidate)
+            return self._rule_effect_family_fit(
+                trial.values(),
+                warm_state=warm_state,
+                warm_support_aliases={candidate.support: current.support},
+                evaluation_device=device,
+            )
+
+        outputs: list[_RuleEffectFamilyFit] = []
+        for left in range(0, len(candidates), wave_size):
+            wave = candidates[left : left + wave_size]
+            assigned = tuple(
+                (candidate, devices[index % len(devices)])
+                for index, candidate in enumerate(wave)
+            )
+            if len(assigned) == 1:
+                fitted = (solve(assigned[0]),)
+            else:
+                fitted = tuple(self._worker_pool.map(solve, assigned))
+                with self._state_lock:
+                    self.diagnostics.family_replacement_parallel_waves += 1
+                    self.diagnostics.family_replacement_parallel_candidates += len(
+                        assigned
+                    )
+            outputs.extend(fitted)
+        elapsed = time.perf_counter() - started
+        with self._state_lock:
+            self.diagnostics.family_replacement_gpu_seconds += elapsed
+        return tuple(outputs)
+
+    def _rule_effect_family_kkt_inactive_candidates(
+        self,
+        leave_records: tuple[SupportRecord, ...],
+        leave_state: _RuleEffectFamilyFit,
+        candidates: tuple[SupportRecord, ...],
+    ) -> set[Support]:
+        """Safely identify zero-weight replacement blocks in one fused pass.
+
+        Conditional on fitted rule-effect columns, stacking is a convex
+        likelihood with nonnegative coefficients.  At the exact leave-one-out
+        optimum, nonnegative gradients for every column of a candidate block
+        complete the cone KKT conditions of the augmented family.  Such a
+        block has exact optimum weight zero and cannot be an identity move.
+        Numerical disagreement with the cached base optimum fails open.
+        """
+
+        if not candidates or not leave_state.stack.converged:
+            return set()
+        unique = {
+            record.support: freeze_support_record(record)
+            for record in (*leave_records, *candidates)
+            if record.fit.converged and record.support != EMPTY_SUPPORT
+        }
+        ordered = tuple(
+            unique[support]
+            for support in sorted(unique, key=lambda item: item.rules)
+        )
+        if not ordered:
+            return set()
+        rules, sources, source_indices, rows, design = (
+            self._cached_rule_effect_design(ordered)
+        )
+        if not rules:
+            return {candidate.support for candidate in candidates}
+        warm_by_column: dict[tuple[Support, int], float] = {}
+        for weight, (support_index, rule_index) in zip(
+            leave_state.stack.weights,
+            leave_state.stack.source_indices,
+            strict=True,
+        ):
+            if support_index >= len(leave_state.records):
+                return set()
+            warm_by_column[
+                (leave_state.records[support_index].support, int(rule_index))
+            ] = float(weight)
+        weights = np.zeros(len(rules), dtype=np.float64)
+        for column, (support_index, rule_index) in enumerate(source_indices):
+            weights[column] = warm_by_column.get(
+                (ordered[support_index].support, int(rule_index)), 0.0
+            )
+        baseline = self.records[EMPTY_SUPPORT]
+        eta0 = self.engine.frozen_linear_predictor_at_rows(
+            self.context,
+            baseline.matrix,
+            baseline.fit.coefficients,
+            rows,
+        )
+        eta = eta0 + np.asarray(design @ weights, dtype=np.float64).reshape(-1)
+        row_weight = self.context.weights_at_rows(rows)
+        event_weight = self.context.target_counts_at_sorted_rows(rows)
+        noevent_weight = (
+            row_weight - event_weight
+            if self.context.dataset.likelihood == "first_event_cloglog"
+            else row_weight
+        )
+        _, first, _ = loss_rows(
+            eta,
+            likelihood=self.context.dataset.likelihood,
+            exposure_weight=self.engine.tick_exposure * row_weight,
+            noevent_weight=noevent_weight,
+            event_weight=event_weight,
+        )
+        gradient = np.asarray(design.T @ first, dtype=np.float64).reshape(-1)
+        threshold = 10.0 * self.config.solver_tolerance * max(
+            1.0, abs(leave_state.stack.nll)
+        )
+        candidate_supports = {candidate.support for candidate in candidates}
+        base_columns = np.asarray(
+            [source not in candidate_supports for source in sources], dtype=bool
+        )
+        active_base = base_columns & (
+            weights > max(1.0e-10, 10.0 * self.config.solver_tolerance)
+        )
+        inactive_base = base_columns & ~active_base
+        base_residual = 0.0
+        if np.any(active_base):
+            base_residual = max(
+                base_residual,
+                float(np.max(np.abs(gradient[active_base]))),
+            )
+        if np.any(inactive_base):
+            base_residual = max(
+                base_residual,
+                float(np.max(np.maximum(-gradient[inactive_base], 0.0))),
+            )
+        if not np.all(np.isfinite(gradient)) or base_residual > threshold:
+            with self._state_lock:
+                self.diagnostics.family_replacement_kkt_candidates += len(
+                    candidates
+                )
+                self.diagnostics.family_replacement_kkt_fail_opens += len(
+                    candidates
+                )
+            return set()
+        screened: set[Support] = set()
+        for candidate in candidates:
+            indices = np.asarray(
+                [source == candidate.support for source in sources], dtype=bool
+            )
+            if not np.any(indices) or np.all(gradient[indices] >= -threshold):
+                screened.add(candidate.support)
+        with self._state_lock:
+            self.diagnostics.family_replacement_kkt_candidates += len(candidates)
+            self.diagnostics.family_replacement_kkt_screens += len(screened)
+        return screened
+
+    def _standalone_objective_score(self, record: SupportRecord) -> float:
+        """Return the declared root-admission score for one exact atom."""
+
+        if not getattr(self.config, "rule_effect_stacking_search", False):
+            return float(record.discovery_score)
+        if not record.fit.converged:
+            return -math.inf
+        state = self._rule_effect_family_fit((record,))
+        if not any(member.support == record.support for member in state.records):
+            return -math.inf
+        return float(state.score)
+
+    def _rule_effect_family_replacement_improves(
+        self,
+        current: SupportRecord,
+        candidate: SupportRecord,
+        *,
+        record_update: bool = True,
+    ) -> tuple[bool, float]:
+        """Return exact unified-objective acceptance and its trial score."""
+
+        base_score, candidate_score, selected, active = (
+            self._rule_effect_family_replacement(current, candidate)
+        )
+        improves = bool(
+            active
+            and candidate_score > base_score + self.config.search_tolerance
+        )
+        edge = (current.support, candidate.support)
+        if record_update:
+            with self._state_lock:
+                self._family_move_scores[edge] = (base_score, candidate_score)
+                if improves:
+                    self._intermediate_frontier_family_updates[edge] = selected
+        return improves, candidate_score
+
+    def _rule_effect_representation_score(
+        self,
+        anchor: SupportRecord,
+        candidate: SupportRecord,
+    ) -> float:
+        """Score one representation in a fixed family slot.
+
+        Representation alternatives must all be compared after removing the
+        same original rule set from the family.  Pairwise replacement against
+        the most recent alternative changes the comparison family and can
+        create a non-transitive A -> B -> A preference cycle.  The frozen
+        ``anchor`` makes every candidate a point on one common exact objective.
+        """
+
+        if not candidate.fit.converged:
+            return -math.inf
+        family = dict(self._route_predictive_records)
+        family.pop(anchor.support, None)
+        if candidate.support != EMPTY_SUPPORT:
+            family[candidate.support] = freeze_support_record(candidate)
+        state = self._rule_effect_family_fit(family.values())
+        if (
+            candidate.support != EMPTY_SUPPORT
+            and not any(
+                record.support == candidate.support for record in state.records
+            )
+        ):
+            return -math.inf
+        return float(state.score)
+
+    def _quadratic_rule_effect_family_scores(
+        self,
+        base_state: _RuleEffectFamilyFit,
+        alternatives: dict[object, tuple[SupportRecord, ...]],
+    ) -> dict[object, float]:
+        r"""Rank fixed-family alternatives around the exact current stack.
+
+        The expansion uses the gradient and conditional Fisher information of
+        the same common-baseline rule-effect likelihood used by
+        :meth:`_rule_effect_family_fit`.  It therefore estimates the stacking
+        NLL change itself; the stacking coefficient code is subtracted only
+        after that estimated likelihood gain is obtained.  Scores produced by
+        this method are ordering values, never rejection certificates.  Route
+        acceptance still calls the exact family fit in that order.
+
+        Every alternative shares one sparse effect design and one Fisher
+        matrix.  This replaces the former nested exact family Add/Drop solve
+        for every child at every intermediate node.
+        """
+
+        started = time.perf_counter()
+        if not alternatives:
+            return {}
+        universe_map = {
+            record.support: freeze_support_record(record)
+            for record in base_state.records
+            if record.fit.converged and record.support != EMPTY_SUPPORT
+        }
+        for records in alternatives.values():
+            for record in records:
+                if record.fit.converged and record.support != EMPTY_SUPPORT:
+                    universe_map[record.support] = freeze_support_record(record)
+        ordered = tuple(
+            universe_map[support]
+            for support in sorted(universe_map, key=lambda item: item.rules)
+        )
+        if not ordered:
+            return {label: 0.0 for label in alternatives}
+
+        _, column_supports, source_indices, rows, design = _rule_effect_design(
+            self.engine,
+            self.context,
+            [record.matrix for record in ordered],
+            [record.fit for record in ordered],
+            deduplicate_rules=False,
+        )
+        if design.shape[1] == 0:
+            return {label: 0.0 for label in alternatives}
+
+        column_keys = tuple(
+            (ordered[support_index].support, int(rule_index))
+            for support_index, rule_index in source_indices
+        )
+        column_by_key = {key: index for index, key in enumerate(column_keys)}
+        base_weights = np.zeros(design.shape[1], dtype=np.float64)
+        for weight, (support_index, rule_index) in zip(
+            base_state.stack.weights,
+            base_state.stack.source_indices,
+            strict=True,
+        ):
+            key = (base_state.records[support_index].support, int(rule_index))
+            union_index = column_by_key.get(key)
+            if union_index is not None:
+                base_weights[union_index] = float(weight)
+
+        baseline = self.records[EMPTY_SUPPORT]
+        eta0 = self.engine.frozen_linear_predictor_at_rows(
+            self.context,
+            baseline.matrix,
+            baseline.fit.coefficients,
+            rows,
+        )
+        base_effect = np.asarray(design @ base_weights, dtype=np.float64).reshape(-1)
+        eta = eta0 + base_effect
+        row_weight = self.context.weights_at_rows(rows)
+        event_weight = self.context.target_counts_at_sorted_rows(rows)
+        noevent_weight = (
+            row_weight - event_weight
+            if self.context.dataset.likelihood == "first_event_cloglog"
+            else row_weight
+        )
+        exposure_weight = self.engine.tick_exposure * row_weight
+        _, first, second = loss_rows(
+            eta,
+            likelihood=self.context.dataset.likelihood,
+            exposure_weight=exposure_weight,
+            noevent_weight=noevent_weight,
+            event_weight=event_weight,
+        )
+        weighted_design = design.multiply(second[:, None])
+        hessian = np.asarray(
+            (design.T @ weighted_design).toarray(), dtype=np.float64
+        )
+        hessian = 0.5 * (hessian + hessian.T)
+        linear = np.asarray(
+            design.T @ (first - second * base_effect), dtype=np.float64
+        ).reshape(-1)
+        constant = float(
+            -first @ base_effect + 0.5 * base_effect @ (second * base_effect)
+        )
+        numerical = max(1.0e-10, 10.0 * self.config.solver_tolerance)
+        log_n = math.log(max(2, self.objective.n_entities))
+        support_columns: dict[Support, list[int]] = {}
+        for index, support in enumerate(column_supports):
+            support_columns.setdefault(support, []).append(index)
+
+        result: dict[object, float] = {}
+        score_cache: dict[tuple[Support, ...], float] = {}
+        failures = 0
+        for label, records in alternatives.items():
+            trial_map = {
+                record.support: universe_map[record.support]
+                for record in records
+                if record.support in universe_map
+            }
+            trial_supports = tuple(
+                sorted(trial_map, key=lambda item: item.rules)
+            )
+            cached = score_cache.get(trial_supports)
+            if cached is not None:
+                result[label] = cached
+                continue
+            indices = np.asarray(
+                [
+                    index
+                    for support in trial_supports
+                    for index in support_columns.get(support, ())
+                ],
+                dtype=np.int64,
+            )
+            if not len(indices):
+                score_cache[trial_supports] = 0.0
+                result[label] = 0.0
+                continue
+            value, weights, converged = _nonnegative_quadratic_minimum(
+                linear[indices],
+                hessian[np.ix_(indices, indices)],
+                base_weights[indices],
+                tolerance=self.config.solver_tolerance,
+            )
+            if not converged:
+                failures += 1
+            active = weights > numerical
+            active_indices = indices[active]
+            active_supports = {
+                column_supports[index] for index in active_indices
+            }
+            penalty = float(
+                sum(trial_map[support].penalty for support in active_supports)
+                + len(active_indices) * log_n
+            )
+            approximate_nll = float(base_state.stack.nll + constant + value)
+            score = support_score(
+                baseline_nll=self.baseline_nll,
+                fit_nll=approximate_nll,
+                penalty=penalty,
+            )
+            if not math.isfinite(score):
+                score = -math.inf
+                failures += 1
+            score_cache[trial_supports] = float(score)
+            result[label] = float(score)
+
+        elapsed = time.perf_counter() - started
+        with self._state_lock:
+            self.diagnostics.intermediate_family_quadratic_calls += 1
+            self.diagnostics.intermediate_family_quadratic_candidates += len(
+                alternatives
+            )
+            self.diagnostics.intermediate_family_quadratic_failures += failures
+            self.diagnostics.intermediate_family_quadratic_seconds += elapsed
+        return result
+
+    def _rule_effect_family_selection(
+        self,
+        records: Iterable[SupportRecord],
+    ) -> tuple[dict[Support, SupportRecord], float]:
+        """Reach exact support-level Add/Drop stationarity for one family.
+
+        All trial values use :meth:`_rule_effect_family_fit`; no support
+        intensity simplex or local support score enters this decision.  The
+        procedure is finite because every accepted Add or Drop strictly
+        increases the same coded objective and ties use immutable support
+        order.
+        """
+
+        universe_map = {
+            record.support: freeze_support_record(record)
+            for record in records
+            if record.fit.converged and record.support != EMPTY_SUPPORT
+        }
+        universe = tuple(sorted(universe_map, key=lambda item: item.rules))
+        cached = self._rule_effect_family_selection_cache.get(universe)
+        if cached is not None:
+            self._rule_effect_family_selection_cache.move_to_end(universe)
+            return dict(cached[0]), float(cached[1])
+        state = self._rule_effect_family_fit(
+            universe_map[support] for support in universe
+        )
+        selected = tuple(record.support for record in state.records)
+        current_score = float(state.score)
+        tolerance = self.config.search_tolerance
+        audits = 0
+        moves = 0
+        while True:
+            best_supports = selected
+            best_state = state
+            best_score = current_score
+            for dropped in selected:
+                trial_supports = tuple(item for item in selected if item != dropped)
+                trial = self._rule_effect_family_fit(
+                    (universe_map[item] for item in trial_supports),
+                    warm_state=state,
+                )
+                audits += 1
+                if trial.score > best_score + tolerance or (
+                    abs(trial.score - best_score) <= tolerance
+                    and tuple(record.support.rules for record in trial.records)
+                    < tuple(item.rules for item in best_supports)
+                ):
+                    best_supports = tuple(record.support for record in trial.records)
+                    best_state = trial
+                    best_score = float(trial.score)
+            if best_score > current_score + tolerance:
+                selected, state, current_score = best_supports, best_state, best_score
+                moves += 1
+                continue
+
+            excluded = tuple(item for item in universe if item not in selected)
+            for added in excluded:
+                trial_supports = tuple(sorted((*selected, added), key=lambda item: item.rules))
+                trial = self._rule_effect_family_fit(
+                    (universe_map[item] for item in trial_supports),
+                    warm_state=state,
+                )
+                audits += 1
+                trial_selected = tuple(record.support for record in trial.records)
+                if added not in trial_selected:
+                    continue
+                if trial.score > best_score + tolerance or (
+                    abs(trial.score - best_score) <= tolerance
+                    and tuple(item.rules for item in trial_selected)
+                    < tuple(item.rules for item in best_supports)
+                ):
+                    best_supports = trial_selected
+                    best_state = trial
+                    best_score = float(trial.score)
+            if best_score > current_score + tolerance:
+                selected, state, current_score = best_supports, best_state, best_score
+                moves += 1
+                continue
+            break
+        output = {
+            record.support: universe_map[record.support] for record in state.records
+        }
+        self._rule_effect_family_selection_cache[universe] = (dict(output), current_score)
+        self._rule_effect_family_selection_cache.move_to_end(universe)
+        while (
+            len(self._rule_effect_family_selection_cache)
+            > self._rule_effect_family_cache_limit
+        ):
+            self._rule_effect_family_selection_cache.popitem(last=False)
+        with self._state_lock:
+            self.diagnostics.route_family_objective_audits += audits
+            self.diagnostics.route_family_objective_moves += moves
+        return output, current_score
+
     def _route_family_selection(
         self,
         records: Iterable[SupportRecord],
@@ -30174,6 +33452,8 @@ class SupportOptimizer:
         exact support predictors are cached as sparse target-row profiles.
         """
 
+        if self.config.rule_effect_stacking_search:
+            return self._rule_effect_family_selection(records)
         unique = {record.support: freeze_support_record(record) for record in records}
         if not unique:
             return {}, 0.0
@@ -30216,30 +33496,174 @@ class SupportOptimizer:
         frontier_started = time.perf_counter()
         if not current.fit.converged:
             return ()
-        children = self._conditional_basin_branch_additions(current)
+        self._defer_intermediate_family_contract = bool(
+            self.config.rule_effect_stacking_search
+        )
+        try:
+            children = self._conditional_basin_branch_additions(current)
+        finally:
+            self._defer_intermediate_family_contract = False
         if not children:
             self._intermediate_reference_parent = None
             self._intermediate_reference_profiles = {}
             return ()
         children_finished = time.perf_counter()
         tolerance = self.config.search_tolerance
-        base_records = tuple(self._route_predictive_records.values())
-        _, base_score = self._route_family_selection(base_records)
-        selected_family, family_score = self._route_family_selection(
-            (*base_records, *children)
-        )
-        predictive_supports = {
-            child.support
-            for child in children
-            if child.support in selected_family
-            and family_score > base_score + tolerance
-        }
-        individual_gains: dict[Support, float] = {}
-        for child in children:
-            selected, score = self._route_family_selection((*base_records, child))
-            individual_gains[child.support] = (
-                score - base_score if child.support in selected else -math.inf
+        if self.config.rule_effect_stacking_search:
+            base_map = dict(self._route_predictive_records)
+            for child in children:
+                if child.support != current.support:
+                    base_map.pop(child.support, None)
+            if current.support != EMPTY_SUPPORT:
+                base_map[current.support] = freeze_support_record(current)
+            base_state = self._rule_effect_family_fit(base_map.values())
+            base_score = float(base_state.score)
+            active_base = {
+                record.support: record for record in base_state.records
+            }
+
+            alternatives: dict[object, tuple[SupportRecord, ...]] = {}
+            for child in children:
+                joint = dict(active_base)
+                joint.pop(current.support, None)
+                joint[child.support] = freeze_support_record(child)
+                alternatives[("joint", child.support)] = tuple(joint.values())
+                added = tuple(
+                    rule
+                    for rule in child.support.rules
+                    if rule not in current.support.rules
+                )
+                atom = (
+                    self._positive_atom_by_antecedent.get(added[0].pattern_key)
+                    if len(added) == 1
+                    else None
+                )
+                if atom is not None and atom.support == Support.of((added[0],)):
+                    separate = dict(active_base)
+                    separate[atom.support] = atom
+                    alternatives[("separate", child.support)] = tuple(
+                        separate.values()
+                    )
+
+            approximate = self._quadratic_rule_effect_family_scores(
+                base_state, alternatives
             )
+            individual_gains = {}
+            for child in children:
+                joint_score = approximate.get(("joint", child.support), -math.inf)
+                separate_score = approximate.get(
+                    ("separate", child.support), base_score
+                )
+                individual_gains[child.support] = float(
+                    joint_score - max(base_score, separate_score)
+                )
+
+            # The quadratic score orders alternatives but never certifies
+            # one. Exact-check that order and stop at the first joint winner.
+            ordered_for_validation = sorted(
+                children,
+                key=lambda item: (
+                    -individual_gains[item.support],
+                    -item.score,
+                    item.support.rules,
+                ),
+            )
+            primary_predictive: SupportRecord | None = None
+            for child in ordered_for_validation:
+                added = tuple(
+                    rule
+                    for rule in child.support.rules
+                    if rule not in current.support.rules
+                )
+                if len(added) != 1:
+                    continue
+                with self._state_lock:
+                    self.diagnostics.intermediate_family_exact_validations += 1
+                normalized, _ = self._selected_unified_family_normal_form(
+                    current, child, added[0]
+                )
+                if normalized is None:
+                    self._conditional_parent_forbidden.add(
+                        (current.support, child.support)
+                    )
+                    continue
+                primary_predictive = normalized
+                if normalized.support != child.support:
+                    base_final = self._family_move_scores.get(
+                        (current.support, normalized.support),
+                        (base_score, base_score),
+                    )
+                    individual_gains[normalized.support] = float(
+                        base_final[1] - base_final[0]
+                    )
+                    children = tuple(
+                        normalized if item.support == child.support else item
+                        for item in children
+                    )
+                break
+            if primary_predictive is None:
+                self._intermediate_reference_parent = None
+                self._intermediate_reference_profiles = {}
+                LOGGER.info(
+                    "intermediate frontier stopped support=%s children=%d "
+                    "validate=%.3f family=%.3f total=%.3f",
+                    support_key(current.support),
+                    len(children),
+                    children_finished - frontier_started,
+                    time.perf_counter() - children_finished,
+                    time.perf_counter() - frontier_started,
+                )
+                return ()
+            predictive_supports = {primary_predictive.support}
+        elif self._uses_rule_set_block_stationarity:
+            # Discovery owns individual rule sets, not a temporary support
+            # ensemble. Every exact-positive basin child remains a route
+            # successor; the independent standalone version of its new atom
+            # is already preserved as its own root. Rule-effect stacking is
+            # fitted once only after D_cert has frozen the certified family.
+            individual_gains = {
+                child.support: float(child.score - current.score)
+                for child in children
+            }
+            predictive_supports = {
+                child.support
+                for child in children
+                if individual_gains[child.support] > tolerance
+            }
+        else:
+            base_records = tuple(self._route_predictive_records.values())
+            _, base_score = self._route_family_selection(base_records)
+            selected_family, family_score = self._route_family_selection(
+                (*base_records, *children)
+            )
+            predictive_supports = {
+                child.support
+                for child in children
+                if child.support in selected_family
+                and family_score > base_score + tolerance
+            }
+            individual_gains = {}
+            for child in children:
+                selected, score = self._route_family_selection(
+                    (*base_records, child)
+                )
+                individual_gains[child.support] = (
+                    score - base_score
+                    if child.support in selected
+                    else -math.inf
+                )
+            if predictive_supports and family_score > base_score + tolerance:
+                primary = min(
+                    (child for child in children if child.support in predictive_supports),
+                    key=lambda item: (
+                        -individual_gains[item.support],
+                        -item.score,
+                        item.support.rules,
+                    ),
+                )
+                self._intermediate_frontier_family_updates[
+                    (current.support, primary.support)
+                ] = selected_family
         family_finished = time.perf_counter()
 
         # Continuous additive supports have an exact interval-native profile
@@ -30394,11 +33818,6 @@ class SupportOptimizer:
                 basin,
             )
 
-        primary = output[0]
-        if predictive_supports and family_score > base_score + tolerance:
-            self._intermediate_frontier_family_updates[
-                (current.support, primary.support)
-            ] = selected_family
         with self._state_lock:
             self.diagnostics.intermediate_frontier_rounds += 1
             self.diagnostics.intermediate_frontier_predictive_children += sum(
@@ -30443,7 +33862,7 @@ class SupportOptimizer:
         candidates = (*self._route_predictive_records.values(), record)
         selected, _ = self._route_family_selection(candidates)
         selected_supports = frozenset(selected)
-        self._route_predictive_records = selected
+        self._install_route_predictive_family(selected)
         role = (
             "predictive_complement"
             if record.support in selected_supports
@@ -31438,7 +34857,18 @@ class SupportOptimizer:
         predictively separated by more than the declared MDL resolution.
         """
 
-        if not self.config.fisher_separated_rashomon or len(records) <= 1:
+        # Post-certification rule stacking must not influence which distinct
+        # D_fit explanations receive an independent held-out test.  In this
+        # mode the frozen family contract permits only exact-predictor
+        # equivalence and strict nested MDL domination, both handled by the
+        # surrounding canonical/nested compaction passes.  Fisher-resolution
+        # packing is intentionally disabled because closeness is not equality
+        # and could otherwise erase a valid Rashomon alternative before F1--F3.
+        if (
+            self.config.posthoc_rule_effect_stacking
+            or not self.config.fisher_separated_rashomon
+            or len(records) <= 1
+        ):
             return records
         empty = self.records[EMPTY_SUPPORT]
         prepared: list[tuple[SupportRecord, tuple[np.ndarray, np.ndarray]]] = []
@@ -31567,9 +34997,25 @@ class SupportOptimizer:
                     replacement = self._exactify_path_state(
                         replacement, reason="cleanup"
                     )
+                family_identity_improves = False
                 if (
-                    not replacement.fit.converged
-                    or replacement.score <= current.score + self.config.search_tolerance
+                    replacement.fit.converged
+                    and getattr(self.config, "rule_effect_stacking_search", False)
+                ):
+                    family_identity_improves, _ = (
+                        self._rule_effect_family_replacement_improves(
+                            current, replacement, record_update=False
+                        )
+                    )
+                unified_identity = bool(
+                    getattr(self.config, "rule_effect_stacking_search", False)
+                )
+                if not replacement.fit.converged or (
+                    unified_identity and not family_identity_improves
+                ) or (
+                    not unified_identity
+                    and replacement.score
+                    <= current.score + self.config.search_tolerance
                 ):
                     if replacement.fit.converged:
                         self._conditional_parent_forbidden.add(
@@ -31581,8 +35027,11 @@ class SupportOptimizer:
                 with self._state_lock:
                     self.diagnostics.family_canonicalization_identity_moves += 1
             if (
-                current.score <= self.config.search_tolerance
-                or current.discovery_score <= self.config.search_tolerance
+                not getattr(self.config, "rule_effect_stacking_search", False)
+                and (
+                    current.score <= self.config.search_tolerance
+                    or current.discovery_score <= self.config.search_tolerance
+                )
             ):
                 continue
             fingerprint = self._prediction_fingerprint(current)
@@ -32133,6 +35582,11 @@ class SupportOptimizer:
         terminal Drop oracle remains unchanged and resolves every such miss.
         """
 
+        if getattr(self.config, "rule_effect_stacking_search", False):
+            # Unified routes use the shared exact/Fisher family replacement
+            # oracle.  This legacy feasible support-score Drop is not an
+            # approximation of that objective.
+            return None
         if len(current.support.rules) <= 1 or current.matrix.x.shape[0] == 0:
             return None
         protected = frozenset(normalize_pattern(key) for key in protected_antecedents)
@@ -32243,6 +35697,9 @@ class SupportOptimizer:
                 current,
                 protected_antecedents=protected_antecedents,
                 audit_add=False,
+                audit_identity=not bool(
+                    getattr(self, "_defer_representation_until_add_stall", False)
+                ),
             )
             if decision.record is None:
                 return current
@@ -32252,8 +35709,201 @@ class SupportOptimizer:
             if not candidate.fit.converged or candidate.support in seen:
                 return None
             candidate = self._attach_rule_score(candidate)
+            if getattr(self.config, "rule_effect_stacking_search", False):
+                family_update = self._intermediate_frontier_family_updates.get(
+                    (current.support, candidate.support)
+                )
+                if family_update is not None:
+                    self._install_route_predictive_family(family_update)
             seen.add(candidate.support)
             current = candidate
+
+    def _exact_family_drop_normal_form(
+        self,
+        start: SupportRecord,
+    ) -> SupportRecord | None:
+        """Apply only exact one-rule deletions after a unified-family Add.
+
+        Intermediate Add validation does not need to re-run W/sign/history or
+        structural representation searches for every sibling proposal.  For a
+        rule set with ``k`` rules, cleanup asks exactly the ``k`` deletion
+        questions ``S - {r}`` on the same rule-effect family objective.  Any
+        accepted deletion is followed by the same check at the smaller set.
+        Active identity and representation coordinates remain mandatory, but
+        are audited once when the forward Add route stalls.
+        """
+
+        current = start
+        if not current.fit.converged:
+            current = self._exactify_path_state(current, reason="cleanup")
+        if not current.fit.converged:
+            return None
+        current = self._attach_rule_score(current)
+        seen = {current.support}
+        while len(current.support.rules) > 1:
+            with self._state_lock:
+                self.diagnostics.intermediate_family_cleanup_drop_audits += len(
+                    current.support.rules
+                )
+            dropped = self._best_exact_rule_objective_drop(
+                current,
+                protected_antecedents=frozenset(),
+            )
+            if dropped is None:
+                return current
+            if not dropped.fit.converged:
+                dropped = self._exactify_path_state(dropped, reason="cleanup")
+            if not dropped.fit.converged or dropped.support in seen:
+                return None
+            family_update = self._intermediate_frontier_family_updates.get(
+                (current.support, dropped.support)
+            )
+            if family_update is not None:
+                self._install_route_predictive_family(family_update)
+            seen.add(dropped.support)
+            current = self._attach_rule_score(dropped)
+            with self._state_lock:
+                self.diagnostics.intermediate_family_cleanup_drop_moves += 1
+        return current
+
+    def _selected_unified_family_normal_form(
+        self,
+        current: SupportRecord,
+        exact: SupportRecord,
+        rule: RuleIdentity,
+    ) -> tuple[SupportRecord | None, str]:
+        """Exact-check and Drop-normalize one already ranked family child.
+
+        This method is intentionally invoked only for the sibling currently
+        selected by the shared family ranking.  It preserves the previous
+        none/joint/separate and exact one-rule Drop decisions while avoiding
+        the same cleanup for every rejected sibling.
+        """
+
+        if self._uses_family_block_stationarity:
+            # Exact cone-KKT screen for an augmented family.  Keep every
+            # current family column and append all fitted-effect columns of
+            # the exact child at weight zero.  If their gradients are
+            # nonnegative at the exact current optimum, that point satisfies
+            # the KKT conditions of the enlarged nonnegative cone and is its
+            # global optimum.  The intended joint replacement is a subset of
+            # this enlarged family, so it cannot beat ``none`` either.  This
+            # needs only sparse dot products against the already cached exact
+            # family residual; it avoids rebuilding and optimizing the same
+            # stacking design for every rejected Add.
+            base_records = dict(self._route_predictive_records)
+            base_records.pop(exact.support, None)
+            if current.support != EMPTY_SUPPORT:
+                base_records[current.support] = freeze_support_record(current)
+            base_state = self._rule_effect_family_fit(base_records.values())
+            first, _, _, derivative_state = self._family_block_derivatives(current)
+            child_columns = self._cached_rule_effect_columns(exact).columns
+            threshold = 10.0 * self.config.solver_tolerance * max(
+                1.0, abs(base_state.stack.nll)
+            )
+            gradients = tuple(
+                float(np.asarray(values, dtype=np.float64) @ first[rows])
+                for _, _, rows, values in child_columns
+            )
+            kkt_nonimproving = bool(
+                derivative_state is base_state
+                and base_state.stack.converged
+                and (
+                    not gradients
+                    or (
+                        all(math.isfinite(value) for value in gradients)
+                        and min(gradients) >= -threshold
+                    )
+                )
+            )
+            if kkt_nonimproving:
+                with self._state_lock:
+                    self.diagnostics.conditional_full_refits_avoided += 1
+                    self.diagnostics.support_contract_add_rejections += 1
+                    self._family_move_scores[(current.support, exact.support)] = (
+                        float(base_state.score),
+                        float(base_state.score),
+                    )
+                return None, "unified-family-augmented-kkt"
+
+            # The dictionary-wide score that selected this identity uses the
+            # raw kernel block because no child fit exists yet. Once the child
+            # is exact, map the current stacking weights onto its matching
+            # rule identities and take one projected Newton step with exact
+            # likelihood line search. This is the terminal Family Block-MDL
+            # one-step question. A positive feasible score is followed by the
+            # full exact family comparison; a nonpositive score needs no full
+            # neighbouring-family optimization.
+            joint_records = {
+                record.support: record for record in base_state.records
+            }
+            joint_records.pop(current.support, None)
+            joint_records[exact.support] = freeze_support_record(exact)
+            joint_block_score = self._rule_effect_family_one_step_score(
+                joint_records.values(),
+                warm_state=base_state,
+                warm_support_aliases={exact.support: current.support},
+            )
+            _, exact_hurdle = self._family_add_base_and_threshold(current, rule)
+            if (
+                math.isfinite(joint_block_score)
+                and joint_block_score
+                <= exact_hurdle + self.config.search_tolerance
+            ):
+                with self._state_lock:
+                    self.diagnostics.conditional_full_refits_avoided += 1
+                    self.diagnostics.support_contract_add_rejections += 1
+                    self._family_move_scores[(current.support, exact.support)] = (
+                        float(base_state.score),
+                        float(joint_block_score),
+                    )
+                return None, "unified-family-child-one-step"
+
+        if not self._add_is_indecomposable(current, exact, rule):
+            return None, "unified-family-none-or-separate"
+        self._frequency_evidence_for_move(current, exact, rule)
+        route_before = dict(self._route_predictive_records)
+        add_edge = (current.support, exact.support)
+        add_scores = self._family_move_scores.get(add_edge)
+        add_update = self._intermediate_frontier_family_updates.get(add_edge)
+        if add_update is not None:
+            self._install_route_predictive_family(add_update)
+        try:
+            normalized = self._exact_family_drop_normal_form(exact)
+            normalized_family = dict(self._route_predictive_records)
+        finally:
+            self._install_route_predictive_family(route_before)
+        if (
+            normalized is None
+            or normalized.support == current.support
+            or rule.pattern_key not in normalized.support.patterns
+        ):
+            self._intermediate_frontier_family_updates.pop(add_edge, None)
+            self._family_move_scores.pop(add_edge, None)
+            return None, "unified-family-cleanup-failed"
+        final_score = float(
+            self._rule_effect_family_fit(normalized_family.values()).score
+        )
+        base_score = (
+            float(add_scores[0])
+            if add_scores is not None
+            else float(self._rule_effect_family_fit(route_before.values()).score)
+        )
+        if (
+            not math.isfinite(base_score)
+            or not math.isfinite(final_score)
+            or final_score <= base_score + self.config.search_tolerance
+        ):
+            self._intermediate_frontier_family_updates.pop(add_edge, None)
+            self._family_move_scores.pop(add_edge, None)
+            return None, "unified-family-cleanup-nonimproving"
+        final_edge = (current.support, normalized.support)
+        self._intermediate_frontier_family_updates[final_edge] = normalized_family
+        self._family_move_scores[final_edge] = (base_score, final_score)
+        if final_edge != add_edge:
+            self._intermediate_frontier_family_updates.pop(add_edge, None)
+            self._family_move_scores.pop(add_edge, None)
+        return normalized, "accepted-unified-family"
 
     def _normalize_composite_addition(
         self,
@@ -32285,6 +35935,24 @@ class SupportOptimizer:
 
         proposed_support = proposal.support
         exact = proposal
+        if (
+            getattr(self.config, "rule_effect_stacking_search", False)
+            and not exact.fit.converged
+            and self._use_lifted_family_add_bound
+        ):
+            family_screen = self._lifted_family_add_upper_score(
+                current,
+                exact,
+                rule,
+            )
+            if family_screen.certified_non_improving:
+                self._conditional_parent_forbidden.add(
+                    (current.support, proposed_support)
+                )
+                with self._state_lock:
+                    self.diagnostics.composite_add_rejections += 1
+                log_outcome("lifted-family-upper")
+                return None
         if not exact.fit.converged:
             with self._state_lock:
                 self.diagnostics.composite_add_exactifications += 1
@@ -32326,17 +35994,27 @@ class SupportOptimizer:
         )
         standalone_atom = self._positive_atom_by_antecedent.get(rule.pattern_key)
         separate_score = (
+            float(current.score)
+            if self._uses_rule_set_block_stationarity
+            else
             float(
                 self._separate_family_scores(current, (rule.pattern_key,)).get(
                     rule.pattern_key, current.score
                 )
             )
-            if standalone_atom is not None
+            if (
+                standalone_atom is not None
+                and not getattr(
+                    self.config, "rule_effect_stacking_search", False
+                )
+            )
             else float(current.score)
         )
         exact_upper_threshold = max(float(current.score), separate_score)
-        if structural_upper_score <= (
-            exact_upper_threshold + self.config.search_tolerance
+        if (
+            not getattr(self.config, "rule_effect_stacking_search", False)
+            and structural_upper_score
+            <= exact_upper_threshold + self.config.search_tolerance
         ):
             self._conditional_parent_forbidden.add((current.support, proposed_support))
             with self._state_lock:
@@ -32353,7 +36031,12 @@ class SupportOptimizer:
         validated: SupportRecord | None = None
         branch_net = -math.inf
         material: bool | None = None
-        if self.config.dependency_aware_mdl and rule.order > 1:
+        if (
+            not getattr(self.config, "rule_effect_stacking_search", False)
+            and not self._uses_rule_set_block_stationarity
+            and self.config.dependency_aware_mdl
+            and rule.order > 1
+        ):
             validation_stage = time.perf_counter()
             validated, branch_net = self._exact_add_branch_validation(
                 current,
@@ -32416,6 +36099,82 @@ class SupportOptimizer:
             rule,
             time.perf_counter() - validation_stage,
         )
+
+        if self._uses_rule_set_block_stationarity:
+            # The exact fixed-support endpoint is accepted only on the same
+            # J(S) used by standalone roots, Drop and identity moves.  Fit-time
+            # robustness, branch and separate-family gates belong neither to
+            # this discovery objective nor to terminal stationarity; F1--F3
+            # apply them independently after the D_fit family is frozen.
+            if exact.score <= current.score + self.config.search_tolerance:
+                self._conditional_parent_forbidden.add(
+                    (current.support, proposed_support)
+                )
+                with self._state_lock:
+                    self.diagnostics.composite_add_rejections += 1
+                log_outcome("rule-set-block-mdl")
+                return None
+            normalized = self._exact_nonadd_normal_form(
+                exact,
+                protected_antecedents=frozenset(),
+            )
+            if (
+                normalized is None
+                or normalized.support == current.support
+                or rule.pattern_key not in normalized.support.patterns
+                or normalized.score
+                <= current.score + self.config.search_tolerance
+            ):
+                self._conditional_parent_forbidden.add(
+                    (current.support, proposed_support)
+                )
+                with self._state_lock:
+                    self.diagnostics.composite_add_rejections += 1
+                log_outcome("rule-set-block-mdl-cleanup")
+                return None
+            self._conditional_parent_forbidden.add(
+                (normalized.support, current.support)
+            )
+            with self._state_lock:
+                self.diagnostics.reverse_drop_screens += 1
+            log_outcome("accepted-rule-set-block-mdl")
+            return normalized
+
+        if getattr(self.config, "rule_effect_stacking_search", False):
+            if self._defer_intermediate_family_contract:
+                # A complete sibling frontier is being built.  Every child is
+                # already an exact fixed-support fit, but none should run its
+                # own none/joint/separate selection or Drop cleanup before the
+                # shared family quadratic has ranked all siblings.  The
+                # selected child is exact-family checked below; rejected
+                # siblings never pay that cost.
+                log_outcome("deferred-unified-family")
+                return exact
+            # The exact joint/separate/none family comparison is the sole
+            # discovery acceptance criterion in unified mode.  Legacy
+            # support-MDL, hierarchy-branch and D_fit robustness gates are not
+            # applied a second time; F1--F3 own reliability after the family
+            # is frozen.  Structural validity and exact KKT convergence were
+            # already checked above.
+            validation_stage = time.perf_counter()
+            normalized, outcome = self._selected_unified_family_normal_form(
+                current, exact, rule
+            )
+            LOGGER.info(
+                "composite Add stage rule=%s stage=unified-family seconds=%.3f",
+                rule,
+                time.perf_counter() - validation_stage,
+            )
+            if normalized is None:
+                self._conditional_parent_forbidden.add(
+                    (current.support, proposed_support)
+                )
+                with self._state_lock:
+                    self.diagnostics.composite_add_rejections += 1
+                log_outcome(outcome)
+                return None
+            log_outcome(outcome)
+            return normalized
 
         # These are the cheapest exact necessary conditions under the declared
         # two-way objective.  The former order built the hierarchy branch null
@@ -32578,6 +36337,9 @@ class SupportOptimizer:
                 current,
                 protected_antecedents=protected_antecedents,
                 audit_add=False,
+                audit_identity=not bool(
+                    getattr(self, "_defer_representation_until_add_stall", False)
+                ),
             )
             if cleanup.record is not None:
                 return _MoveDecision(cleanup.record, False)
@@ -32614,6 +36376,23 @@ class SupportOptimizer:
         finally:
             self._block_score_terminal_audit_active = previous_block_terminal_audit
         if direct is None:
+            # Some search engines deliberately postpone the expensive finite
+            # W/sign/history coordinate audit while the forward Add route is
+            # still open.  Once the complete block-score Add pass stalls, run
+            # that exact representation audit once.  An improving identity
+            # restarts the same Add oracle at the next DAG node; otherwise the
+            # current node has the unchanged final representation certificate.
+            if current.fit.converged and bool(
+                getattr(self, "_defer_representation_until_add_stall", False)
+            ):
+                representation = self._best_terminal_cleanup_decision(
+                    current,
+                    protected_antecedents=protected_antecedents,
+                    audit_add=False,
+                    audit_identity=True,
+                )
+                if representation.record is not None:
+                    return representation
             return _MoveDecision(None, False)
         if not direct.fit.converged:
             with self._state_lock:
@@ -32646,6 +36425,38 @@ class SupportOptimizer:
     ) -> tuple[_MoveDecision, tuple[SupportRecord, ...]]:
         """Return one primary move plus distinct intermediate branch starts."""
 
+        if self._uses_rule_set_block_stationarity:
+            # Every exact-positive standalone rule is already an independent
+            # route root.  Discovery from each root follows the best current
+            # rule-set Block-MDL move.  Branching every intermediate node into
+            # all conditional score basins exact-fitted dozens of siblings per
+            # step and duplicated the role of those roots.  Distinct terminal
+            # basins remain preserved across the complete standalone-root
+            # family and equal downstream supports are still merged by the DAG.
+            return (
+                self._best_fast_route_decision(
+                    current,
+                    protected_antecedents=protected_antecedents,
+                ),
+                (),
+            )
+
+        if self._uses_family_block_stationarity:
+            # The exact-positive standalone basins already supply independent
+            # Rashomon starts. At an intermediate node the declared algorithm
+            # follows one deterministic best-first path: rank joint/separate/
+            # none by Family Block-MDL, exact-check in that order, and move as
+            # soon as one joint Add wins. Materializing and exact-fitting every
+            # basin sibling here was both inconsistent with that policy and
+            # the dominant route-time cost.
+            return (
+                self._best_fast_route_decision(
+                    current,
+                    protected_antecedents=protected_antecedents,
+                ),
+                (),
+            )
+
         if not current.fit.converged:
             return (
                 self._best_fast_route_decision(
@@ -32659,6 +36470,9 @@ class SupportOptimizer:
                 current,
                 protected_antecedents=protected_antecedents,
                 audit_add=False,
+                audit_identity=not bool(
+                    getattr(self, "_defer_representation_until_add_stall", False)
+                ),
             )
             if cleanup.record is not None:
                 return _MoveDecision(cleanup.record, False), ()
@@ -32672,6 +36486,17 @@ class SupportOptimizer:
         finally:
             self._block_score_terminal_audit_active = previous_block_terminal_audit
         if not successors:
+            if bool(
+                getattr(self, "_defer_representation_until_add_stall", False)
+            ):
+                representation = self._best_terminal_cleanup_decision(
+                    current,
+                    protected_antecedents=protected_antecedents,
+                    audit_add=False,
+                    audit_identity=True,
+                )
+                if representation.record is not None:
+                    return representation, ()
             return _MoveDecision(None, False), ()
         return _MoveDecision(successors[0], False), tuple(successors[1:])
 
@@ -32692,6 +36517,11 @@ class SupportOptimizer:
         Add dictionary is then reopened, allowing a lower-order replacement
         such as ``BC`` after a provisional ``ABC`` is removed.
         """
+        if getattr(self.config, "rule_effect_stacking_search", False):
+            # Unified-family Drop below compares the exact replacement on the
+            # same objective as Add and W/sign.  A support-level branch score
+            # is neither needed nor a valid additional acceptance rule.
+            return None
         if self.config.dependency_aware_mdl:
             # With no hidden hierarchy closure, the dependency-aware support
             # objective already supplies the exact branch comparison.  The
@@ -33349,6 +37179,8 @@ class SupportOptimizer:
         Drop and branch audits, so this adds entity-loss reductions rather than
         a second family of nonlinear optimizations.
         """
+        if getattr(self.config, "rule_effect_stacking_search", False):
+            return None
         if (
             not self.config.reliability_aware_search
             or not current.fit.converged
@@ -33433,6 +37265,13 @@ class SupportOptimizer:
         The deletion fits are shared with robustness and ordinary Drop audits.
         """
 
+        if getattr(self.config, "rule_effect_stacking_search", False):
+            # In unified mode the ordinary exact Drop immediately below
+            # evaluates the complete family replacement directly.  This
+            # legacy joint-vs-separate support margin uses a different scale
+            # to choose among deletions and must not precede that decision.
+            return None
+
         if not current.fit.converged or len(current.support.rules) < 2:
             return None
         protected = frozenset(
@@ -33496,6 +37335,7 @@ class SupportOptimizer:
         *,
         protected_antecedents: frozenset[PatternKey] = frozenset(),
         audit_add: bool = True,
+        audit_identity: bool = True,
     ) -> _MoveDecision:
         """Audit the block-score basin and reprofile W/sign at an exact node.
 
@@ -33521,30 +37361,34 @@ class SupportOptimizer:
             support_key(current.support),
             time.perf_counter() - cleanup_started,
         )
-        branch_started = time.perf_counter()
-        branch_drop = self._best_exact_nonpositive_branch_drop(
-            current,
-            protected_antecedents=protected_antecedents,
+        unified_family = bool(
+            getattr(self.config, "rule_effect_stacking_search", False)
         )
-        if branch_drop is not None:
-            return _MoveDecision(branch_drop, False)
-        LOGGER.info(
-            "terminal cleanup branch audit support=%s seconds=%.3f",
-            support_key(current.support),
-            time.perf_counter() - branch_started,
-        )
-        robust_drop = self._best_exact_nonrobust_rule_drop(
-            current,
-            protected_antecedents=protected_antecedents,
-        )
-        if robust_drop is not None:
-            return _MoveDecision(robust_drop, False)
-        family_drop = self._best_exact_family_decomposition_drop(
-            current,
-            protected_antecedents=protected_antecedents,
-        )
-        if family_drop is not None:
-            return _MoveDecision(family_drop, False)
+        if not unified_family and not self._uses_rule_set_block_stationarity:
+            branch_started = time.perf_counter()
+            branch_drop = self._best_exact_nonpositive_branch_drop(
+                current,
+                protected_antecedents=protected_antecedents,
+            )
+            if branch_drop is not None:
+                return _MoveDecision(branch_drop, False)
+            LOGGER.info(
+                "terminal cleanup branch audit support=%s seconds=%.3f",
+                support_key(current.support),
+                time.perf_counter() - branch_started,
+            )
+            robust_drop = self._best_exact_nonrobust_rule_drop(
+                current,
+                protected_antecedents=protected_antecedents,
+            )
+            if robust_drop is not None:
+                return _MoveDecision(robust_drop, False)
+            family_drop = self._best_exact_family_decomposition_drop(
+                current,
+                protected_antecedents=protected_antecedents,
+            )
+            if family_drop is not None:
+                return _MoveDecision(family_drop, False)
         with self._state_lock:
             self.diagnostics.terminal_cleanup_audits += 1
             self.diagnostics.terminal_drop_audits += len(
@@ -33576,25 +37420,39 @@ class SupportOptimizer:
         # exact and strictly improve the same objective, so commuting them ahead
         # of Add preserves the terminal set while removing invalidated pricing
         # passes.
-        while True:
-            replaced = self._best_final_identity_change(current)
-            if replaced is None:
-                break
-            if not replaced.fit.converged:
-                replaced = self._exactify_path_state(replaced, reason="cleanup")
-            if not replaced.fit.converged:
-                self._conditional_forbidden.add(replaced.support)
-                self.diagnostics.nonattained_exact_rejections += 1
-                continue
-            replaced = self._attach_rule_score(replaced)
-            if replaced.score <= current.score + self.config.search_tolerance:
-                self._conditional_parent_forbidden.add(
-                    (current.support, replaced.support)
-                )
-                continue
-            with self._state_lock:
-                self.diagnostics.terminal_cleanup_identity_moves += 1
-            return _MoveDecision(replaced, True)
+        if audit_identity:
+            while True:
+                replaced = self._best_final_identity_change(current)
+                if replaced is None:
+                    break
+                if not replaced.fit.converged:
+                    replaced = self._exactify_path_state(replaced, reason="cleanup")
+                if not replaced.fit.converged:
+                    self._conditional_forbidden.add(replaced.support)
+                    self.diagnostics.nonattained_exact_rejections += 1
+                    continue
+                replaced = self._attach_rule_score(replaced)
+                if self._uses_family_block_stationarity:
+                    improves, _ = self._rule_effect_family_replacement_improves(
+                        current, replaced
+                    )
+                    if not improves:
+                        self._conditional_parent_forbidden.add(
+                            (current.support, replaced.support)
+                        )
+                        continue
+                elif (
+                    not getattr(self.config, "rule_effect_stacking_search", False)
+                    and replaced.score
+                    <= current.score + self.config.search_tolerance
+                ):
+                    self._conditional_parent_forbidden.add(
+                        (current.support, replaced.support)
+                    )
+                    continue
+                with self._state_lock:
+                    self.diagnostics.terminal_cleanup_identity_moves += 1
+                return _MoveDecision(replaced, True)
 
         if audit_add:
             # Reopen the complete finite W/sign dictionary at the exact
@@ -34114,7 +37972,32 @@ class SupportOptimizer:
         empty = self.records[EMPTY_SUPPORT]
         restored_profile = self._checkpoint_profiled_roots
         if restored_profile is None:
-            profiled_roots = self._standalone_profiled_atoms(empty)
+            profiled_candidates = self._standalone_profiled_atoms(empty)
+            if self.config.rule_effect_stacking_search:
+                # A standalone route is the family action F={} -> {{r}}.
+                # Support Block-MDL is a safe upstream necessary screen, but
+                # admission uses the same exact stacking-family objective as
+                # every later move.  Zero-weight or family-negative atoms do
+                # not become route roots.
+                unified_roots: list[SupportRecord] = []
+                for record in profiled_candidates:
+                    state = self._rule_effect_family_fit((record,))
+                    if (
+                        state.score > self.config.search_tolerance
+                        and any(
+                            member.support == record.support
+                            for member in state.records
+                        )
+                    ):
+                        unified_roots.append(record)
+                profiled_roots = tuple(unified_roots)
+                LOGGER.info(
+                    "unified standalone family admission candidates=%d roots=%d",
+                    len(profiled_candidates),
+                    len(profiled_roots),
+                )
+            else:
+                profiled_roots = profiled_candidates
             self._checkpoint_profiled_roots = tuple(
                 freeze_support_record(record) for record in profiled_roots
             )
@@ -34215,11 +38098,11 @@ class SupportOptimizer:
                         for support, value in self.ensemble_reduced_costs.items()
                         if value > self.config.search_tolerance
                     )
-                    self._route_predictive_records = {
-                        support: profiled_by_support[support]
+                    self._install_route_predictive_family(
+                        profiled_by_support[support]
                         for support in self._predictive_root_supports
                         if support in profiled_by_support
-                    }
+                    )
                     for support in restored_order:
                         self._rashomon_basin_by_support[support] = support
                 LOGGER.info(
@@ -34306,7 +38189,7 @@ class SupportOptimizer:
         # family. A resumed route must continue from the exact family/basin
         # state recorded after its last accepted edge instead.
         if self._checkpoint_route_predictive_family:
-            self._route_predictive_records = dict(
+            self._install_route_predictive_family(
                 self._checkpoint_route_predictive_family
             )
         if self._checkpoint_rashomon_basin_map:
@@ -34969,7 +38852,10 @@ class SupportOptimizer:
                             or self.config.terminal_add_audit == "block_score"
                         ),
                     )
-                elif self.config.predictive_basin_rashomon_search:
+                elif (
+                    self.config.predictive_basin_rashomon_search
+                    or self._uses_rule_set_block_stationarity
+                ):
                     decision, frontier_alternatives = (
                         self._best_intermediate_frontier_route_decision(
                             current,
@@ -35314,7 +39200,7 @@ class SupportOptimizer:
                     (current.support, next_record.support), None
                 )
                 if family_update is not None:
-                    self._route_predictive_records = family_update
+                    self._install_route_predictive_family(family_update)
                 if repeated_support:
                     seen_in_path = {next_record.support}
                 self.diagnostics.accepted_moves += 1
@@ -35339,6 +39225,13 @@ class SupportOptimizer:
                     "total_mdl_gain": float(next_record.score - current.score),
                     "move": move_kind,
                 }
+                family_scores = self._family_move_scores.pop(
+                    (current.support, next_record.support), None
+                )
+                if family_scores is not None:
+                    move_payload["family_block_mdl_gain"] = float(
+                        family_scores[1] - family_scores[0]
+                    )
                 if forced_branch_drop:
                     move_payload["forced_nonpositive_branch_drop"] = True
                 if forced_reliability_drop:
@@ -35513,7 +39406,12 @@ class SupportOptimizer:
                                     self.config.ensemble_residual_search
                                     or self.config.rule_effect_stacking_search
                                 )
-                                else "monotone_block_score_rashomon_terminal_exact"
+                                else (
+                                    "rule_set_block_mdl_basin_rashomon_"
+                                    "terminal_one_step_stationary"
+                                    if self._uses_rule_set_block_stationarity
+                                    else "monotone_block_score_rashomon_terminal_exact"
+                                )
                             )
                             if self.config.terminal_add_audit == "block_score"
                             else "atomic_descendant_safe_shared_rashomon_frontier"
@@ -35604,8 +39502,11 @@ class SupportOptimizer:
 
         frontier_audited_supports: set[Support] = set()
         skip_duplicate_exact_frontier = bool(
-            self.config.fisher_separated_rashomon
-            and self.config.terminal_add_audit == "block_score"
+            self._uses_rule_set_block_stationarity
+            or (
+                self.config.fisher_separated_rashomon
+                and self.config.terminal_add_audit == "block_score"
+            )
         )
         if skip_duplicate_exact_frontier and self.config.conditional_basin_branching:
             with self._state_lock:
@@ -35747,11 +39648,21 @@ class SupportOptimizer:
             # every node, accepted only feasible objective-improving block
             # steps, and exactly polished each terminal.  In fast discovery
             # mode we intentionally do not replay the whole dictionary as
-            # candidate-by-candidate exact Add fits.  The terminal's Drop,
-            # W/sign and representation audits below remain exact.
+            # candidate-by-candidate exact Add fits. The terminal's family
+            # Drop comparison remains exact; W/sign/history use the same
+            # Family Block-MDL one-step audit and exact-check only a selected
+            # improving coordinate.
             self.diagnostics.block_score_terminal_add_audits += len(terminals)
             for path in paths:
-                path["terminal_add_audit"] = "complete_dictionary_block_score"
+                path["terminal_add_audit"] = (
+                    "family_block_mdl_one_step_stationary"
+                    if self._uses_family_block_stationarity
+                    else (
+                        "rule_set_block_mdl_one_step_stationary"
+                        if self._uses_rule_set_block_stationarity
+                        else "complete_dictionary_block_score"
+                    )
+                )
 
         # A joint-vs-separate audit may discover an exact-positive standalone
         # atom on demand.  The separate decision is meaningful only if that
@@ -35815,10 +39726,14 @@ class SupportOptimizer:
             else frozenset(frozen_terminals)
         )
         representation_family = self._reported_only_family(tuple(family_map.values()))
-        representation_family = self._local_representation_audit(
-            representation_family,
-            identity_audited_supports=representation_identity_audited_supports,
-        )
+        if not (
+            self._uses_family_block_stationarity
+            or self._uses_rule_set_block_stationarity
+        ):
+            representation_family = self._local_representation_audit(
+                representation_family,
+                identity_audited_supports=representation_identity_audited_supports,
+            )
 
         # Representation and deletion audits can create exact-positive supports
         # after the first shared frontier has already terminated.  Reopen only
@@ -35936,7 +39851,19 @@ class SupportOptimizer:
         # W/sign identities are support-conditioned rather than inherited
         # mechanically from a larger terminal.  This prevents a weak added
         # triplet from suppressing an otherwise reliable pair-only model.
-        deletion_family = self._deletion_minimal_subsupport_family(compact_family)
+        # Pre-certification compaction includes the exact-positive,
+        # deletion-minimal subsets of each terminal.  These are fitted and
+        # selected on D_fit before the certification family is frozen.  This
+        # step is independent of post-hoc rule-effect stacking: stacking is a
+        # predictive fit performed only after certification and must not make
+        # a reliable smaller explanation disappear with an unreliable larger
+        # terminal.  Configurations that do not request pre-certification
+        # compaction retain terminal-only reporting.
+        deletion_family = (
+            self._deletion_minimal_subsupport_family(compact_family)
+            if self.config.precert_family_compaction
+            else ()
+        )
         deletion_family = self._canonical_family_compaction(deletion_family)
         deletion_minimal_supports = frozenset(
             record.support for record in deletion_family
@@ -36008,7 +39935,8 @@ class SupportOptimizer:
         # subset MDL-dominated candidates have already been removed above.
         # Every remaining candidate is sent to D_cert; only certified supports
         # participate in the final D_fit+D_cert simplex ensemble.
-        self._family_ensemble_objective(compact_family)
+        if not self.config.posthoc_rule_effect_stacking:
+            self._family_ensemble_objective(compact_family)
         self.diagnostics.compact_support_candidates = len(compact_candidates)
         self.diagnostics.mdl_dominated_supports = dominated
         self.diagnostics.rashomon_terminal_representatives = len(compact_family)

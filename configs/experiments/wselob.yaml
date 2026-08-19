@@ -1,0 +1,79 @@
+adaptive_gradient_racing: true
+adaptive_kernel_mdl: false
+alpha: 0.05
+anchor_aware_representation_audit: true
+baseline_time_bins: 1
+cache_bytes: 4294967296
+conditional_basin_branching: true
+dataset: data/crbstpp/wselob_three_stock_market_state_volatility_v12_90stockdays_30s_q90_ms_seed111
+dependency_aware_mdl: true
+dependency_mdl_sample_size: prediction_opportunities
+dependency_mdl_dimension: additive_rule_godambe
+discovery_noncase_fraction: 0.1
+discovery_reference_dataset: null
+discovery_sampling: full
+discovery_sampling_seed: 111
+early_warning_horizon: 30000
+effect_model: support_additive
+ensemble_aware_roots: false
+ensemble_irreducible_family: false
+ensemble_residual_dictionary_repricing: false
+ensemble_residual_search: false
+exact_workers: 2
+fisher_orthogonal_route_order: true
+fisher_separated_rashomon: true
+formation_window_mode: fit_quantile
+formation_window_quantiles: [0.25, 0.5, 0.75, 0.9]
+formation_windows: [0, 5000, 15000, 30000]
+frequency_effect_separation: false
+history_count_quantiles: [0.25, 0.5, 0.75, 0.9]
+history_lookback_windows: [30000]
+history_marked_events: true
+history_max_marked_atoms: 1
+history_state_family_search: false
+impact_lag: 30000
+knot_count: 4
+max_rules_per_support: null
+metadata:
+  add_contract: selected_positive_one_step_then_one_exact_child_refit
+  baseline_contract: stock_x_weekday_x_4_fixed_intraday_time_only
+  certification_family_contract: fit_only_deletion_minimal_equivalence_and_nested_MDL_compaction_then_F0_F3_Romano_Wolf
+  context_contract: per_stock_D_fit_frozen_mutually_exclusive_calm_neutral_stressed_state_axis
+  dependency_contract: continuous_interval_native_one_way_stock_trading_day_godambe_block_mdl
+  discovery_objective: individual_rule_set_dependency_block_mdl
+  formation_window_contract: D_fit_Q25_Q50_Q75_Q90_productive_spans_at_millisecond_resolution
+  observation_contract: first_30_trading_days_per_stock_month_stratified_seed111
+  predicate_contract: common_eleven_exclusive_actions_plus_two_exclusive_market_state_conditions
+  representation_contract: terminal_rule_set_block_mdl_one_step_stationarity
+  route_contract: sign_separated_score_basin_rashomon_frontier_with_shared_rule_set_dag
+  stacking_contract: one_postcert_rule_effect_stack_on_fit_plus_cert
+  target_contract: per_stock_D_fit_duration_weighted_Q90_30_second_realized_volatility_burst_onset_with_half_threshold_rearm
+  time_contract: exact_piecewise_constant_continuous_poisson_nanosecond_clock_millisecond_model_unit
+online_predicate_pareto_frontier: false
+posthoc_rule_effect_stacking: true
+precert_family_compaction: true
+predicate_coverage_rashomon: false
+predictive_basin_rashomon_search: false
+pricing_devices: [cuda:0, cuda:1]
+pricing_workers: 12
+probability_materiality: 0.0
+q_max: 3
+rashomon_branching: true
+reliability_aware_search: true
+romano_wolf_resamples: 20000
+romano_wolf_seed: 111
+route_refinement_kkt_tolerance: null
+route_refinement_max_steps: 4
+route_workers: 2
+rule_effect_stacking_search: false
+run_id: wselob_three_stock_market_state_volatility_v65_90stockdays_seed111_full
+run_root: runs/crbstpp
+search_mode: atomic_rashomon_frontier
+search_tolerance: 1.0e-08
+solver_max_iter: 100
+solver_tolerance: 2.0e-07
+split_fractions: [0.5, 0.3, 0.2]
+split_seed: 111
+standalone_positive_atom_expansion: true
+temporal_relations: [unordered]
+terminal_add_audit: block_score

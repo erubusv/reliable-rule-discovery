@@ -154,7 +154,10 @@ class Dataset:
         return self.predicate_definitions[predicate]
 
     def is_state_predicate(self, predicate: int) -> bool:
-        return self.predicate_definition(predicate).get("kind") == "history_state"
+        return self.predicate_definition(predicate).get("kind") in {
+            "history_state",
+            "transition_state",
+        }
 
     @property
     def reported_state_predicates(self) -> tuple[int, ...]:
@@ -174,10 +177,15 @@ class Dataset:
 
     @property
     def baseline_control_predicates(self) -> tuple[int, ...]:
+        control_roles = {
+            "baseline_control",
+            "exposure_increase_control",
+            "exposure_decrease_control",
+        }
         return tuple(
             index
             for index, role in enumerate(self.predicate_roles)
-            if role != "reported"
+            if role in control_roles
         )
 
     @property
@@ -189,9 +197,7 @@ class Dataset:
             "exposure_increase_control": 1,
             "exposure_decrease_control": -1,
         }
-        return tuple(
-            signs[role] for role in self.predicate_roles if role != "reported"
-        )
+        return tuple(signs[self.predicate_roles[index]] for index in self.baseline_control_predicates)
 
     @classmethod
     def load(cls, root: str | Path) -> "Dataset":
@@ -361,6 +367,7 @@ class Dataset:
             "baseline_control",
             "exposure_increase_control",
             "exposure_decrease_control",
+            "state_source",
         }
         if len(predicate_roles) != len(predicate_names) or any(
             role not in valid_roles for role in predicate_roles
@@ -556,28 +563,48 @@ class Dataset:
                 kind = str(definition.get("kind", ""))
                 if kind == "event":
                     continue
-                if kind != "history_state":
+                if kind not in {"history_state", "transition_state"}:
                     raise ValueError("unsupported predicate definition kind")
-                source = definition.get("source_predicate")
-                transform = str(definition.get("transform", ""))
-                horizon = definition.get("horizon")
-                if (
-                    not isinstance(source, int)
-                    or not 0 <= source < self.n_reported_predicates
-                    or self.predicate_definitions[source].get("kind") != "event"
-                ):
-                    raise ValueError("history state requires a primitive event source")
-                if transform not in {
-                    "recent",
-                    "recurrent",
-                    "accelerating",
-                    "decelerating",
-                }:
-                    raise ValueError("invalid history-state transform")
-                if isinstance(horizon, bool) or not isinstance(horizon, int) or horizon < 1:
-                    raise ValueError("history-state horizon must be positive")
                 if self.predicate_roles[predicate] != "reported":
                     raise ValueError("history states must be reportable predicates")
+                if kind == "history_state":
+                    source = definition.get("source_predicate")
+                    transform = str(definition.get("transform", ""))
+                    horizon = definition.get("horizon")
+                    if (
+                        not isinstance(source, int)
+                        or not 0 <= source < self.n_reported_predicates
+                        or self.predicate_definitions[source].get("kind") != "event"
+                    ):
+                        raise ValueError(
+                            "history state requires a primitive event source"
+                        )
+                    if transform not in {
+                        "recent",
+                        "recurrent",
+                        "accelerating",
+                        "decelerating",
+                    }:
+                        raise ValueError("invalid history-state transform")
+                    if (
+                        isinstance(horizon, bool)
+                        or not isinstance(horizon, int)
+                        or horizon < 1
+                    ):
+                        raise ValueError("history-state horizon must be positive")
+                else:
+                    entry = definition.get("entry_predicate")
+                    exit_ = definition.get("exit_predicate")
+                    if any(
+                        not isinstance(value, int)
+                        or not 0 <= value < self.n_predicates
+                        or self.predicate_definitions[value].get("kind") != "event"
+                        or self.predicate_roles[value] != "state_source"
+                        for value in (entry, exit_)
+                    ):
+                        raise ValueError(
+                            "transition state requires hidden event entry/exit sources"
+                        )
         if not self.adverse_event_name:
             raise ValueError("adverse_event_name must be pre-registered")
         if self.ticks_per_unit < 1:
@@ -592,8 +619,13 @@ class Dataset:
         controls = self.baseline_control_predicates
         if not reported or reported != tuple(range(len(reported))):
             raise ValueError("reported predicates must form a nonempty leading block")
-        if controls != tuple(range(len(reported), self.n_predicates)):
+        if any(index < len(reported) for index in controls):
             raise ValueError("baseline controls must follow reported predicates")
+        if any(
+            role == "state_source" and index < len(reported)
+            for index, role in enumerate(self.predicate_roles)
+        ):
+            raise ValueError("state sources must follow reported predicates")
         for entities, times, label in (
             (self.event_entities, self.event_times, "predicate"),
             (self.target_entities, self.target_times, "target"),

@@ -8,7 +8,16 @@ __pycache__/
 .ipynb_checkpoints/
 
 data/
+logs/
+notes/
 outputs/
+paper/
+runs/
 notebooks/
 
 .env
+.env.*
+*.pem
+*.key
+credentials*.json
+secrets.*
