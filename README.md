@@ -95,16 +95,6 @@ tools/reproduce_experiments.sh baselines
 tools/reproduce_experiments.sh metrics
 ```
 
-Generated configurations and outputs are stored under
-`runs/reproduction/seed-<id>/`. The reference data digests for run 111 are:
-
-- Aave: `5f790a169904e6e6c77db7010e9a3aef858276c643fcf3b4fff0969bfa8c6ea7`
-- WSELOB: `287a6e4c015b5280cf19d260c9fa0430e0d94cc299b9257ec01397a13f634974`
-
-Per-seed reports are written to each run directory. Their mean and sample
-standard deviation are written to
-`runs/reproduction/metrics_three_seeds.json`.
-
 ## Rules reported from run 111
 
 The direction of every certified rule below is excitation. It means that the
