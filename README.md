@@ -192,31 +192,3 @@ discovery-sample fit alone is insufficient. Short-lived imbalance, routine
 quote replenishment, and broad market stress either failed to generalize,
 varied too much across stock-days, or did not survive correction across the
 13 candidate rule sets.
-
-## Anonymous release
-
-The public release must be created from a fresh root commit. Removing a name
-from the latest files or adding it to `.gitignore` does not remove it from old
-commits. Do not publish development history, local paper files, data, logs, or
-results. Use an account and repository that are not linked to an author, and
-verify the public commit metadata before sharing the URL.
-
-Create a one-commit release repository with:
-
-```bash
-tools/create_anonymous_release.sh /path/to/anonymous-release
-```
-
-The new repository contains only publishable files allowed by `.gitignore`. It
-has no remote and no connection to the development history. Push that directory
-to a new anonymous repository rather than force-pushing the development remote.
-
-## Validation
-
-```bash
-pytest
-```
-
-The regression suite checks likelihood calculations, high-order completion,
-history-count rules, dependency-aware model selection, route decisions,
-certification, baseline preparation, and metric reporting.
